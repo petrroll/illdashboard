@@ -15,7 +15,7 @@ function App() {
             Dashboard
           </NavLink>
           <NavLink to="/files">Lab Files</NavLink>
-          <NavLink to="/charts">Charts</NavLink>
+          <NavLink to="/charts">Biomarkers</NavLink>
         </nav>
         <main className="content">
           <Routes>

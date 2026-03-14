@@ -37,5 +37,18 @@ class Measurement(Base):
     reference_low = Column(Float, nullable=True)
     reference_high = Column(Float, nullable=True)
     measured_at = Column(DateTime, nullable=True)  # date/time of measurement
+    page_number = Column(Integer, nullable=True)  # 1-indexed page in source file
 
     lab_file = relationship("LabFile", back_populates="measurements")
+
+
+class BiomarkerInsight(Base):
+    """Cached AI summary for a biomarker and its latest trend state."""
+
+    __tablename__ = "biomarker_insights"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    marker_name = Column(String, nullable=False, unique=True)
+    measurement_signature = Column(String, nullable=False)
+    summary_markdown = Column(Text, nullable=False)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)

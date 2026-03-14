@@ -87,7 +87,7 @@ export default function Dashboard() {
 
       <div className="flex-row gap-1 mt-1">
         <Link to="/files" className="btn btn-primary">Upload Files</Link>
-        <Link to="/charts" className="btn btn-outline">View Charts</Link>
+        <Link to="/charts" className="btn btn-outline">Browse Biomarkers</Link>
       </div>
     </>
   );

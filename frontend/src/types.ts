@@ -17,6 +17,42 @@ export interface Measurement {
   reference_low: number | null;
   reference_high: number | null;
   measured_at: string | null;
+  page_number: number | null;
+}
+
+export interface MarkerOverviewItem {
+  marker_name: string;
+  group_name: string;
+  latest_measurement: Measurement;
+  previous_measurement: Measurement | null;
+  status: "low" | "high" | "in_range" | "no_range";
+  range_position: number | null;
+  total_count: number;
+  value_min: number | null;
+  value_max: number | null;
+}
+
+export interface MarkerOverviewGroup {
+  group_name: string;
+  markers: MarkerOverviewItem[];
+}
+
+export interface MarkerDetailResponse {
+  marker_name: string;
+  group_name: string;
+  latest_measurement: Measurement;
+  previous_measurement: Measurement | null;
+  status: "low" | "high" | "in_range" | "no_range";
+  range_position: number | null;
+  measurements: Measurement[];
+  explanation: string | null;
+  explanation_cached: boolean;
+}
+
+export interface MarkerInsightResponse {
+  marker_name: string;
+  explanation: string;
+  explanation_cached: boolean;
 }
 
 export interface ExplainRequest {

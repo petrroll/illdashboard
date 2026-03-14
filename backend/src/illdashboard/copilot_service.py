@@ -68,8 +68,13 @@ PDF of a lab report as a file attachment. Your job is to:
 1. Identify every measured lab marker (e.g. Hemoglobin, WBC, Glucose…).
 2. For each marker return a JSON array of objects with keys:
    "marker_name", "value" (numeric), "unit", "reference_low" (numeric or null),
-   "reference_high" (numeric or null), "measured_at" (ISO date string or null).
+   "reference_high" (numeric or null), "measured_at" (ISO date string or null),
+   "page_number" (integer, 1-indexed – which page/image the value appears on).
 3. Also return "lab_date" (ISO date string or null) for the report date.
+
+When multiple pages/images are attached, number them starting from 1 in the \
+order they are provided and set "page_number" accordingly for every measurement.
+If there is only one page/image, set "page_number" to 1 for all measurements.
 
 Return ONLY valid JSON: {"lab_date": "...", "measurements": [...]}.
 Do not include any commentary outside the JSON.\
@@ -143,8 +148,10 @@ You are a medical lab data normalization assistant. The user will give you:
 For each new marker name, decide:
 - If it matches an existing canonical name (same test, just different formatting, \
 spacing, abbreviation, or punctuation), map it to that existing canonical name.
-- If it is genuinely new (no match in the existing list), return it cleaned up \
-(consistent spacing, consistent punctuation style) as the canonical form.
+- If it is genuinely new (no match in the existing list), return a cleaned-up, \
+standard English canonical lab marker name when you can translate it confidently.
+- Prefer concise English medical names such as \"White Blood Cell (WBC) Count\" \
+or \"Platelet Count\" over local-language labels.
 
 Return ONLY valid JSON: a mapping object where keys are the original new names \
 and values are the canonical names.
@@ -213,6 +220,21 @@ Be concise but thorough. Use markdown formatting.\
 """
 
 
+MARKER_HISTORY_SYSTEM_PROMPT = """\
+You are a knowledgeable medical lab advisor. The user will provide the history of \
+a single biomarker across time, including units and reference ranges when available.
+
+Write a short markdown explanation with these sections:
+1. What this marker measures.
+2. What the latest value means relative to its range.
+3. What the recent trend suggests, based only on the supplied values.
+4. A short caution that this is not a diagnosis and should be interpreted with a clinician.
+
+Keep the language plain, factual, and concise. Do not invent causes that are not \
+supported by the data.\
+"""
+
+
 async def explain_markers(markers: list[dict]) -> str:
     """Ask Copilot to explain a set of lab markers."""
     user_text = "Please explain these lab results:\n\n"
@@ -225,3 +247,22 @@ async def explain_markers(markers: list[dict]) -> str:
         user_text += line + "\n"
 
     return await _ask(EXPLAIN_SYSTEM_PROMPT, user_text)
+
+
+async def explain_marker_history(marker_name: str, measurements: list[dict]) -> str:
+    """Ask Copilot to explain one biomarker with historical context."""
+    user_text = f"Please explain the history of {marker_name}.\n\n"
+    for measurement in measurements:
+        line = f"- {measurement['date']}: {measurement['value']}"
+        if measurement.get("unit"):
+            line += f" {measurement['unit']}"
+        if (
+            measurement.get("reference_low") is not None
+            and measurement.get("reference_high") is not None
+        ):
+            line += (
+                f" (ref {measurement['reference_low']}–{measurement['reference_high']})"
+            )
+        user_text += line + "\n"
+
+    return await _ask(MARKER_HISTORY_SYSTEM_PROMPT, user_text)

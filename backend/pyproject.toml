@@ -13,6 +13,7 @@ dependencies = [
     "pydantic-settings>=2.7,<3",
     "github-copilot-sdk",
     "pymupdf>=1.25,<2",
+    "matplotlib>=3.10.8",
 ]
 
 [project.optional-dependencies]

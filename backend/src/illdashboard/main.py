@@ -1,17 +1,65 @@
 """FastAPI application entry point."""
 
+import mimetypes
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import select
 
 from illdashboard.config import settings
 from illdashboard.copilot_service import shutdown_client
-from illdashboard.database import engine
-from illdashboard.models import Base
+from illdashboard.database import async_session, engine
+from illdashboard.models import Base, LabFile
 from illdashboard.routes import router
+
+
+PRELOADABLE_MIME_TYPES = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
+
+
+async def preload_uploaded_files() -> int:
+    """Seed missing lab file rows from files already present in the upload folder."""
+    upload_dir = Path(settings.UPLOAD_DIR)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    async with async_session() as session:
+        result = await session.execute(select(LabFile.filepath))
+        existing_paths = set(result.scalars().all())
+
+        added = 0
+        for file_path in sorted(path for path in upload_dir.iterdir() if path.is_file()):
+            if file_path.name in existing_paths:
+                continue
+
+            mime_type = PRELOADABLE_MIME_TYPES.get(file_path.suffix.lower())
+            if mime_type is None:
+                guessed_mime_type, _ = mimetypes.guess_type(file_path.name)
+                if guessed_mime_type not in PRELOADABLE_MIME_TYPES.values():
+                    continue
+                mime_type = guessed_mime_type
+
+            session.add(
+                LabFile(
+                    filename=file_path.name,
+                    filepath=file_path.name,
+                    mime_type=mime_type,
+                )
+            )
+            existing_paths.add(file_path.name)
+            added += 1
+
+        if added:
+            await session.commit()
+
+    return added
 
 
 @asynccontextmanager
@@ -21,6 +69,7 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
     # Ensure upload directory exists
     Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
+    await preload_uploaded_files()
     yield
     # Shutdown Copilot SDK client
     await shutdown_client()
