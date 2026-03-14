@@ -250,7 +250,7 @@ export default function FileDetail() {
                         <td className={status} style={{ fontWeight: 600 }}>
                           {m.value}
                         </td>
-                        <td>{m.unit || "—"}</td>
+                        <td>{m.unit && m.unit !== "1" ? m.unit : "—"}</td>
                         <td>
                           {m.reference_low != null && m.reference_high != null
                             ? `${m.reference_low}–${m.reference_high}`

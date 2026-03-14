@@ -171,7 +171,8 @@ export default function MarkerChart() {
     reference_high: measurement.reference_high,
   }));
 
-  const unit = detail?.latest_measurement.unit || "";
+  const rawUnit = detail?.latest_measurement.unit || "";
+  const unit = rawUnit === "1" ? "" : rawUnit;
   const refLow = detail?.latest_measurement.reference_low ?? null;
   const refHigh = detail?.latest_measurement.reference_high ?? null;
   const yAxisValues = measurements.flatMap((measurement) => {
@@ -212,7 +213,9 @@ export default function MarkerChart() {
 
   const formatValue = (value: number, itemUnit?: string | null) => {
     const rendered = Number.isInteger(value) ? value.toString() : value.toFixed(2).replace(/\.00$/, "");
-    return itemUnit ? `${rendered} ${itemUnit}` : rendered;
+    // Hide the dimensionless unit "1" — it's confusing when displayed next to numbers
+    const displayUnit = itemUnit && itemUnit !== "1" ? itemUnit : null;
+    return displayUnit ? `${rendered} ${displayUnit}` : rendered;
   };
 
   const formatDate = (value: string | null) => {
@@ -239,7 +242,7 @@ export default function MarkerChart() {
         <span className={`status-pill status-${item.status}`}>{statusLabel}</span>
         <img
           className="sparkline-img"
-          src={`/api/measurements/sparkline?marker_name=${encodeURIComponent(item.marker_name)}`}
+          src={`/api/measurements/sparkline?marker_name=${encodeURIComponent(item.marker_name)}&v=4`}
           alt={`Sparkline for ${item.marker_name}`}
           loading="lazy"
           decoding="async"
@@ -453,10 +456,11 @@ export default function MarkerChart() {
                 <div className="chart-wrapper mb-1">
                   <ResponsiveContainer width="100%" height={320}>
                     <LineChart data={chartData}>
-                      <CartesianGrid strokeDasharray="3 3" />
-                      <XAxis dataKey="dateLabel" />
+                      <CartesianGrid strokeDasharray="3 3" stroke="#303c4d" />
+                      <XAxis dataKey="dateLabel" stroke="#96a1ae" />
                       <YAxis
                         domain={yAxisDomain}
+                        stroke="#96a1ae"
                         label={{
                           value: unit,
                           angle: -90,
@@ -466,20 +470,21 @@ export default function MarkerChart() {
                       <Tooltip
                         formatter={(value) => formatValue(Number(value ?? 0), unit)}
                         labelFormatter={(label) => `Date: ${label}`}
+                        contentStyle={{ background: "#161d27", border: "1px solid #303c4d", borderRadius: "8px", color: "#edf1f7" }}
                       />
                       {refLow != null && refHigh != null && (
-                        <ReferenceArea y1={refLow} y2={refHigh} fill="#dbeafe" fillOpacity={0.55} />
+                        <ReferenceArea y1={refLow} y2={refHigh} fill="#12c78e" fillOpacity={0.1} />
                       )}
                       {refLow != null && (
-                        <ReferenceLine y={refLow} stroke="#2563eb" strokeDasharray="5 5" label="Low" />
+                        <ReferenceLine y={refLow} stroke="#12c78e" strokeDasharray="5 5" label="Low" />
                       )}
                       {refHigh != null && (
-                        <ReferenceLine y={refHigh} stroke="#dc2626" strokeDasharray="5 5" label="High" />
+                        <ReferenceLine y={refHigh} stroke="#f85149" strokeDasharray="5 5" label="High" />
                       )}
                       <Line
                         type="monotone"
                         dataKey="value"
-                        stroke="#0f766e"
+                        stroke="#b575ff"
                         strokeWidth={3}
                         dot={{ r: 5, strokeWidth: 2 }}
                         activeDot={{ r: 7 }}

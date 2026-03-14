@@ -72,6 +72,13 @@ PDF of a lab report as a file attachment. Your job is to:
    "page_number" (integer, 1-indexed – which page/image the value appears on).
 3. Also return "lab_date" (ISO date string or null) for the report date.
 
+CRITICAL rules for numeric values:
+- "value", "reference_low", and "reference_high" MUST be JSON numbers (not strings).
+- Use a dot (.) as the decimal separator, never a comma or space. E.g. 0.1, not "0,1" or "0 1".
+- Do NOT insert spaces into numbers. E.g. 1500, not "1 500".
+- If a value is less than 1, include the leading zero: 0.1, not .1.
+- Read decimal points carefully – "0.1" (zero point one) is very different from "1".
+
 When multiple pages/images are attached, number them starting from 1 in the \
 order they are provided and set "page_number" accordingly for every measurement.
 If there is only one page/image, set "page_number" to 1 for all measurements.

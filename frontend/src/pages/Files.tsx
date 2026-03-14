@@ -175,12 +175,12 @@ export default function Files() {
                     ? `Processing ${latest.filename}… (${doneCount + errorCount}/${latest.total})`
                     : `Processed ${doneCount + errorCount}/${latest.total}`}
                 </div>
-                <div style={{ background: "var(--bg-muted, #e2e8f0)", borderRadius: "4px", height: "6px", overflow: "hidden" }}>
+                <div style={{ background: "#303c4d", borderRadius: "4px", height: "6px", overflow: "hidden" }}>
                   <div
                     style={{
                       width: `${((doneCount + errorCount) / latest.total) * 100}%`,
                       height: "100%",
-                      background: errorCount > 0 ? "var(--danger, #e53e3e)" : "var(--primary, #3182ce)",
+                      background: errorCount > 0 ? "#f85149" : "#12c78e",
                       transition: "width 0.3s ease",
                     }}
                   />

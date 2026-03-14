@@ -70,7 +70,7 @@ export default function Dashboard() {
                   <tr key={m.id}>
                     <td>{m.marker_name}</td>
                     <td className={status}>{m.value}</td>
-                    <td>{m.unit || "—"}</td>
+                    <td>{m.unit && m.unit !== "1" ? m.unit : "—"}</td>
                     <td>
                       {m.reference_low != null && m.reference_high != null
                         ? `${m.reference_low}–${m.reference_high}`

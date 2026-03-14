@@ -3,6 +3,8 @@
 import asyncio
 import io
 import json
+import logging
+import math
 import os
 import re
 import shutil
@@ -11,6 +13,8 @@ import uuid
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 import fitz  # PyMuPDF
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -53,14 +57,55 @@ GROUP_ORDER = [
     "Metabolic",
     "Kidney Function",
     "Electrolytes",
-    "Liver Function",
+    "Urinalysis",
     "Lipids",
+    "Liver Function",
     "Thyroid",
     "Vitamins & Minerals",
     "Hormones",
-    "Urinalysis",
+    "Immunity & Serology",
     "Other",
 ]
+
+
+def _parse_numeric_value(raw) -> float | None:
+    """Parse and validate a numeric value from OCR output.
+
+    Handles common OCR artifacts: spaces in numbers, comma-as-decimal,
+    non-numeric strings. Returns None if the value cannot be parsed.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        if math.isfinite(raw):
+            return float(raw)
+        return None
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    # Handle spaces between digits:
+    # 1) Thousand separators: right part is exactly 3 digits → remove space
+    #    e.g. "1 500" -> "1500"
+    # 2) Otherwise treat space as a misread decimal point
+    #    e.g. "0 1" -> "0.1", "1 5" -> "1.5"
+    s = re.sub(r'(\d)\s+(\d{3})(?!\d)', r'\1\2', s)
+    s = re.sub(r'(\d)\s+(\d)', r'\1.\2', s)
+    # Replace comma decimal separator with dot (e.g. "0,1" -> "0.1")
+    # Only when comma appears between digits and there's at most one comma
+    if s.count(',') == 1:
+        s = re.sub(r'(\d),(\d)', r'\1.\2', s)
+    # Remove any remaining whitespace
+    s = s.replace(' ', '')
+    # Try to parse
+    try:
+        val = float(s)
+    except (ValueError, OverflowError):
+        return None
+    if not math.isfinite(val):
+        return None
+    return val
 
 
 def _normalize_marker_name_deterministic(name: str) -> str:
@@ -88,7 +133,7 @@ def _marker_matches(name: str, keywords: tuple[str, ...], patterns: tuple[str, .
 def _classify_marker_group(name: str) -> str:
     marker = _normalized_marker_key(name)
 
-    if _marker_matches(marker, ("wbc", "white blood", "neutroph", "lymph", "monocyt", "eosinoph", "basoph", "platelet", "hemoglobin", "hematocrit", "mcv", "mch", "mchc", "rdw", "reticul", "red blood", "rbc")):
+    if _marker_matches(marker, ("wbc", "white blood", "neutroph", "lymph", "monocyt", "eosinoph", "basoph", "platelet", "hemoglobin", "hematocrit", "mcv", "mch", "mchc", "rdw", "reticul", "red blood", "rbc", "lymfocyt", "neutrofil", "bazofil", "eozinofil", "hematokrit", "tromb", "granulocyt")):
         return "Blood Function"
     if _marker_matches(marker, ("ferritin", "iron", "transferrin", "tibc", "uibc")):
         return "Iron Status"
@@ -100,22 +145,24 @@ def _classify_marker_group(name: str) -> str:
         return "Kidney Function"
     if _marker_matches(
         marker,
-        ("sodium", "potassium", "chloride", "bicarbonate", "carbon dioxide", "anion gap", "osmolality", "bicarb", "magnesium"),
-        (r"\bna(?:\+)?\b", r"\bk(?:\+)?\b", r"\bcl(?:-)?\b", r"\bhco3(?:-)??\b", r"\bco2\b"),
+        ("sodium", "potassium", "chloride", "bicarbonate", "carbon dioxide", "anion gap", "osmolality", "bicarb", "magnesium", "horcik"),
+        (r"\bna(?:\+)?\b", r"\bk(?:\+)?\b", r"\bcl(?:-)?\b", r"\bhco3(?:-)??\b", r"\bco2\b", r"\bmg\b"),
     ):
         return "Electrolytes"
+    if _marker_matches(marker, ("urine", "leukocyte esterase", "nitrite", "specific gravity", "ketone", "proteinuria", "moci")):
+        return "Urinalysis"
+    if _marker_matches(marker, ("cholesterol", "triglycer", "hdl", "ldl", "apolipoprotein", "lipoprotein")):
+        return "Lipids"
     if _marker_matches(marker, ("alt", "ast", "ggt", "alp", "bilirubin", "albumin", "protein")):
         return "Liver Function"
-    if _marker_matches(marker, ("cholesterol", "triglycer", "hdl", "ldl", "apolipoprotein")):
-        return "Lipids"
     if _marker_matches(marker, ("tsh", "ft4", "free t4", "ft3", "free t3", "thyroid")):
         return "Thyroid"
-    if _marker_matches(marker, ("vitamin", "folate", "folic", "b12", "zinc", "selenium", "calcium", "phosphate")):
+    if _marker_matches(marker, ("vitamin", "folate", "folic", "b12", "zinc", "selenium", "calcium", "phosphate", "phosphorus", "vapnik")):
         return "Vitamins & Minerals"
     if _marker_matches(marker, ("testosterone", "estradiol", "progesterone", "lh", "fsh", "cortisol", "prolactin", "dhea", "hcg")):
         return "Hormones"
-    if _marker_matches(marker, ("urine", "leukocyte esterase", "nitrite", "specific gravity", "ketone", "proteinuria")):
-        return "Urinalysis"
+    if _marker_matches(marker, ("igg", "igm", "iga", "ige", "antibod", "protilatk")):
+        return "Immunity & Serology"
     return "Other"
 
 
@@ -447,6 +494,19 @@ async def _apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> lis
 
     new_measurements: list[Measurement] = []
     for m in result.get("measurements", []):
+        # Validate and clean numeric values
+        value = _parse_numeric_value(m.get("value"))
+        if value is None:
+            logger.warning(
+                "Skipping measurement %r: invalid value %r",
+                m.get("marker_name"),
+                m.get("value"),
+            )
+            continue
+
+        ref_low = _parse_numeric_value(m.get("reference_low"))
+        ref_high = _parse_numeric_value(m.get("reference_high"))
+
         measured_at = None
         if m.get("measured_at"):
             try:
@@ -457,10 +517,10 @@ async def _apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> lis
         meas = Measurement(
             lab_file_id=lab.id,
             marker_name=canonical_map.get(m["marker_name"], m["marker_name"]),
-            value=float(m["value"]),
+            value=value,
             unit=m.get("unit"),
-            reference_low=float(m["reference_low"]) if m.get("reference_low") is not None else None,
-            reference_high=float(m["reference_high"]) if m.get("reference_high") is not None else None,
+            reference_low=ref_low,
+            reference_high=ref_high,
             measured_at=measured_at or lab.lab_date,
             page_number=int(m["page_number"]) if m.get("page_number") is not None else None,
         )
@@ -755,7 +815,7 @@ async def measurement_sparkline(
         return Response(
             content=cached,
             media_type="image/png",
-            headers={"Cache-Control": "public, max-age=86400"},
+            headers={"Cache-Control": "no-store"},
         )
 
     values = [m.value for m in measurements]
@@ -772,7 +832,7 @@ async def measurement_sparkline(
     return Response(
         content=png_bytes,
         media_type="image/png",
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers={"Cache-Control": "no-store"},
     )
 
 

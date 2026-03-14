@@ -13,11 +13,12 @@ SPARKLINE_CACHE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "
 SPARKLINE_WIDTH = 180  # px
 SPARKLINE_HEIGHT = 40  # px
 DPI = 72
+STYLE_VERSION = "v4"  # bump when changing sparkline colors/styling
 
 
 def _cache_path(marker_name: str, signature: str) -> Path:
     """Return the cache file path for a given marker + signature."""
-    safe = hashlib.sha256(f"{marker_name}:{signature}".encode()).hexdigest()[:24]
+    safe = hashlib.sha256(f"{STYLE_VERSION}:{marker_name}:{signature}".encode()).hexdigest()[:24]
     return SPARKLINE_CACHE_DIR / f"{safe}.png"
 
 
@@ -47,14 +48,44 @@ def generate_sparkline(
 
     # Reference band
     if ref_low is not None and ref_high is not None:
-        ax.axhspan(ref_low, ref_high, color="#93c5fd", alpha=0.35)
-        ax.axhline(ref_low, color="#2563eb", linewidth=0.5, alpha=0.5)
-        ax.axhline(ref_high, color="#dc2626", linewidth=0.5, alpha=0.5)
+        ax.axhspan(ref_low, ref_high, color="#12c78e", alpha=0.22)
+        ax.axhline(ref_low, color="#12c78e", linewidth=0.7, alpha=0.6)
+        ax.axhline(ref_high, color="#f85149", linewidth=0.7, alpha=0.6)
 
-    # Value line
-    ax.plot(xs, values, color="#0f766e", linewidth=1.5, solid_capstyle="round")
-    # Dots
-    ax.scatter(xs, values, color="#0f766e", s=8, zorder=5)
+    COLOR_OK = "#22d9a0"
+    COLOR_OOR = "#f5a254"
+
+    def _is_oor(v: float) -> bool:
+        if ref_low is not None and v < ref_low:
+            return True
+        if ref_high is not None and v > ref_high:
+            return True
+        return False
+
+    # Draw line segments colored by out-of-range status
+    for i in range(len(values) - 1):
+        x0, x1 = xs[i], xs[i + 1]
+        v0, v1 = values[i], values[i + 1]
+        oor0, oor1 = _is_oor(v0), _is_oor(v1)
+
+        if not oor0 and not oor1:
+            # Both in range — full green segment
+            ax.plot([x0, x1], [v0, v1], color=COLOR_OK, linewidth=2.8, solid_capstyle="round")
+        elif oor0 and oor1:
+            # Both out of range — full orange segment
+            ax.plot([x0, x1], [v0, v1], color=COLOR_OOR, linewidth=2.8, solid_capstyle="round")
+        else:
+            # Mixed — split at midpoint
+            xm = (x0 + x1) / 2
+            vm = (v0 + v1) / 2
+            c0 = COLOR_OOR if oor0 else COLOR_OK
+            c1 = COLOR_OOR if oor1 else COLOR_OK
+            ax.plot([x0, xm], [v0, vm], color=c0, linewidth=2.8, solid_capstyle="round")
+            ax.plot([xm, x1], [vm, v1], color=c1, linewidth=2.8, solid_capstyle="round")
+
+    # Dots — orange for out-of-range, bright green for in-range
+    dot_colors = [COLOR_OOR if _is_oor(v) else COLOR_OK for v in values]
+    ax.scatter(xs, values, c=dot_colors, s=20, zorder=5, edgecolors="none")
 
     # Padding
     all_vals = list(values)
