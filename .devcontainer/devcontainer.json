@@ -1,0 +1,13 @@
+{
+  "name": "Health Dashboard",
+  "forwardPorts": [8000, 5173],
+  "portsAttributes": {
+    "8000": {
+      "label": "API (FastAPI)",
+      "visibility": "public"
+    },
+    "5173": {
+      "label": "Frontend (Vite)"
+    }
+  }
+}

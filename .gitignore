@@ -3,6 +3,16 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Health Dashboard
+backend/data/
+backend/src/data/
+backend/.venv/
+frontend/node_modules/
+frontend/dist/
+*.db
+*.db-journal
+.env
+
 # C extensions
 *.so
 
