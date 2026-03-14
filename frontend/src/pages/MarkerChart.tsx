@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import Select from "react-select";
 import {
   LineChart,
   Line,
@@ -53,6 +54,25 @@ export default function MarkerChart() {
   const refLow = data.find((m) => m.reference_low != null)?.reference_low;
   const refHigh = data.find((m) => m.reference_high != null)?.reference_high;
   const unit = data.find((m) => m.unit)?.unit || "";
+  const yAxisValues = data.flatMap((measurement) => {
+    const values = [
+      measurement.value,
+      measurement.reference_low,
+      measurement.reference_high,
+    ];
+
+    return values.filter(
+      (value): value is number => value != null && Number.isFinite(value),
+    );
+  });
+  const yAxisDomain: [number, number] = (() => {
+    const min = Math.min(...yAxisValues);
+    const max = Math.max(...yAxisValues);
+    const span = max - min;
+    const padding = span === 0 ? Math.max(Math.abs(max) * 0.1, 1) : span * 0.1;
+
+    return [min - padding, max + padding];
+  })();
 
   const toggleId = (id: number) => {
     setSelectedIds((prev) => {
@@ -91,16 +111,14 @@ export default function MarkerChart() {
       <h2>Marker Charts</h2>
 
       <div className="flex-row mb-1">
-        <select
-          value={selectedMarker}
-          onChange={(e) => setSelectedMarker(e.target.value)}
-        >
-          {markers.map((m) => (
-            <option key={m} value={m}>
-              {m}
-            </option>
-          ))}
-        </select>
+        <Select
+          options={markers.map((m) => ({ value: m, label: m }))}
+          value={selectedMarker ? { value: selectedMarker, label: selectedMarker } : null}
+          onChange={(opt) => opt && setSelectedMarker(opt.value)}
+          isSearchable
+          placeholder="Search markers…"
+          styles={{ container: (base) => ({ ...base, minWidth: 250 }) }}
+        />
 
         {selectedIds.size > 0 && (
           <button
@@ -136,6 +154,7 @@ export default function MarkerChart() {
                 <CartesianGrid strokeDasharray="3 3" />
                 <XAxis dataKey="date" />
                 <YAxis
+                  domain={yAxisDomain}
                   label={{
                     value: unit,
                     angle: -90,
