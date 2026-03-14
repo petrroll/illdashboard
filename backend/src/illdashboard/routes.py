@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +17,7 @@ from illdashboard.copilot_service import explain_markers, ocr_extract
 from illdashboard.database import get_db
 from illdashboard.models import LabFile, Measurement
 from illdashboard.schemas import (
+    BatchOcrRequest,
     ExplainRequest,
     ExplainResponse,
     LabFileOut,
@@ -101,12 +103,27 @@ async def run_ocr(file_id: int, db: AsyncSession = Depends(get_db)):
     if not lab:
         raise HTTPException(404, "File not found")
 
-    fpath = Path(settings.UPLOAD_DIR) / lab.filepath
+    new_measurements = await _run_ocr_for_file(lab, db)
+    await db.commit()
+    for meas in new_measurements:
+        await db.refresh(meas)
+    return new_measurements
 
-    # The Copilot SDK reads the file directly from disk, handles encoding/resizing
+
+async def _run_ocr_for_file(lab: LabFile, db: AsyncSession) -> list[Measurement]:
+    """Run OCR on a single LabFile and persist results. Caller must commit."""
+    # Remove existing measurements to avoid duplicates on reprocessing
+    existing = await db.execute(
+        select(Measurement).where(Measurement.lab_file_id == lab.id)
+    )
+    for m in existing.scalars().all():
+        await db.delete(m)
+    lab.ocr_raw = None
+    await db.flush()
+
+    fpath = Path(settings.UPLOAD_DIR) / lab.filepath
     result = await ocr_extract(str(fpath.resolve()))
 
-    # Persist raw OCR output
     lab.ocr_raw = json.dumps(result)
     if result.get("lab_date"):
         try:
@@ -114,7 +131,6 @@ async def run_ocr(file_id: int, db: AsyncSession = Depends(get_db)):
         except (ValueError, TypeError):
             pass
 
-    # Create measurements
     new_measurements: list[Measurement] = []
     for m in result.get("measurements", []):
         measured_at = None
@@ -136,10 +152,70 @@ async def run_ocr(file_id: int, db: AsyncSession = Depends(get_db)):
         db.add(meas)
         new_measurements.append(meas)
 
-    await db.commit()
-    for meas in new_measurements:
-        await db.refresh(meas)
     return new_measurements
+
+
+@router.post("/files/ocr/batch", tags=["ocr"])
+async def batch_ocr(req: BatchOcrRequest, db: AsyncSession = Depends(get_db)):
+    """Reprocess selected files with NDJSON streaming progress."""
+    # Validate all IDs upfront before streaming
+    labs = []
+    for fid in req.file_ids:
+        lab = await db.get(LabFile, fid)
+        if not lab:
+            raise HTTPException(404, f"File {fid} not found")
+        labs.append(lab)
+
+    async def generate():
+        total = len(labs)
+        for idx, lab in enumerate(labs):
+            yield json.dumps({"type": "progress", "file_id": lab.id, "filename": lab.filename, "index": idx, "total": total, "status": "processing"}) + "\n"
+            try:
+                # Delete existing measurements
+                existing = await db.execute(
+                    select(Measurement).where(Measurement.lab_file_id == lab.id)
+                )
+                for m in existing.scalars().all():
+                    await db.delete(m)
+                lab.ocr_raw = None
+                await db.flush()
+
+                await _run_ocr_for_file(lab, db)
+                await db.commit()
+                yield json.dumps({"type": "progress", "file_id": lab.id, "filename": lab.filename, "index": idx, "total": total, "status": "done"}) + "\n"
+            except Exception as e:
+                await db.rollback()
+                yield json.dumps({"type": "progress", "file_id": lab.id, "filename": lab.filename, "index": idx, "total": total, "status": "error", "error": str(e)}) + "\n"
+        yield json.dumps({"type": "complete"}) + "\n"
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
+@router.post("/files/ocr/unprocessed", tags=["ocr"])
+async def ocr_unprocessed(db: AsyncSession = Depends(get_db)):
+    """Run OCR on all unprocessed files with NDJSON streaming progress."""
+    result = await db.execute(
+        select(LabFile).where(LabFile.ocr_raw.is_(None))
+    )
+    labs = list(result.scalars().all())
+
+    async def generate():
+        if not labs:
+            yield json.dumps({"type": "complete"}) + "\n"
+            return
+        total = len(labs)
+        for idx, lab in enumerate(labs):
+            yield json.dumps({"type": "progress", "file_id": lab.id, "filename": lab.filename, "index": idx, "total": total, "status": "processing"}) + "\n"
+            try:
+                await _run_ocr_for_file(lab, db)
+                await db.commit()
+                yield json.dumps({"type": "progress", "file_id": lab.id, "filename": lab.filename, "index": idx, "total": total, "status": "done"}) + "\n"
+            except Exception as e:
+                await db.rollback()
+                yield json.dumps({"type": "progress", "file_id": lab.id, "filename": lab.filename, "index": idx, "total": total, "status": "error", "error": str(e)}) + "\n"
+        yield json.dumps({"type": "complete"}) + "\n"
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 
 # ── Measurements ─────────────────────────────────────────────────────────────

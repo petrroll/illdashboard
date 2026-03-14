@@ -59,5 +59,12 @@ class MultiExplainRequest(BaseModel):
     measurements: list[ExplainRequest]
 
 
+# ── Batch OCR ────────────────────────────────────────────────────────────────
+
+
+class BatchOcrRequest(BaseModel):
+    file_ids: list[int]
+
+
 class ExplainResponse(BaseModel):
     explanation: str

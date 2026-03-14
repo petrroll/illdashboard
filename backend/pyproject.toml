@@ -12,6 +12,7 @@ dependencies = [
     "pydantic>=2.10,<3",
     "pydantic-settings>=2.7,<3",
     "github-copilot-sdk",
+    "pymupdf>=1.25,<2",
 ]
 
 [project.optional-dependencies]
