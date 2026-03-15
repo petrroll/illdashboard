@@ -163,6 +163,29 @@ class BatchOcrRequest(BaseModel):
     file_ids: list[int]
 
 
+class OcrJobProgressOut(BaseModel):
+    file_id: int
+    filename: str
+    index: int
+    total: int
+    status: str
+    error: str | None = None
+
+
+class OcrJobStartResponse(BaseModel):
+    job_id: str
+
+
+class OcrJobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    total: int
+    completed_count: int
+    error_count: int
+    last_updated_at: float
+    progress: list[OcrJobProgressOut] = Field(default_factory=list)
+
+
 class ExplainResponse(BaseModel):
     explanation: str
 

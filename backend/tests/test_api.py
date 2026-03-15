@@ -1,5 +1,6 @@
 """Smoke tests for the API."""
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -14,6 +15,7 @@ from illdashboard import config
 from illdashboard.database import create_database_engine
 from illdashboard.main import preload_uploaded_files
 from illdashboard.models import Base, LabFile, LabFileTag, MarkerTag, Measurement, MeasurementType
+from illdashboard.services import ocr as ocr_service
 
 
 @pytest.mark.asyncio
@@ -137,6 +139,11 @@ OCR_RESULT = {
     ],
 }
 
+OCR_RESULT_WITH_SOURCE = {
+    **OCR_RESULT,
+    "source": "jaeger",
+}
+
 MAGNESIUM_RESULT = {
     "lab_date": "2025-09-05",
     "raw_text": "Magnesium 0.85 mmol/l",
@@ -211,6 +218,22 @@ async def _upload_pdf(client, filename: str = "lab.pdf"):
 
 def _parse_ndjson(text: str) -> list[dict]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+async def _wait_for_ocr_job(client, job_id: str, *, timeout: float = 5.0) -> dict:
+    deadline = asyncio.get_running_loop().time() + timeout
+    last_payload: dict | None = None
+
+    while asyncio.get_running_loop().time() < deadline:
+        response = await client.get(f"/api/files/ocr/jobs/{job_id}")
+        assert response.status_code == 200
+        payload = response.json()
+        last_payload = payload
+        if payload["status"] in {"completed", "failed"}:
+            return payload
+        await asyncio.sleep(0.01)
+
+    raise AssertionError(f"OCR job {job_id} did not finish in time: {last_payload}")
 
 
 def _open_current_test_db():
@@ -601,8 +624,8 @@ async def test_set_marker_tags_allows_extending_existing_tag_list(client):
 
 
 @pytest.mark.asyncio
-async def test_batch_and_unprocessed_share_streaming_behavior(client):
-    """Both streaming OCR endpoints should emit completion and persist processed data."""
+async def test_batch_and_unprocessed_share_job_behavior(client):
+    """Both batch OCR endpoints should return a job id and persist processed data."""
     first_file_id = await _upload_pdf(client)
     second_file_id = await _upload_pdf(client)
 
@@ -610,14 +633,11 @@ async def test_batch_and_unprocessed_share_streaming_behavior(client):
         unprocessed_resp = await client.post("/api/files/ocr/unprocessed")
 
     assert unprocessed_resp.status_code == 200
-    unprocessed_messages = _parse_ndjson(unprocessed_resp.text)
-    assert unprocessed_messages[-1] == {"type": "complete"}
-    unprocessed_done_ids = sorted(
-        message["file_id"]
-        for message in unprocessed_messages
-        if message.get("type") == "progress" and message.get("status") == "done"
-    )
-    assert unprocessed_done_ids == [first_file_id, second_file_id]
+    unprocessed_job = await _wait_for_ocr_job(client, unprocessed_resp.json()["job_id"])
+    assert unprocessed_job["status"] == "completed"
+    assert sorted(
+        item["file_id"] for item in unprocessed_job["progress"] if item["status"] == "done"
+    ) == [first_file_id, second_file_id]
 
     batch_result = {
         "lab_date": "2025-09-06",
@@ -636,20 +656,113 @@ async def test_batch_and_unprocessed_share_streaming_behavior(client):
         batch_resp = await client.post("/api/files/ocr/batch", json={"file_ids": [first_file_id]})
 
     assert batch_resp.status_code == 200
-    batch_messages = _parse_ndjson(batch_resp.text)
-    assert batch_messages[-1] == {"type": "complete"}
-    batch_done_ids = [
-        message["file_id"]
-        for message in batch_messages
-        if message.get("type") == "progress" and message.get("status") == "done"
-    ]
-    assert batch_done_ids == [first_file_id]
+    batch_job = await _wait_for_ocr_job(client, batch_resp.json()["job_id"])
+    assert batch_job["status"] == "completed"
+    assert [item["file_id"] for item in batch_job["progress"] if item["status"] == "done"] == [first_file_id]
 
     measurements_resp = await client.get(f"/api/files/{first_file_id}/measurements")
     assert measurements_resp.status_code == 200
     measurements = measurements_resp.json()
     assert len(measurements) == 1
     assert measurements[0]["value"] == 141
+
+
+@pytest.mark.asyncio
+async def test_batch_ocr_job_reports_processing_before_completion(client):
+    file_id = await _upload_pdf(client)
+
+    async def slow_extract(_lab):
+        await asyncio.sleep(0.02)
+        return OCR_RESULT
+
+    with patch("illdashboard.services.ocr.extract_ocr_result", side_effect=slow_extract):
+        response = await client.post("/api/files/ocr/batch", json={"file_ids": [file_id]})
+
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    status_resp = await client.get(f"/api/files/ocr/jobs/{job_id}")
+    assert status_resp.status_code == 200
+    status_payload = status_resp.json()
+    assert status_payload["status"] in {"queued", "running"}
+    assert any(item["status"] == "processing" for item in status_payload["progress"])
+
+    final_payload = await _wait_for_ocr_job(client, job_id)
+    assert final_payload["status"] == "completed"
+    assert final_payload["completed_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reprocessing_same_source_tag_does_not_fail_or_duplicate(client):
+    file_id = await _upload_pdf(client, filename="jaeger.pdf")
+
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT_WITH_SOURCE):
+        first_resp = await client.post(f"/api/files/{file_id}/ocr")
+        assert first_resp.status_code == 200
+
+        second_resp = await client.post(f"/api/files/{file_id}/ocr")
+        assert second_resp.status_code == 200
+
+    file_resp = await client.get(f"/api/files/{file_id}")
+    assert file_resp.status_code == 200
+    assert file_resp.json()["tags"].count("source:jaeger") == 1
+
+
+def test_get_ocr_job_status_prunes_expired_finished_jobs():
+    old_job = ocr_service.OcrJobState(
+        job_id="expired-job",
+        status="completed",
+        total=1,
+        last_updated_at=100,
+        finished_at=100,
+    )
+    fresh_job = ocr_service.OcrJobState(
+        job_id="fresh-job",
+        status="completed",
+        total=1,
+        last_updated_at=1000,
+        finished_at=1000,
+    )
+
+    original_jobs = dict(ocr_service._ocr_jobs)
+    try:
+        ocr_service._ocr_jobs.clear()
+        ocr_service._ocr_jobs[old_job.job_id] = old_job
+        ocr_service._ocr_jobs[fresh_job.job_id] = fresh_job
+
+        with patch("illdashboard.services.ocr.time.time", return_value=100 + ocr_service.OCR_JOB_TTL_SECONDS + 1):
+            with pytest.raises(ocr_service.HTTPException) as exc_info:
+                ocr_service.get_ocr_job_status(old_job.job_id)
+
+        assert exc_info.value.status_code == 404
+        assert old_job.job_id not in ocr_service._ocr_jobs
+        assert fresh_job.job_id in ocr_service._ocr_jobs
+    finally:
+        ocr_service._ocr_jobs.clear()
+        ocr_service._ocr_jobs.update(original_jobs)
+
+
+def test_get_ocr_job_status_exposes_last_updated_at():
+    now = 1235.0
+    job = ocr_service.OcrJobState(
+        job_id="job-with-timestamp",
+        status="running",
+        total=1,
+        last_updated_at=now - 0.5,
+    )
+
+    original_jobs = dict(ocr_service._ocr_jobs)
+    try:
+        ocr_service._ocr_jobs.clear()
+        ocr_service._ocr_jobs[job.job_id] = job
+
+        with patch("illdashboard.services.ocr.time.time", return_value=now):
+            payload = ocr_service.get_ocr_job_status(job.job_id)
+
+        assert payload["last_updated_at"] == now - 0.5
+    finally:
+        ocr_service._ocr_jobs.clear()
+        ocr_service._ocr_jobs.update(original_jobs)
 
 
 @pytest.mark.asyncio

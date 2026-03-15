@@ -12,15 +12,15 @@ from pathlib import Path
 
 import fitz
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from illdashboard.config import settings
 from illdashboard.database import get_db
 from illdashboard.models import LabFile, LabFileTag, Measurement
-from illdashboard.schemas import BatchOcrRequest, LabFileOut, MeasurementOut
+from illdashboard.schemas import BatchOcrRequest, LabFileOut, MeasurementOut, OcrJobStartResponse, OcrJobStatusResponse
 from illdashboard.services import ocr as ocr_service
 from illdashboard.services import search as search_service
 
@@ -67,8 +67,11 @@ def render_pdf_page(file_path: Path, page_num: int) -> bytes:
     return buffer.getvalue()
 
 
-def ocr_streaming_response(labs: list[LabFile], db: AsyncSession) -> StreamingResponse:
-    return StreamingResponse(ocr_service.stream_ocr_for_labs(labs, db), media_type="application/x-ndjson")
+def get_session_factory(db: AsyncSession) -> async_sessionmaker[AsyncSession]:
+    bind = db.bind
+    if bind is None:
+        raise HTTPException(500, "Database session is not bound")
+    return async_sessionmaker(bind=bind, class_=AsyncSession, expire_on_commit=False)
 
 
 def hash_file_content(content: bytes) -> str:
@@ -199,13 +202,18 @@ async def run_ocr(file_id: int, db: AsyncSession = Depends(get_db)):
     return result.scalars().all()
 
 
-@router.post("/files/ocr/batch", tags=["ocr"])
+@router.post("/files/ocr/batch", response_model=OcrJobStartResponse, tags=["ocr"])
 async def batch_ocr(req: BatchOcrRequest, db: AsyncSession = Depends(get_db)):
     labs = await ocr_service.load_labs_for_ocr(db, file_ids=req.file_ids)
-    return ocr_streaming_response(labs, db)
+    return ocr_service.start_ocr_job(labs, get_session_factory(db))
 
 
-@router.post("/files/ocr/unprocessed", tags=["ocr"])
+@router.post("/files/ocr/unprocessed", response_model=OcrJobStartResponse, tags=["ocr"])
 async def ocr_unprocessed(db: AsyncSession = Depends(get_db)):
     labs = await ocr_service.load_labs_for_ocr(db, only_unprocessed=True)
-    return ocr_streaming_response(labs, db)
+    return ocr_service.start_ocr_job(labs, get_session_factory(db))
+
+
+@router.get("/files/ocr/jobs/{job_id}", response_model=OcrJobStatusResponse, tags=["ocr"])
+async def get_ocr_job(job_id: str):
+    return ocr_service.get_ocr_job_status(job_id)

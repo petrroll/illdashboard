@@ -15,6 +15,23 @@ export interface OcrProgress {
   error?: string;
 }
 
+interface OcrJobStartResponse {
+  job_id: string;
+}
+
+interface OcrJobStatusResponse {
+  job_id: string;
+  status: "queued" | "running" | "completed" | "failed";
+  total: number;
+  completed_count: number;
+  error_count: number;
+  last_updated_at: number;
+  progress: OcrProgress[];
+}
+
+const OCR_JOB_POLL_INTERVAL_MS = 1500;
+const OCR_JOB_IDLE_POLL_INTERVAL_MS = 10000;
+
 function buildTagQueryParams(tags: string[]) {
   const params = new URLSearchParams();
   for (const tag of tags) {
@@ -61,45 +78,67 @@ export async function runFileOcr(fileId: string | number) {
   return response.data;
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function progressChanged(previous: OcrProgress | undefined, current: OcrProgress) {
+  if (!previous) {
+    return true;
+  }
+  return previous.status !== current.status || previous.error !== current.error;
+}
+
+function jobSnapshotChanged(previous: OcrJobStatusResponse | null, current: OcrJobStatusResponse) {
+  if (!previous) {
+    return true;
+  }
+  return (
+    previous.status !== current.status ||
+    previous.completed_count !== current.completed_count ||
+    previous.error_count !== current.error_count ||
+    previous.last_updated_at !== current.last_updated_at ||
+    previous.progress.length !== current.progress.length
+  );
+}
+
 export async function streamOcr(
   url: string,
   body: object | undefined,
   onProgress: (progress: OcrProgress) => void,
 ): Promise<void> {
-  const response = await fetch(`/api${url}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-
-  if (!response.ok || !response.body) {
-    throw new Error("Stream request failed");
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  const startResponse = await apiClient.post<OcrJobStartResponse>(url, body);
+  const { job_id: jobId } = startResponse.data;
+  const seenProgress = new Map<number, OcrProgress>();
+  let previousJob: OcrJobStatusResponse | null = null;
 
   while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
+    const statusResponse = await apiClient.get<OcrJobStatusResponse>(`/files/ocr/jobs/${jobId}`);
+    const job = statusResponse.data;
+    let hasProgressChange = false;
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-
-    for (const line of lines) {
-      if (!line.trim()) {
-        continue;
-      }
-
-      const message = JSON.parse(line);
-      if (message.type === "progress") {
-        onProgress(message as OcrProgress);
+    for (const progress of job.progress) {
+      const previous = seenProgress.get(progress.file_id);
+      if (progressChanged(previous, progress)) {
+        seenProgress.set(progress.file_id, progress);
+        hasProgressChange = true;
+        onProgress(progress);
       }
     }
+
+    if (job.status === "completed") {
+      return;
+    }
+
+    if (job.status === "failed") {
+      throw new Error("OCR job failed");
+    }
+
+    const pollDelay = hasProgressChange || jobSnapshotChanged(previousJob, job)
+      ? OCR_JOB_POLL_INTERVAL_MS
+      : OCR_JOB_IDLE_POLL_INTERVAL_MS;
+    previousJob = job;
+    await sleep(pollDelay);
   }
 }
 

@@ -7,13 +7,16 @@ import json
 import logging
 import math
 import re
+import time
 import unicodedata
+import uuid
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import HTTPException
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from illdashboard.config import settings
 from illdashboard.copilot_service import normalize_marker_names, normalize_source_name, ocr_extract
@@ -34,6 +37,51 @@ from illdashboard.services.markers import (
 logger = logging.getLogger(__name__)
 
 MAX_OCR_CONCURRENCY = 4
+OCR_STREAM_KEEPALIVE_INTERVAL = 10
+OCR_JOB_TTL_SECONDS = 600
+
+
+@dataclass
+class OcrJobProgress:
+    file_id: int
+    filename: str
+    index: int
+    total: int
+    status: str
+    error: str | None = None
+
+
+@dataclass
+class OcrJobState:
+    job_id: str
+    status: str
+    total: int
+    progress_by_file: dict[int, OcrJobProgress] = field(default_factory=dict)
+    completed_count: int = 0
+    error_count: int = 0
+    created_at: float = field(default_factory=time.time)
+    last_updated_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    finished_at: float | None = None
+    task: asyncio.Task | None = None
+
+
+_ocr_jobs: dict[str, OcrJobState] = {}
+
+
+def _prune_ocr_jobs(*, now: float | None = None) -> None:
+    current_time = time.time() if now is None else now
+    expired_job_ids = [
+        job_id
+        for job_id, job in _ocr_jobs.items()
+        if current_time - job.last_updated_at >= OCR_JOB_TTL_SECONDS
+    ]
+    for job_id in expired_job_ids:
+        _ocr_jobs.pop(job_id, None)
+
+
+def _touch_job(job: OcrJobState, *, now: float | None = None) -> None:
+    job.last_updated_at = time.time() if now is None else now
 
 QUALITATIVE_TRUE_VALUES = {
     "positive",
@@ -172,18 +220,21 @@ async def normalize_lab_source(lab: LabFile, result: dict, db: AsyncSession) -> 
 async def sync_lab_source_tag(lab: LabFile, source_value: str | None, db: AsyncSession) -> None:
     tag_result = await db.execute(select(LabFileTag).where(LabFileTag.lab_file_id == lab.id))
     existing_tags = tag_result.scalars().all()
+    existing_source_tags = [tag for tag in existing_tags if is_source_tag(tag.tag)]
 
-    for tag in existing_tags:
-        if is_source_tag(tag.tag):
-            await db.delete(tag)
-
-    if not source_value:
-        await db.flush()
+    source_tag = build_source_tag(source_value) if source_value else None
+    if len(existing_source_tags) == 1 and existing_source_tags[0].tag == source_tag:
         return
 
-    source_tag = build_source_tag(source_value)
+    for tag in existing_source_tags:
+        await db.delete(tag)
+
+    await db.flush()
+
+    if not source_value:
+        return
+
     if source_tag is None:
-        await db.flush()
         return
 
     db.add(LabFileTag(lab_file_id=lab.id, tag=source_tag))
@@ -191,6 +242,12 @@ async def sync_lab_source_tag(lab: LabFile, source_value: str | None, db: AsyncS
 
 
 async def apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list[Measurement]:
+    logger.info(
+        "Applying OCR result file_id=%s filename=%s measurements=%s",
+        lab.id,
+        lab.filename,
+        len(result.get("measurements", [])),
+    )
     lab.ocr_raw = json.dumps(result)
     lab.ocr_text_raw = normalize_document_text(result.get("raw_text"))
     lab.ocr_text_english = normalize_document_text(result.get("translated_text_english") or result.get("translated_text"))
@@ -267,10 +324,29 @@ async def apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list
 
 async def extract_ocr_result(lab: LabFile) -> dict:
     file_path = Path(settings.UPLOAD_DIR) / lab.filepath
-    return await ocr_extract(str(file_path.resolve()), filename=lab.filename)
+    resolved_path = str(file_path.resolve())
+    started_at = time.perf_counter()
+    logger.info(
+        "OCR extraction start file_id=%s filename=%s path=%s mime_type=%s",
+        lab.id,
+        lab.filename,
+        resolved_path,
+        lab.mime_type,
+    )
+    result = await ocr_extract(resolved_path, filename=lab.filename)
+    logger.info(
+        "OCR extraction finished file_id=%s filename=%s duration=%.2fs measurements=%s",
+        lab.id,
+        lab.filename,
+        time.perf_counter() - started_at,
+        len(result.get("measurements", [])),
+    )
+    return result
 
 
 async def persist_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list[Measurement]:
+    started_at = time.perf_counter()
+    logger.info("Persist OCR result start file_id=%s filename=%s", lab.id, lab.filename)
     existing = await db.execute(select(Measurement).where(Measurement.lab_file_id == lab.id))
     for measurement in existing.scalars().all():
         await db.delete(measurement)
@@ -283,6 +359,13 @@ async def persist_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> li
     new_measurements = await apply_ocr_result(lab, result, db)
     await db.flush()
     await search_service.refresh_lab_search_document(lab.id, db)
+    logger.info(
+        "Persist OCR result finished file_id=%s filename=%s duration=%.2fs saved_measurements=%s",
+        lab.id,
+        lab.filename,
+        time.perf_counter() - started_at,
+        len(new_measurements),
+    )
     return new_measurements
 
 
@@ -312,12 +395,207 @@ def progress_payload(
     return json.dumps(payload) + "\n"
 
 
+def keepalive_payload() -> str:
+    return json.dumps({"type": "keepalive"}) + "\n"
+
+
+def _make_progress(*, lab: LabFile, index: int, total: int, status: str, error: str | None = None) -> OcrJobProgress:
+    return OcrJobProgress(
+        file_id=lab.id,
+        filename=lab.filename,
+        index=index,
+        total=total,
+        status=status,
+        error=error,
+    )
+
+
+def _job_status_payload(job: OcrJobState) -> dict:
+    progress = [
+        asdict(item)
+        for item in sorted(job.progress_by_file.values(), key=lambda current: current.index)
+    ]
+    return {
+        "job_id": job.job_id,
+        "status": job.status,
+        "total": job.total,
+        "completed_count": job.completed_count,
+        "error_count": job.error_count,
+        "last_updated_at": job.last_updated_at,
+        "progress": progress,
+    }
+
+
+def get_ocr_job_status(job_id: str) -> dict:
+    _prune_ocr_jobs()
+    job = _ocr_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "OCR job not found")
+    return _job_status_payload(job)
+
+
+async def _run_ocr_job(job: OcrJobState, labs: list[LabFile], session_factory: async_sessionmaker[AsyncSession]) -> None:
+    stream_started_at = time.perf_counter()
+    total = len(labs)
+    job.status = "running"
+    job.started_at = time.time()
+    _touch_job(job, now=job.started_at)
+    logger.info("Starting OCR job job_id=%s total_files=%s file_ids=%s", job.job_id, total, [lab.id for lab in labs])
+
+    for index, lab in enumerate(labs):
+        job.progress_by_file[lab.id] = _make_progress(
+            lab=lab,
+            index=index,
+            total=total,
+            status="processing",
+        )
+    _touch_job(job)
+
+    semaphore = asyncio.Semaphore(MAX_OCR_CONCURRENCY)
+
+    async def extract_one(index: int, lab: LabFile):
+        async with semaphore:
+            started_at = time.perf_counter()
+            logger.info(
+                "OCR worker acquired job_id=%s file_id=%s filename=%s queue_index=%s/%s",
+                job.job_id,
+                lab.id,
+                lab.filename,
+                index + 1,
+                total,
+            )
+            try:
+                result = await extract_ocr_result(lab)
+                logger.info(
+                    "OCR worker completed extraction job_id=%s file_id=%s filename=%s duration=%.2fs",
+                    job.job_id,
+                    lab.id,
+                    lab.filename,
+                    time.perf_counter() - started_at,
+                )
+                return index, lab, result, None
+            except Exception as exc:
+                logger.exception(
+                    "OCR extraction failed for job_id=%s file id=%s filename=%r path=%r",
+                    job.job_id,
+                    lab.id,
+                    lab.filename,
+                    lab.filepath,
+                )
+                return index, lab, None, exc
+
+    tasks = [asyncio.create_task(extract_one(index, lab)) for index, lab in enumerate(labs)]
+
+    try:
+        for future in asyncio.as_completed(tasks):
+            index, lab, result, error = await future
+            if error:
+                logger.warning(
+                    "OCR job extraction error job_id=%s file_id=%s filename=%s queue_index=%s/%s error=%s",
+                    job.job_id,
+                    lab.id,
+                    lab.filename,
+                    index + 1,
+                    total,
+                    error,
+                )
+                job.progress_by_file[lab.id] = _make_progress(
+                    lab=lab,
+                    index=index,
+                    total=total,
+                    status="error",
+                    error=str(error),
+                )
+                job.error_count += 1
+                _touch_job(job)
+                continue
+
+            try:
+                assert result is not None
+                async with session_factory() as session:
+                    persistent_lab = await session.get(LabFile, lab.id)
+                    if persistent_lab is None:
+                        raise HTTPException(404, f"File {lab.id} not found")
+                    await persist_ocr_result(persistent_lab, result, session)
+                    await session.commit()
+                logger.info(
+                    "OCR job file complete job_id=%s file_id=%s filename=%s queue_index=%s/%s",
+                    job.job_id,
+                    lab.id,
+                    lab.filename,
+                    index + 1,
+                    total,
+                )
+                job.progress_by_file[lab.id] = _make_progress(
+                    lab=lab,
+                    index=index,
+                    total=total,
+                    status="done",
+                )
+                job.completed_count += 1
+                _touch_job(job)
+            except Exception as exc:
+                logger.exception(
+                    "Persisting OCR result failed for job_id=%s file id=%s filename=%r path=%r",
+                    job.job_id,
+                    lab.id,
+                    lab.filename,
+                    lab.filepath,
+                )
+                job.progress_by_file[lab.id] = _make_progress(
+                    lab=lab,
+                    index=index,
+                    total=total,
+                    status="error",
+                    error=str(exc),
+                )
+                job.error_count += 1
+                _touch_job(job)
+
+        job.status = "completed"
+        job.finished_at = time.time()
+        _touch_job(job, now=job.finished_at)
+        logger.info(
+            "OCR job complete job_id=%s total_files=%s completed=%s errors=%s duration=%.2fs",
+            job.job_id,
+            total,
+            job.completed_count,
+            job.error_count,
+            time.perf_counter() - stream_started_at,
+        )
+    except Exception:
+        job.status = "failed"
+        job.finished_at = time.time()
+        _touch_job(job, now=job.finished_at)
+        logger.exception("OCR job failed job_id=%s", job.job_id)
+        raise
+
+
+def start_ocr_job(labs: list[LabFile], session_factory: async_sessionmaker[AsyncSession]) -> dict:
+    _prune_ocr_jobs()
+    job_id = uuid.uuid4().hex
+    job = OcrJobState(job_id=job_id, status="queued", total=len(labs))
+    _ocr_jobs[job_id] = job
+
+    if not labs:
+        job.status = "completed"
+        job.started_at = time.time()
+        job.finished_at = time.time()
+        _touch_job(job, now=job.finished_at)
+        return _job_status_payload(job)
+
+    job.task = asyncio.create_task(_run_ocr_job(job, labs, session_factory))
+    return _job_status_payload(job)
+
+
 async def stream_ocr_for_labs(labs: list[LabFile], db: AsyncSession):
     if not labs:
         yield json.dumps({"type": "complete"}) + "\n"
         return
 
+    stream_started_at = time.perf_counter()
     total = len(labs)
+    logger.info("Starting OCR stream total_files=%s file_ids=%s", total, [lab.id for lab in labs])
     for index, lab in enumerate(labs):
         yield progress_payload(lab=lab, index=index, total=total, status="processing")
 
@@ -325,8 +603,22 @@ async def stream_ocr_for_labs(labs: list[LabFile], db: AsyncSession):
 
     async def extract_one(index: int, lab: LabFile):
         async with semaphore:
+            started_at = time.perf_counter()
+            logger.info(
+                "OCR worker acquired file_id=%s filename=%s queue_index=%s/%s",
+                lab.id,
+                lab.filename,
+                index + 1,
+                total,
+            )
             try:
                 result = await extract_ocr_result(lab)
+                logger.info(
+                    "OCR worker completed extraction file_id=%s filename=%s duration=%.2fs",
+                    lab.id,
+                    lab.filename,
+                    time.perf_counter() - started_at,
+                )
                 return index, lab, result, None
             except Exception as exc:
                 logger.exception(
@@ -339,27 +631,59 @@ async def stream_ocr_for_labs(labs: list[LabFile], db: AsyncSession):
 
     tasks = [asyncio.create_task(extract_one(index, lab)) for index, lab in enumerate(labs)]
 
-    for future in asyncio.as_completed(tasks):
-        index, lab, result, error = await future
-        if error:
-            yield progress_payload(lab=lab, index=index, total=total, status="error", error=str(error))
+    pending = set(tasks)
+    while pending:
+        done, pending = await asyncio.wait(
+            pending,
+            timeout=OCR_STREAM_KEEPALIVE_INTERVAL,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            logger.info(
+                "OCR stream keepalive pending=%s elapsed=%.2fs",
+                len(pending),
+                time.perf_counter() - stream_started_at,
+            )
+            yield keepalive_payload()
             continue
 
-        try:
-            assert result is not None
-            await persist_ocr_result(lab, result, db)
-            await db.commit()
-            yield progress_payload(lab=lab, index=index, total=total, status="done")
-        except Exception as exc:
-            await db.rollback()
-            logger.exception(
-                "Persisting OCR result failed for file id=%s filename=%r path=%r",
-                lab.id,
-                lab.filename,
-                lab.filepath,
-            )
-            yield progress_payload(lab=lab, index=index, total=total, status="error", error=str(exc))
+        for future in done:
+            index, lab, result, error = await future
+            if error:
+                logger.warning(
+                    "OCR stream extraction error file_id=%s filename=%s queue_index=%s/%s error=%s",
+                    lab.id,
+                    lab.filename,
+                    index + 1,
+                    total,
+                    error,
+                )
+                yield progress_payload(lab=lab, index=index, total=total, status="error", error=str(error))
+                continue
 
+            try:
+                assert result is not None
+                await persist_ocr_result(lab, result, db)
+                await db.commit()
+                logger.info(
+                    "OCR stream file complete file_id=%s filename=%s queue_index=%s/%s",
+                    lab.id,
+                    lab.filename,
+                    index + 1,
+                    total,
+                )
+                yield progress_payload(lab=lab, index=index, total=total, status="done")
+            except Exception as exc:
+                await db.rollback()
+                logger.exception(
+                    "Persisting OCR result failed for file id=%s filename=%r path=%r",
+                    lab.id,
+                    lab.filename,
+                    lab.filepath,
+                )
+                yield progress_payload(lab=lab, index=index, total=total, status="error", error=str(exc))
+
+    logger.info("OCR stream complete total_files=%s duration=%.2fs", total, time.perf_counter() - stream_started_at)
     yield json.dumps({"type": "complete"}) + "\n"
 
 

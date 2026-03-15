@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import tempfile
+import time
 from pathlib import Path
 from collections.abc import Awaitable, Callable
 from typing import cast
@@ -57,6 +58,15 @@ async def shutdown_client() -> None:
 
 async def _ask(system_prompt: str, user_prompt: str, *, attachments: list | None = None, timeout: float = 120) -> str:
     """Create an ephemeral session, send one prompt, return the response text."""
+    started_at = time.perf_counter()
+    attachment_count = len(attachments or [])
+    logger.info(
+        "Copilot request starting model=%s timeout=%ss attachments=%s prompt_chars=%s",
+        settings.COPILOT_MODEL,
+        timeout,
+        attachment_count,
+        len(user_prompt),
+    )
     client = await _get_client()
     session = await client.create_session(
         {
@@ -94,10 +104,28 @@ async def _ask(system_prompt: str, user_prompt: str, *, attachments: list | None
         unsubscribe()
         await session.disconnect()
 
+    duration = time.perf_counter() - started_at
+
     add_premium_requests(observed_usage_cost)
 
     if request_error is not None:
+        logger.warning(
+            "Copilot request failed after %.2fs model=%s attachments=%s error=%s",
+            duration,
+            settings.COPILOT_MODEL,
+            attachment_count,
+            request_error,
+        )
         raise request_error
+
+    logger.info(
+        "Copilot request finished in %.2fs model=%s attachments=%s response_chars=%s usage_cost=%.4f",
+        duration,
+        settings.COPILOT_MODEL,
+        attachment_count,
+        len(content),
+        observed_usage_cost,
+    )
 
     return content
 
@@ -232,6 +260,15 @@ def _pdf_to_images(pdf_path: str, *, start_page: int = 0, stop_page: int | None 
     doc = fitz.open(pdf_path)
     paths: list[str] = []
     page_stop: int = stop_page if stop_page is not None else doc.page_count
+    started_at = time.perf_counter()
+
+    logger.info(
+        "Rendering PDF pages path=%s pages=%s-%s dpi=%s",
+        pdf_path,
+        start_page + 1,
+        page_stop,
+        dpi,
+    )
 
     try:
         for page_index in range(start_page, page_stop):
@@ -243,6 +280,16 @@ def _pdf_to_images(pdf_path: str, *, start_page: int = 0, stop_page: int | None 
             paths.append(tmp.name)
     finally:
         doc.close()
+
+    logger.info(
+        "Rendered PDF pages path=%s pages=%s-%s dpi=%s image_count=%s duration=%.2fs",
+        pdf_path,
+        start_page + 1,
+        page_stop,
+        dpi,
+        len(paths),
+        time.perf_counter() - started_at,
+    )
     return paths
 
 
@@ -361,13 +408,47 @@ async def _pdf_batch_extract(
     stop_page: int,
     dpi: int,
     filename: str | None = None,
-    extract_fn: Callable[[list[dict]], Awaitable[dict]],
+    extract_fn: Callable[..., Awaitable[dict]],
 ) -> dict:
     temp_images: list[str] = []
+    started_at = time.perf_counter()
+    batch_label = getattr(extract_fn, "__name__", "attachment_extract")
+    logger.info(
+        "Starting PDF batch extract kind=%s path=%s filename=%s pages=%s-%s dpi=%s",
+        batch_label,
+        pdf_path,
+        filename,
+        start_page + 1,
+        stop_page,
+        dpi,
+    )
     try:
         temp_images = _pdf_to_images(pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi)
         attachments = [{"type": "file", "path": path} for path in temp_images]
-        return await extract_fn(attachments, filename=filename)
+        result = await extract_fn(attachments, filename=filename)
+        logger.info(
+            "Finished PDF batch extract kind=%s path=%s filename=%s pages=%s-%s dpi=%s duration=%.2fs",
+            batch_label,
+            pdf_path,
+            filename,
+            start_page + 1,
+            stop_page,
+            dpi,
+            time.perf_counter() - started_at,
+        )
+        return result
+    except Exception:
+        logger.exception(
+            "PDF batch extract failed kind=%s path=%s filename=%s pages=%s-%s dpi=%s after %.2fs",
+            batch_label,
+            pdf_path,
+            filename,
+            start_page + 1,
+            stop_page,
+            dpi,
+            time.perf_counter() - started_at,
+        )
+        raise
     finally:
         for path in temp_images:
             try:
@@ -417,8 +498,30 @@ async def _pdf_range_with_retries(
     label: str,
 ) -> dict:
     page_count = stop_page - start_page
+    started_at = time.perf_counter()
+    logger.info(
+        "%s range start path=%s filename=%s pages=%s-%s dpi=%s page_count=%s",
+        label,
+        pdf_path,
+        filename,
+        start_page + 1,
+        stop_page,
+        dpi,
+        page_count,
+    )
 
     async def _retry(**overrides) -> dict:
+        logger.info(
+            "%s retry scheduled path=%s filename=%s pages=%s-%s dpi=%s overrides=%s delay=%ss",
+            label,
+            pdf_path,
+            filename,
+            start_page + 1,
+            stop_page,
+            dpi,
+            overrides,
+            OCR_RETRY_DELAY,
+        )
         await asyncio.sleep(OCR_RETRY_DELAY)
         kw = dict(start_page=start_page, stop_page=stop_page, dpi=dpi)
         kw.update(overrides)
@@ -439,6 +542,16 @@ async def _pdf_range_with_retries(
             stop_page=stop_page,
             dpi=dpi,
             filename=filename,
+        )
+        logger.info(
+            "%s range success path=%s filename=%s pages=%s-%s dpi=%s duration=%.2fs",
+            label,
+            pdf_path,
+            filename,
+            start_page + 1,
+            stop_page,
+            dpi,
+            time.perf_counter() - started_at,
         )
         return post_process_fn(result, start_page) if post_process_fn else result
     except Exception as exc:
@@ -508,6 +621,8 @@ async def _ocr_extract_pdf(pdf_path: str, *, filename: str | None = None) -> dic
     with fitz.open(pdf_path) as doc:
         page_count = doc.page_count
 
+    started_at = time.perf_counter()
+    logger.info("Structured OCR PDF start path=%s filename=%s page_count=%s", pdf_path, filename, page_count)
     results: list[dict] = []
     for start_page in range(0, page_count, OCR_PDF_BATCH_SIZE):
         stop_page = min(start_page + OCR_PDF_BATCH_SIZE, page_count)
@@ -520,6 +635,13 @@ async def _ocr_extract_pdf(pdf_path: str, *, filename: str | None = None) -> dic
             )
         )
 
+    logger.info(
+        "Structured OCR PDF finished path=%s filename=%s page_count=%s duration=%.2fs",
+        pdf_path,
+        filename,
+        page_count,
+        time.perf_counter() - started_at,
+    )
     return _merge_ocr_results(results)
 
 
@@ -527,6 +649,8 @@ async def _extract_document_text_pdf(pdf_path: str, *, filename: str | None = No
     with fitz.open(pdf_path) as doc:
         page_count = doc.page_count
 
+    started_at = time.perf_counter()
+    logger.info("Document text PDF start path=%s filename=%s page_count=%s", pdf_path, filename, page_count)
     results: list[dict] = []
     for start_page in range(0, page_count, OCR_PDF_BATCH_SIZE):
         stop_page = min(start_page + OCR_PDF_BATCH_SIZE, page_count)
@@ -539,23 +663,42 @@ async def _extract_document_text_pdf(pdf_path: str, *, filename: str | None = No
             )
         )
 
+    logger.info(
+        "Document text PDF finished path=%s filename=%s page_count=%s duration=%.2fs",
+        pdf_path,
+        filename,
+        page_count,
+        time.perf_counter() - started_at,
+    )
     return _merge_document_text_results(results)
 
 
 async def _extract_medical_data(file_path: str, *, filename: str | None = None) -> dict:
+    started_at = time.perf_counter()
+    logger.info("Medical extraction start path=%s filename=%s", file_path, filename)
     if Path(file_path).suffix.lower() == ".pdf":
-        return await _ocr_extract_pdf(file_path, filename=filename)
+        result = await _ocr_extract_pdf(file_path, filename=filename)
+        logger.info("Medical extraction finished path=%s filename=%s duration=%.2fs", file_path, filename, time.perf_counter() - started_at)
+        return result
 
     attachments = [{"type": "file", "path": file_path}]
-    return await _ocr_extract_from_attachments(attachments, filename=filename)
+    result = await _ocr_extract_from_attachments(attachments, filename=filename)
+    logger.info("Medical extraction finished path=%s filename=%s duration=%.2fs", file_path, filename, time.perf_counter() - started_at)
+    return result
 
 
 async def _extract_document_text(file_path: str, *, filename: str | None = None) -> dict:
+    started_at = time.perf_counter()
+    logger.info("Document text extraction start path=%s filename=%s", file_path, filename)
     if Path(file_path).suffix.lower() == ".pdf":
-        return await _extract_document_text_pdf(file_path, filename=filename)
+        result = await _extract_document_text_pdf(file_path, filename=filename)
+        logger.info("Document text extraction finished path=%s filename=%s duration=%.2fs", file_path, filename, time.perf_counter() - started_at)
+        return result
 
     attachments = [{"type": "file", "path": file_path}]
-    return await _extract_document_text_from_attachments(attachments, filename=filename)
+    result = await _extract_document_text_from_attachments(attachments, filename=filename)
+    logger.info("Document text extraction finished path=%s filename=%s duration=%.2fs", file_path, filename, time.perf_counter() - started_at)
+    return result
 
 
 async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
@@ -570,6 +713,8 @@ async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
     Returns:
         Parsed JSON dict with structured medical data plus OCR text and summary when available.
     """
+    started_at = time.perf_counter()
+    logger.info("OCR pipeline start path=%s filename=%s", file_path, filename)
     medical_task = asyncio.create_task(_extract_medical_data(file_path, filename=filename))
     text_task = asyncio.create_task(_extract_document_text(file_path, filename=filename))
 
@@ -580,6 +725,13 @@ async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
     )
 
     if isinstance(medical_result_or_error, BaseException):
+        logger.warning(
+            "OCR pipeline medical extraction failed path=%s filename=%s after %.2fs error=%s",
+            file_path,
+            filename,
+            time.perf_counter() - started_at,
+            medical_result_or_error,
+        )
         raise medical_result_or_error
 
     medical_result = cast(dict, medical_result_or_error)
@@ -609,6 +761,15 @@ async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
             filename,
         )
 
+    logger.info(
+        "OCR pipeline finished path=%s filename=%s measurements=%s raw_text=%s summary=%s duration=%.2fs",
+        file_path,
+        filename,
+        len(medical_result.get("measurements", [])),
+        bool((usable_text_result or {}).get("raw_text")),
+        bool(summary_english),
+        time.perf_counter() - started_at,
+    )
     return _combine_ocr_outputs(medical_result, usable_text_result, summary_english)
 
 
