@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from illdashboard.models import BiomarkerInsight, MarkerTag, Measurement, MeasurementType
+from illdashboard.models import LabFile, MarkerTag, BiomarkerInsight, Measurement, MeasurementType
 
 
 GROUP_ORDER = [
@@ -31,6 +31,47 @@ GROUP_ORDER = [
 ]
 SINGLE_MEASUREMENT_TAG = "singlemeasurement"
 MULTIPLE_MEASUREMENTS_TAG = "multiplemeasurements"
+SOURCE_TAG_PREFIX = "source:"
+
+
+def normalize_source_tag_value(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    normalized = normalized.casefold().strip()
+    normalized = re.sub(r"[\s_./]+", "-", normalized)
+    normalized = re.sub(r"[^a-z0-9-]+", "", normalized)
+    normalized = re.sub(r"-{2,}", "-", normalized)
+    return normalized.strip("-")
+
+
+def build_source_tag(value: str) -> str | None:
+    normalized_value = normalize_source_tag_value(value)
+    if not normalized_value:
+        return None
+    return f"{SOURCE_TAG_PREFIX}{normalized_value}"
+
+
+def is_source_tag(tag: str) -> bool:
+    return tag.casefold().startswith(SOURCE_TAG_PREFIX)
+
+
+def source_tag_value(tag: str) -> str | None:
+    if not is_source_tag(tag):
+        return None
+    _, _, value = tag.partition(":")
+    normalized_value = normalize_source_tag_value(value)
+    return normalized_value or None
+
+
+def normalize_tag(raw_tag: str) -> str:
+    tag = raw_tag.strip()
+    if not tag:
+        return ""
+
+    match = re.match(r"(?i)^source\s*:\s*(.+)$", tag)
+    if match:
+        return build_source_tag(match.group(1)) or ""
+
+    return tag
 
 
 def normalize_unique_tags(tags: list[str]) -> list[str]:
@@ -38,7 +79,7 @@ def normalize_unique_tags(tags: list[str]) -> list[str]:
     seen: set[str] = set()
 
     for raw_tag in tags:
-        tag = raw_tag.strip()
+        tag = normalize_tag(raw_tag)
         if not tag or tag in seen:
             continue
         seen.add(tag)
@@ -203,7 +244,10 @@ async def load_measurements_for_marker(db: AsyncSession, marker_name: str) -> li
     result = await db.execute(
         select(Measurement)
         .join(Measurement.measurement_type)
-        .options(selectinload(Measurement.measurement_type))
+        .options(
+            selectinload(Measurement.measurement_type),
+            selectinload(Measurement.lab_file).selectinload(LabFile.tags),
+        )
         .where(MeasurementType.name == marker_name)
         .order_by(Measurement.measured_at.asc(), Measurement.id.asc())
     )
@@ -311,3 +355,19 @@ def build_marker_tag_map(
         )
         for marker_name, marker_measurements in by_marker.items()
     }
+
+
+def build_marker_file_tag_map(by_marker: dict[str, list[Measurement]]) -> dict[str, list[str]]:
+    file_tag_map: dict[str, list[str]] = {}
+
+    for marker_name, marker_measurements in by_marker.items():
+        file_tags: list[str] = []
+        for measurement in marker_measurements:
+            file_tags.extend(tag.tag for tag in measurement.lab_file.tags)
+        file_tag_map[marker_name] = sorted(normalize_unique_tags(file_tags), key=str.casefold)
+
+    return file_tag_map
+
+
+def combine_search_tags(marker_tags: list[str], file_tags: list[str]) -> list[str]:
+    return normalize_unique_tags([*marker_tags, *file_tags])

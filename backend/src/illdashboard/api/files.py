@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import shutil
@@ -26,6 +27,7 @@ from illdashboard.services import ocr as ocr_service
 router = APIRouter(prefix="")
 
 ALLOWED_MIME = {"application/pdf", "image/png", "image/jpeg", "image/webp"}
+HASH_CHUNK_SIZE = 1024 * 1024
 
 
 async def get_lab_file_or_404(file_id: int, db: AsyncSession) -> LabFile:
@@ -68,6 +70,29 @@ def ocr_streaming_response(labs: list[LabFile], db: AsyncSession) -> StreamingRe
     return StreamingResponse(ocr_service.stream_ocr_for_labs(labs, db), media_type="application/x-ndjson")
 
 
+def hash_file_content(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def hash_file_on_disk(file_path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(file_path, "rb") as source:
+        for chunk in iter(lambda: source.read(HASH_CHUNK_SIZE), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+async def find_duplicate_lab_file(content_hash: str, db: AsyncSession) -> LabFile | None:
+    result = await db.execute(select(LabFile).order_by(LabFile.uploaded_at.desc()))
+    for lab in result.scalars():
+        file_path = Path(settings.UPLOAD_DIR) / lab.filepath
+        if not file_path.exists():
+            continue
+        if hash_file_on_disk(file_path) == content_hash:
+            return lab
+    return None
+
+
 @router.post("/files/upload", response_model=LabFileOut, tags=["files"])
 async def upload_file(
     file: UploadFile = File(...),
@@ -80,12 +105,17 @@ async def upload_file(
     upload_dir = Path(settings.UPLOAD_DIR)
     upload_dir.mkdir(parents=True, exist_ok=True)
 
+    content = await file.read()
+    duplicate_lab = await find_duplicate_lab_file(hash_file_content(content), db)
+    if duplicate_lab is not None:
+        return duplicate_lab
+
     extension = Path(file.filename or "file").suffix
     safe_name = f"{uuid.uuid4().hex}{extension}"
     destination = upload_dir / safe_name
 
     with open(destination, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        buffer.write(content)
 
     lab = LabFile(
         filename=file.filename or safe_name,

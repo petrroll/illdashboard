@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from illdashboard.database import get_db
-from illdashboard.models import MarkerTag, Measurement, MeasurementType
+from illdashboard.models import LabFile, MarkerTag, Measurement, MeasurementType
 from illdashboard.schemas import (
     MarkerDetailResponse,
     MarkerInsightResponse,
@@ -53,7 +53,10 @@ async def measurement_overview(
     result = await db.execute(
         select(Measurement)
         .join(Measurement.measurement_type)
-        .options(selectinload(Measurement.measurement_type))
+        .options(
+            selectinload(Measurement.measurement_type),
+            selectinload(Measurement.lab_file).selectinload(LabFile.tags),
+        )
         .order_by(MeasurementType.name.asc(), Measurement.measured_at.asc(), Measurement.id.asc())
     )
     measurements = result.scalars().all()
@@ -61,17 +64,29 @@ async def measurement_overview(
 
     stored_marker_tags = await marker_service.load_stored_marker_tags(db)
     marker_tag_map = marker_service.build_marker_tag_map(by_marker, stored_marker_tags)
+    marker_file_tag_map = marker_service.build_marker_file_tag_map(by_marker)
+    marker_search_tag_map = {
+        marker_name: marker_service.combine_search_tags(
+            marker_tag_map.get(marker_name, []),
+            marker_file_tag_map.get(marker_name, []),
+        )
+        for marker_name in by_marker
+    }
 
     if tags:
         tag_set = set(tags)
         by_marker = {
-            name: entries for name, entries in by_marker.items() if tag_set <= set(marker_tag_map.get(name, []))
+            name: entries
+            for name, entries in by_marker.items()
+            if tag_set <= set(marker_search_tag_map.get(name, []))
         }
 
     grouped_items: dict[str, list[MarkerOverviewItem]] = defaultdict(list)
     for marker_name in sorted(by_marker):
         payload = marker_service.build_marker_payload(by_marker[marker_name])
-        payload["tags"] = marker_tag_map.get(marker_name, [])
+        payload["tags"] = marker_search_tag_map.get(marker_name, [])
+        payload["marker_tags"] = marker_tag_map.get(marker_name, [])
+        payload["file_tags"] = marker_file_tag_map.get(marker_name, [])
         grouped_items[payload["group_name"]].append(MarkerOverviewItem(**payload))
 
     groups: list[MarkerOverviewGroup] = []
@@ -119,13 +134,16 @@ async def measurement_detail(
         measurement_type.group_name,
         len(measurements),
     )
+    file_tags = marker_service.build_marker_file_tag_map({marker_name: measurements}).get(marker_name, [])
 
     return MarkerDetailResponse(
         **payload,
         measurements=measurements,
         explanation=explanation,
         explanation_cached=explanation_cached,
-        tags=marker_tags,
+        tags=marker_service.combine_search_tags(marker_tags, file_tags),
+        marker_tags=marker_tags,
+        file_tags=file_tags,
     )
 
 

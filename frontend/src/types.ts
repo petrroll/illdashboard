@@ -32,6 +32,8 @@ export interface MarkerOverviewItem {
   value_min: number | null;
   value_max: number | null;
   tags: string[];
+  marker_tags: string[];
+  file_tags: string[];
 }
 
 export interface MarkerOverviewGroup {
@@ -50,6 +52,8 @@ export interface MarkerDetailResponse {
   explanation: string | null;
   explanation_cached: boolean;
   tags: string[];
+  marker_tags: string[];
+  file_tags: string[];
 }
 
 export interface MarkerInsightResponse {

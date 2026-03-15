@@ -27,16 +27,26 @@ async def list_marker_tags(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(Measurement)
         .join(Measurement.measurement_type)
-        .options(selectinload(Measurement.measurement_type))
+        .options(
+            selectinload(Measurement.measurement_type),
+            selectinload(Measurement.lab_file).selectinload(LabFile.tags),
+        )
         .order_by(MeasurementType.name.asc(), Measurement.measured_at.asc(), Measurement.id.asc())
     )
     measurements = result.scalars().all()
     by_marker = marker_service.build_marker_histories(measurements)
     stored_marker_tags = await marker_service.load_stored_marker_tags(db)
+    marker_tag_map = marker_service.build_marker_tag_map(by_marker, stored_marker_tags)
+    marker_file_tag_map = marker_service.build_marker_file_tag_map(by_marker)
 
     all_tags: set[str] = set()
-    for marker_tags in marker_service.build_marker_tag_map(by_marker, stored_marker_tags).values():
-        all_tags.update(marker_tags)
+    for marker_name in by_marker:
+        all_tags.update(
+            marker_service.combine_search_tags(
+                marker_tag_map.get(marker_name, []),
+                marker_file_tag_map.get(marker_name, []),
+            )
+        )
 
     return sorted(all_tags)
 

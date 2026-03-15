@@ -15,13 +15,17 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from illdashboard.config import settings
-from illdashboard.copilot_service import normalize_marker_names, ocr_extract
-from illdashboard.models import LabFile, Measurement, MeasurementType
+from illdashboard.copilot_service import normalize_marker_names, normalize_source_name, ocr_extract
+from illdashboard.models import LabFile, LabFileTag, Measurement, MeasurementType
 from illdashboard.services.markers import (
+    build_source_tag,
     classify_marker_group,
     ensure_measurement_types,
     get_measurement_type_by_name,
+    is_source_tag,
     merge_measurement_types,
+    normalize_source_tag_value,
+    source_tag_value,
 )
 
 
@@ -66,6 +70,46 @@ def normalize_marker_name_deterministic(name: str) -> str:
     return name.strip()
 
 
+async def normalize_lab_source(lab: LabFile, result: dict, db: AsyncSession) -> str | None:
+    existing_source_result = await db.execute(
+        select(LabFileTag.tag).where(LabFileTag.tag.like("source:%")).distinct().order_by(LabFileTag.tag)
+    )
+    existing_sources = [value for tag in existing_source_result.scalars().all() if (value := source_tag_value(tag))]
+
+    try:
+        normalized_source = await normalize_source_name(result.get("source"), lab.filename, existing_sources)
+    except Exception:
+        normalized_source = None
+
+    if normalized_source:
+        normalized_source = normalize_source_tag_value(normalized_source)
+    elif result.get("source"):
+        normalized_source = normalize_source_tag_value(str(result["source"]))
+
+    return normalized_source or None
+
+
+async def sync_lab_source_tag(lab: LabFile, source_value: str | None, db: AsyncSession) -> None:
+    tag_result = await db.execute(select(LabFileTag).where(LabFileTag.lab_file_id == lab.id))
+    existing_tags = tag_result.scalars().all()
+
+    for tag in existing_tags:
+        if is_source_tag(tag.tag):
+            await db.delete(tag)
+
+    if not source_value:
+        await db.flush()
+        return
+
+    source_tag = build_source_tag(source_value)
+    if source_tag is None:
+        await db.flush()
+        return
+
+    db.add(LabFileTag(lab_file_id=lab.id, tag=source_tag))
+    await db.flush()
+
+
 async def apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list[Measurement]:
     lab.ocr_raw = json.dumps(result)
     if result.get("lab_date"):
@@ -73,6 +117,9 @@ async def apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list
             lab.lab_date = datetime.fromisoformat(result["lab_date"])
         except (ValueError, TypeError):
             pass
+
+    source_value = await normalize_lab_source(lab, result, db)
+    await sync_lab_source_tag(lab, source_value, db)
 
     raw_names = [measurement["marker_name"] for measurement in result.get("measurements", [])]
     deterministic_map = {name: normalize_marker_name_deterministic(name) for name in raw_names}
@@ -132,7 +179,7 @@ async def apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list
 
 async def extract_ocr_result(lab: LabFile) -> dict:
     file_path = Path(settings.UPLOAD_DIR) / lab.filepath
-    return await ocr_extract(str(file_path.resolve()))
+    return await ocr_extract(str(file_path.resolve()), filename=lab.filename)
 
 
 async def persist_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list[Measurement]:

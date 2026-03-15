@@ -79,6 +79,8 @@ class MarkerOverviewItem(BaseModel):
     value_min: float | None = None
     value_max: float | None = None
     tags: list[str] = Field(default_factory=list)
+    marker_tags: list[str] = Field(default_factory=list)
+    file_tags: list[str] = Field(default_factory=list)
 
 
 class MarkerOverviewGroup(BaseModel):
@@ -97,6 +99,8 @@ class MarkerDetailResponse(BaseModel):
     explanation: str | None = None
     explanation_cached: bool = False
     tags: list[str] = Field(default_factory=list)
+    marker_tags: list[str] = Field(default_factory=list)
+    file_tags: list[str] = Field(default_factory=list)
 
 
 class MarkerInsightResponse(BaseModel):

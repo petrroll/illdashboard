@@ -6,10 +6,16 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from illdashboard.database import get_db
+from illdashboard.metrics import get_premium_requests_used
 from illdashboard.services import admin as admin_service
 
 
 router = APIRouter(prefix="")
+
+
+@router.get("/admin/stats", tags=["admin"])
+async def get_stats():
+    return {"premium_requests_used": get_premium_requests_used()}
 
 
 @router.delete("/admin/cache/explanations", tags=["admin"])

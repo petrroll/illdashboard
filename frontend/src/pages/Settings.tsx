@@ -4,6 +4,7 @@ import {
   fetchFiles,
   fetchMarkerNames,
   fetchMeasurements,
+  fetchAdminStats,
   normalizeMarkers,
   purgeAllCaches,
   purgeExplanationCache,
@@ -98,23 +99,24 @@ async function performSettingsAction(action: SettingsAction) {
 export default function Settings() {
   const [files, setFiles] = useState<LabFile[]>([]);
   const [markers, setMarkers] = useState<string[]>([]);
-  const [recentMeasurements, setRecentMeasurements] = useState<Measurement[]>(
-    []
-  );
+  const [recentMeasurements, setRecentMeasurements] = useState<Measurement[]>([]);
+  const [copilotRequestCount, setCopilotRequestCount] = useState<number | null>(null);
   const [actionResult, setActionResult] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
   const [loading, setLoading] = useState<string | null>(null);
 
   const loadSettingsData = useCallback(async () => {
-    const [filesResponse, markersResponse, measurementsResponse] = await Promise.all([
+    const [filesResponse, markersResponse, measurementsResponse, statsResponse] = await Promise.all([
       fetchFiles(),
       fetchMarkerNames(),
       fetchMeasurements(),
+      fetchAdminStats(),
     ]);
 
     setFiles(filesResponse);
     setMarkers(markersResponse);
     setRecentMeasurements(measurementsResponse.slice(-10));
+    setCopilotRequestCount(statsResponse.premium_requests_used);
   }, []);
 
   useEffect(() => {
@@ -153,7 +155,7 @@ export default function Settings() {
     <>
       <h2>Settings</h2>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "1rem", marginBottom: "1.5rem" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: "1rem", marginBottom: "1.5rem" }}>
         <div className="card" style={{ textAlign: "center" }}>
           <div style={{ fontSize: "2rem", fontWeight: 700 }}>{files.length}</div>
           <div style={{ color: "var(--text-muted)" }}>Lab Files</div>
@@ -167,6 +169,12 @@ export default function Settings() {
             {formatDate(latestMeasurement?.measured_at ?? null)}
           </div>
           <div style={{ color: "var(--text-muted)" }}>Latest Result</div>
+        </div>
+        <div className="card" style={{ textAlign: "center" }}>
+          <div style={{ fontSize: "2rem", fontWeight: 700 }}>
+            {copilotRequestCount ?? "—"}
+          </div>
+          <div style={{ color: "var(--text-muted)" }}>Copilot Requests</div>
         </div>
       </div>
 

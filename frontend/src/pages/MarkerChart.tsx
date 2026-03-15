@@ -41,6 +41,10 @@ const DEFAULT_LIST_PANE_WIDTH = 680;
 const MAX_LIST_PANE_WIDTH = 680;
 const MIN_DETAIL_PANE_WIDTH = 380;
 
+function mergeUniqueTags(...tagGroups: string[][]) {
+  return Array.from(new Set(tagGroups.flat()));
+}
+
 function getStoredListPaneWidth() {
   if (typeof window === "undefined") {
     return DEFAULT_LIST_PANE_WIDTH;
@@ -277,14 +281,24 @@ export default function MarkerChart() {
     const savedTags = await setMarkerTags(markerName, newTags);
 
     if (detail?.marker_name === markerName) {
-      setDetail({ ...detail, tags: savedTags });
+      setDetail({
+        ...detail,
+        marker_tags: savedTags,
+        tags: mergeUniqueTags(savedTags, detail.file_tags),
+      });
     }
 
     setOverview((previousOverview) =>
       previousOverview.map((group) => ({
         ...group,
         markers: group.markers.map((marker) =>
-          marker.marker_name === markerName ? { ...marker, tags: savedTags } : marker,
+          marker.marker_name === markerName
+            ? {
+                ...marker,
+                marker_tags: savedTags,
+                tags: mergeUniqueTags(savedTags, marker.file_tags),
+              }
+            : marker,
         ),
       })),
     );
@@ -461,12 +475,19 @@ export default function MarkerChart() {
                 </p>
                 <div style={{ marginTop: "0.35rem" }}>
                   <TagInput
-                    tags={detail?.tags ?? summarySource.tags}
+                    tags={detail?.marker_tags ?? summarySource.marker_tags}
                     allTags={allMarkerTags}
                     onChange={(newTags) => handleMarkerTagsChange(summarySource.marker_name, newTags)}
                     placeholder="Add marker tag…"
                   />
                 </div>
+                {summarySource.file_tags.length > 0 && (
+                  <div className="tag-list" style={{ marginTop: "0.45rem" }}>
+                    {summarySource.file_tags.map((tag) => (
+                      <span key={tag} className="tag-pill">{tag}</span>
+                    ))}
+                  </div>
+                )}
               </div>
               <span className={`status-pill status-${summarySource.status}`}>
                 {getMarkerStatusLabel(summarySource.status)}

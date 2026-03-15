@@ -1,5 +1,9 @@
 import { apiClient } from "./client";
 
+export interface AdminStats {
+  premium_requests_used: number | null;
+}
+
 export interface PurgeExplanationsResult {
   deleted_explanations: number;
 }
@@ -12,6 +16,11 @@ export interface PurgeAllCachesResult {
 export interface ResetDatabaseResult {
   status: string;
   deleted_sparklines: number;
+}
+
+export async function fetchAdminStats() {
+  const response = await apiClient.get<AdminStats>("/admin/stats");
+  return response.data;
 }
 
 export async function purgeExplanationCache() {
