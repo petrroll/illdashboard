@@ -21,6 +21,8 @@ export interface Measurement {
   canonical_unit?: string | null;
   canonical_value: number | null;
   original_value?: number | null;
+  original_qualitative_value?: string | null;
+  qualitative_bool?: boolean | null;
   qualitative_value: string | null;
   original_unit?: string | null;
   canonical_reference_low: number | null;

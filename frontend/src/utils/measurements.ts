@@ -113,7 +113,16 @@ export function getMeasurementValueClass(measurement: {
   value: number | null;
   reference_low: number | null;
   reference_high: number | null;
+  qualitative_bool?: boolean | null;
 }) {
+  if (measurement.qualitative_bool === false) {
+    return "value-normal";
+  }
+
+  if (measurement.qualitative_bool === true) {
+    return "value-positive";
+  }
+
   if (measurement.value == null) {
     return "value-normal";
   }

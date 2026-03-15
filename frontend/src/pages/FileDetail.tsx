@@ -369,7 +369,7 @@ export default function FileDetail() {
                           </label>
                         </td>
                         <td style={{ fontWeight: 500 }}>{m.marker_name}</td>
-                        <td className={getMeasurementValueClass({ value: canonicalValue, reference_low: canonicalReferenceLow, reference_high: canonicalReferenceHigh })}>
+                        <td className={getMeasurementValueClass({ value: canonicalValue, reference_low: canonicalReferenceLow, reference_high: canonicalReferenceHigh, qualitative_bool: m.qualitative_bool })}>
                           <StackedMeasurementValue
                             primary={formatMeasurementValue(canonicalValue, canonicalUnit, m.qualitative_value)}
                             secondary={showOriginalValue

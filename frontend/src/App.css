@@ -239,6 +239,10 @@ tr:hover td {
   color: var(--danger);
 }
 
+.value-positive {
+  color: var(--warning);
+}
+
 /* ── Explanation panel ────────────────────────────────────────── */
 
 .explanation-panel {

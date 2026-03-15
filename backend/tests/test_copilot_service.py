@@ -2,7 +2,7 @@ import asyncio
 import json
 from collections.abc import Callable
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, call, patch
+from unittest.mock import ANY, AsyncMock, call, patch
 
 import pytest
 
@@ -66,6 +66,7 @@ async def test_extract_structured_medical_data_from_pdf_splits_oversized_batches
         stop_page: int,
         dpi: int,
         filename: str | None = None,
+        render_cache=None,
     ):
         if stop_page - start_page > 1:
             raise Exception("CAPIError: 413 failed to parse request")
@@ -129,6 +130,7 @@ async def test_extract_structured_medical_data_from_pdf_splits_timed_out_batches
         stop_page: int,
         dpi: int,
         filename: str | None = None,
+        render_cache=None,
     ):
         if stop_page - start_page > 1:
             raise TimeoutError("Timeout after 120s waiting for session.idle")
@@ -165,9 +167,9 @@ async def test_extract_structured_medical_data_from_pdf_splits_timed_out_batches
         "Marker 2",
     ]
     assert batch_mock.await_args_list == [
-        call("/tmp/report.pdf", start_page=0, stop_page=2, dpi=144, filename=None),
-        call("/tmp/report.pdf", start_page=0, stop_page=1, dpi=144, filename=None),
-        call("/tmp/report.pdf", start_page=1, stop_page=2, dpi=144, filename=None),
+        call("/tmp/report.pdf", start_page=0, stop_page=2, dpi=144, filename=None, render_cache=ANY),
+        call("/tmp/report.pdf", start_page=0, stop_page=1, dpi=144, filename=None, render_cache=ANY),
+        call("/tmp/report.pdf", start_page=1, stop_page=2, dpi=144, filename=None, render_cache=ANY),
     ]
 
 
@@ -180,6 +182,7 @@ async def test_extract_structured_medical_data_from_pdf_falls_back_to_single_pag
         stop_page: int,
         dpi: int,
         filename: str | None = None,
+        render_cache=None,
     ):
         if stop_page - start_page > 1:
             raise RuntimeError("429 Too Many Requests")
@@ -212,9 +215,9 @@ async def test_extract_structured_medical_data_from_pdf_falls_back_to_single_pag
     assert result["source"] == "synlab"
     assert [measurement["page_number"] for measurement in result["measurements"]] == [1, 2]
     assert batch_mock.await_args_list == [
-        call("/tmp/report.pdf", start_page=0, stop_page=2, dpi=144, filename=None),
-        call("/tmp/report.pdf", start_page=0, stop_page=1, dpi=144, filename=None),
-        call("/tmp/report.pdf", start_page=1, stop_page=2, dpi=144, filename=None),
+        call("/tmp/report.pdf", start_page=0, stop_page=2, dpi=144, filename=None, render_cache=ANY),
+        call("/tmp/report.pdf", start_page=0, stop_page=1, dpi=144, filename=None, render_cache=ANY),
+        call("/tmp/report.pdf", start_page=1, stop_page=2, dpi=144, filename=None, render_cache=ANY),
     ]
 
 
@@ -227,6 +230,7 @@ async def test_extract_structured_medical_data_from_pdf_retries_single_page_at_l
         stop_page: int,
         dpi: int,
         filename: str | None = None,
+        render_cache=None,
     ):
         if dpi == copilot_service.OCR_PDF_RENDER_DPI:
             raise Exception("CAPIError: 413 failed to parse request")
@@ -273,8 +277,8 @@ async def test_extract_structured_medical_data_from_pdf_retries_single_page_at_l
         ],
     }
     assert batch_mock.await_args_list == [
-        call("/tmp/report.pdf", start_page=0, stop_page=1, dpi=144, filename=None),
-        call("/tmp/report.pdf", start_page=0, stop_page=1, dpi=120, filename=None),
+        call("/tmp/report.pdf", start_page=0, stop_page=1, dpi=144, filename=None, render_cache=ANY),
+        call("/tmp/report.pdf", start_page=0, stop_page=1, dpi=120, filename=None, render_cache=ANY),
     ]
 
 
@@ -291,6 +295,7 @@ async def test_extract_structured_medical_data_from_pdf_processes_page_batches_i
         stop_page: int,
         dpi: int,
         filename: str | None = None,
+        render_cache=None,
     ):
         if start_page == 0:
             first_batch_started.set()
@@ -372,27 +377,44 @@ async def test_choose_canonical_units_splits_large_batches():
     ]
 
     marker_groups = [
-        {
-            "marker_name": "Marker 1",
-            "existing_canonical_unit": None,
-            "observations": [
-                {"id": "0", "value": 0.38, "unit": "10^9/L", "reference_low": None, "reference_high": None},
+        copilot_service.MarkerUnitGroup(
+            marker_name="Marker 1",
+            observations=[
+                copilot_service.MarkerObservation(
+                    id="0",
+                    value=0.38,
+                    unit="10^9/L",
+                    reference_low=None,
+                    reference_high=None,
+                )
             ],
-        },
-        {
-            "marker_name": "Marker 2",
-            "existing_canonical_unit": "mmol/L",
-            "observations": [
-                {"id": "1", "value": 75.6, "unit": "mg/dL", "reference_low": 63.0, "reference_high": 91.8},
+        ),
+        copilot_service.MarkerUnitGroup(
+            marker_name="Marker 2",
+            existing_canonical_unit="mmol/L",
+            observations=[
+                copilot_service.MarkerObservation(
+                    id="1",
+                    value=75.6,
+                    unit="mg/dL",
+                    reference_low=63.0,
+                    reference_high=91.8,
+                )
             ],
-        },
-        {
-            "marker_name": "Marker 3",
-            "existing_canonical_unit": "g/L",
-            "observations": [
-                {"id": "2", "value": 15.6, "unit": "g/dL", "reference_low": 13.5, "reference_high": 17.5},
+        ),
+        copilot_service.MarkerUnitGroup(
+            marker_name="Marker 3",
+            existing_canonical_unit="g/L",
+            observations=[
+                copilot_service.MarkerObservation(
+                    id="2",
+                    value=15.6,
+                    unit="g/dL",
+                    reference_low=13.5,
+                    reference_high=17.5,
+                )
             ],
-        },
+        ),
     ]
 
     with patch.object(copilot_service, "UNIT_NORMALIZATION_BATCH_SIZE", 2), patch.object(
@@ -406,6 +428,77 @@ async def test_choose_canonical_units_splits_large_batches():
     assert result["Marker 2"] == "mmol/L"
     assert result["Marker 3"] == "g/L"
     assert ask_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_normalize_qualitative_values_splits_large_batches():
+    responses = [
+        json.dumps(
+            {
+                "negative": {"canonical_value": "negative", "boolean_value": False},
+                "true": {"canonical_value": "positive", "boolean_value": True},
+            }
+        ),
+        json.dumps(
+            {
+                "reaktivni": {"canonical_value": "reactive", "boolean_value": True}
+            }
+        ),
+    ]
+
+    requests = [
+        copilot_service.QualitativeNormalizationRequest(
+            id="negative",
+            marker_name="Chlamydia psittaci IgG",
+            original_value="negative",
+        ),
+        copilot_service.QualitativeNormalizationRequest(
+            id="true",
+            marker_name="Varicella-zoster IgG",
+            original_value="true",
+        ),
+        copilot_service.QualitativeNormalizationRequest(
+            id="reaktivni",
+            marker_name="EBV VCA IgM",
+            original_value="reaktívní",
+        ),
+    ]
+
+    with patch.object(copilot_service, "QUALITATIVE_NORMALIZATION_BATCH_SIZE", 2), patch.object(
+        copilot_service,
+        "QUALITATIVE_NORMALIZATION_CONCURRENCY",
+        1,
+    ), patch("illdashboard.copilot_service._ask", new=AsyncMock(side_effect=responses)) as ask_mock:
+        result = await copilot_service.normalize_qualitative_values(requests, [])
+
+    assert result == {
+        "negative": ("negative", False),
+        "true": ("positive", True),
+        "reaktivni": ("reactive", True),
+    }
+    assert ask_mock.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_normalize_qualitative_values_includes_existing_canonical_values_in_prompt():
+    requests = [
+        copilot_service.QualitativeNormalizationRequest(
+            id="negative",
+            marker_name="Chlamydia psittaci IgG",
+            original_value="NEGATIVE",
+        )
+    ]
+
+    response = json.dumps({"negative": {"canonical_value": "negative", "boolean_value": False}})
+
+    with patch("illdashboard.copilot_service._ask", new=AsyncMock(return_value=response)) as ask_mock:
+        result = await copilot_service.normalize_qualitative_values(requests, ["negative"])
+
+    assert result == {"negative": ("negative", False)}
+    ask_mock.assert_awaited_once()
+    assert ask_mock.await_args is not None
+    _system_prompt, user_prompt = ask_mock.await_args.args
+    assert "EXISTING canonical qualitative values:\n- negative\n" in user_prompt
 
 
 @pytest.mark.asyncio
@@ -425,33 +518,33 @@ async def test_infer_rescaling_factors_splits_large_batches():
     ]
 
     conversion_requests = [
-        {
-            "id": "req-1",
-            "marker_name": "Marker 1",
-            "original_unit": "cells/µL",
-            "canonical_unit": "10^9/L",
-            "example_value": 380,
-            "reference_low": None,
-            "reference_high": None,
-        },
-        {
-            "id": "req-2",
-            "marker_name": "Marker 2",
-            "original_unit": "mmol/l",
-            "canonical_unit": "mmol/L",
-            "example_value": 4.2,
-            "reference_low": 3.5,
-            "reference_high": 5.1,
-        },
-        {
-            "id": "req-3",
-            "marker_name": "Marker 3",
-            "original_unit": "g/dL",
-            "canonical_unit": "g/L",
-            "example_value": 15.6,
-            "reference_low": 13.5,
-            "reference_high": 17.5,
-        },
+        copilot_service.UnitConversionRequest(
+            id="req-1",
+            marker_name="Marker 1",
+            original_unit="cells/µL",
+            canonical_unit="10^9/L",
+            example_value=380,
+            reference_low=None,
+            reference_high=None,
+        ),
+        copilot_service.UnitConversionRequest(
+            id="req-2",
+            marker_name="Marker 2",
+            original_unit="mmol/l",
+            canonical_unit="mmol/L",
+            example_value=4.2,
+            reference_low=3.5,
+            reference_high=5.1,
+        ),
+        copilot_service.UnitConversionRequest(
+            id="req-3",
+            marker_name="Marker 3",
+            original_unit="g/dL",
+            canonical_unit="g/L",
+            example_value=15.6,
+            reference_low=13.5,
+            reference_high=17.5,
+        ),
     ]
 
     with patch.object(copilot_service, "UNIT_NORMALIZATION_BATCH_SIZE", 2), patch.object(
@@ -552,19 +645,18 @@ async def test_choose_canonical_units_prompt_mentions_count_conversion_example()
     with patch("illdashboard.copilot_service._ask", new=AsyncMock(return_value=response)) as ask_mock:
         result = await copilot_service.choose_canonical_units(
             [
-                {
-                    "marker_name": "Absolute CD4+ T-Helper Cell Count",
-                    "existing_canonical_unit": None,
-                    "observations": [
-                        {
-                            "id": "0",
-                            "value": 380,
-                            "unit": "Zellen/µl",
-                            "reference_low": None,
-                            "reference_high": None,
-                        }
+                copilot_service.MarkerUnitGroup(
+                    marker_name="Absolute CD4+ T-Helper Cell Count",
+                    observations=[
+                        copilot_service.MarkerObservation(
+                            id="0",
+                            value=380,
+                            unit="Zellen/µl",
+                            reference_low=None,
+                            reference_high=None,
+                        )
                     ],
-                }
+                )
             ]
         )
 
@@ -584,26 +676,26 @@ async def test_choose_canonical_units_skips_homogeneous_units_without_llm():
     with patch("illdashboard.copilot_service._ask", new=AsyncMock()) as ask_mock:
         result = await copilot_service.choose_canonical_units(
             [
-                {
-                    "marker_name": "Sodium",
-                    "existing_canonical_unit": "mmol/L",
-                    "observations": [
-                        {
-                            "id": "0",
-                            "value": 141,
-                            "unit": "mmol/l",
-                            "reference_low": 136,
-                            "reference_high": 145,
-                        },
-                        {
-                            "id": "1",
-                            "value": 139,
-                            "unit": "mmol/L",
-                            "reference_low": 136,
-                            "reference_high": 145,
-                        },
+                copilot_service.MarkerUnitGroup(
+                    marker_name="Sodium",
+                    existing_canonical_unit="mmol/L",
+                    observations=[
+                        copilot_service.MarkerObservation(
+                            id="0",
+                            value=141,
+                            unit="mmol/l",
+                            reference_low=136,
+                            reference_high=145,
+                        ),
+                        copilot_service.MarkerObservation(
+                            id="1",
+                            value=139,
+                            unit="mmol/L",
+                            reference_low=136,
+                            reference_high=145,
+                        ),
                     ],
-                }
+                )
             ]
         )
 
@@ -618,15 +710,15 @@ async def test_infer_rescaling_factors_prompt_mentions_count_conversion_example(
     with patch("illdashboard.copilot_service._ask", new=AsyncMock(return_value=response)) as ask_mock:
         result = await copilot_service.infer_rescaling_factors(
             [
-                {
-                    "id": "zellen/ul=>10^9/l",
-                    "marker_name": "Absolute CD4+ T-Helper Cell Count",
-                    "original_unit": "Zellen/µl",
-                    "canonical_unit": "10^9/L",
-                    "example_value": 380,
-                    "reference_low": 440,
-                    "reference_high": 2160,
-                }
+                copilot_service.UnitConversionRequest(
+                    id="zellen/ul=>10^9/l",
+                    marker_name="Absolute CD4+ T-Helper Cell Count",
+                    original_unit="Zellen/µl",
+                    canonical_unit="10^9/L",
+                    example_value=380,
+                    reference_low=440,
+                    reference_high=2160,
+                )
             ]
         )
 
@@ -638,6 +730,34 @@ async def test_infer_rescaling_factors_prompt_mentions_count_conversion_example(
     assert "id=zellen/ul=>10^9/l" in user_prompt
     assert "original_unit=Zellen/µl" in user_prompt
     assert "canonical_unit=10^9/L" in user_prompt
+
+
+@pytest.mark.asyncio
+async def test_normalize_qualitative_values_prompt_mentions_boolean_context():
+    response = json.dumps({"true": {"canonical_value": "positive", "boolean_value": True}})
+
+    with patch("illdashboard.copilot_service._ask", new=AsyncMock(return_value=response)) as ask_mock:
+        result = await copilot_service.normalize_qualitative_values(
+            [
+                copilot_service.QualitativeNormalizationRequest(
+                    id="true",
+                    marker_name="Varicella-zoster IgG",
+                    original_value="true",
+                )
+            ],
+            [],
+        )
+
+    assert result == {"true": ("positive", True)}
+
+    assert ask_mock.await_args is not None
+    system_prompt, user_prompt = ask_mock.await_args.args
+    assert "literal boolean-like value such as \"true\" or \"false\"" in system_prompt
+    assert "Use true for outcomes like positive, reactive, or detected" in system_prompt
+    assert "Translate non-English qualitative result words to concise English" in system_prompt
+    assert '"canonical_value": string or null' in system_prompt
+    assert '"boolean_value": boolean or null' in system_prompt
+    assert "id=true; marker=Varicella-zoster IgG; original_value=true" in user_prompt
 
 
 @pytest.mark.asyncio

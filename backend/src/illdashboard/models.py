@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -63,6 +63,10 @@ class MeasurementType(Base):
         back_populates="measurement_type",
         cascade="all, delete-orphan",
     )
+    qualitative_rules: Mapped[list[QualitativeRule]] = relationship(
+        back_populates="measurement_type",
+        cascade="all, delete-orphan",
+    )
     insight: Mapped[BiomarkerInsight | None] = relationship(
         back_populates="measurement_type",
         cascade="all, delete-orphan",
@@ -84,6 +88,8 @@ class Measurement(Base):
     )
     canonical_value: Mapped[float | None] = mapped_column(Float, nullable=True)
     original_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    original_qualitative_value: Mapped[str | None] = mapped_column(String, nullable=True)
+    qualitative_bool: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     qualitative_value: Mapped[str | None] = mapped_column(String, nullable=True)
     original_unit: Mapped[str | None] = mapped_column(String, nullable=True)
     canonical_reference_low: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -189,6 +195,32 @@ class RescalingRule(Base):
     )
 
     measurement_type: Mapped[MeasurementType | None] = relationship(back_populates="rescaling_rules")
+
+
+class QualitativeRule(Base):
+    """Persisted canonical mapping from a raw qualitative value to a normalized label."""
+
+    __tablename__ = "qualitative_rules"
+    __table_args__ = (UniqueConstraint("normalized_original_value"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    original_value: Mapped[str] = mapped_column(String, nullable=False)
+    canonical_value: Mapped[str] = mapped_column(String, nullable=False)
+    boolean_value: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    normalized_original_value: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
+    measurement_type_id: Mapped[int | None] = mapped_column(
+        ForeignKey("measurement_types.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    measurement_type: Mapped[MeasurementType | None] = relationship(back_populates="qualitative_rules")
 
 
 class BiomarkerInsight(Base):

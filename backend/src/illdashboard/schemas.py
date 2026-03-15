@@ -48,6 +48,8 @@ class MeasurementOut(BaseModel):
     canonical_unit: str | None = None
     canonical_value: float | None = None
     original_value: float | None = None
+    original_qualitative_value: str | None = None
+    qualitative_bool: bool | None = None
     qualitative_value: str | None = None
     original_unit: str | None = None
     canonical_reference_low: float | None = None
@@ -83,6 +85,8 @@ class MeasurementOut(BaseModel):
                 "canonical_unit": measurement_type.canonical_unit,
                 "canonical_value": data.canonical_value,
                 "original_value": data.original_value,
+                "original_qualitative_value": data.original_qualitative_value,
+                "qualitative_bool": data.qualitative_bool,
                 "qualitative_value": data.qualitative_value,
                 "original_unit": data.original_unit,
                 "canonical_reference_low": data.canonical_reference_low,

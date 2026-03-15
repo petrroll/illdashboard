@@ -12,6 +12,7 @@ import os
 import re
 import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Awaitable, Callable
 
@@ -23,6 +24,7 @@ from copilot.types import CopilotClientOptions, MessageOptions
 from illdashboard.config import settings
 from illdashboard.metrics import add_premium_requests
 from illdashboard.services.markers import normalize_marker_alias_key
+from illdashboard.services.qualitative_values import normalize_qualitative_key
 from illdashboard.services.rescaling import normalize_unit_key
 
 
@@ -31,6 +33,8 @@ logger = logging.getLogger(__name__)
 # ── Client management ────────────────────────────────────────────────────────
 
 _client: CopilotClient | None = None
+_request_semaphore: asyncio.Semaphore | None = None
+_request_semaphore_limit = 0
 
 OCR_PDF_BATCH_SIZE = 2
 OCR_PDF_RENDER_DPI = 144
@@ -38,10 +42,74 @@ OCR_PDF_MIN_RENDER_DPI = 96
 OCR_ASK_TIMEOUT = 180
 OCR_RETRY_DELAY = 3
 OCR_PDF_BATCH_CONCURRENCY = 4
+OCR_LLM_REQUEST_CONCURRENCY = 6
 MARKER_NORMALIZATION_BATCH_SIZE = 40
 MARKER_NORMALIZATION_CONCURRENCY = 2
 UNIT_NORMALIZATION_BATCH_SIZE = 20
 UNIT_NORMALIZATION_CONCURRENCY = 2
+QUALITATIVE_NORMALIZATION_BATCH_SIZE = 40
+QUALITATIVE_NORMALIZATION_CONCURRENCY = 2
+
+
+@dataclass
+class MarkerObservation:
+    id: str
+    value: int | float
+    unit: str | None = None
+    reference_low: float | None = None
+    reference_high: float | None = None
+
+
+@dataclass
+class MarkerUnitGroup:
+    marker_name: str
+    existing_canonical_unit: str | None = None
+    observations: list[MarkerObservation] = field(default_factory=list)
+
+
+@dataclass
+class UnitConversionRequest:
+    id: str
+    marker_name: str
+    original_unit: str
+    canonical_unit: str
+    example_value: int | float
+    reference_low: float | None = None
+    reference_high: float | None = None
+
+
+@dataclass
+class QualitativeNormalizationRequest:
+    id: str
+    marker_name: str
+    original_value: str
+
+
+class _PdfRenderCache:
+    def __init__(self, pdf_path: str):
+        self.pdf_path = pdf_path
+        self._lock = asyncio.Lock()
+        self._images_by_batch: dict[tuple[int, int, int], list[str]] = {}
+
+    async def attachments_for_range(self, *, start_page: int, stop_page: int, dpi: int) -> list[dict]:
+        key = (start_page, stop_page, dpi)
+        async with self._lock:
+            paths = self._images_by_batch.get(key)
+            if paths is None:
+                paths = _pdf_to_images(self.pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi)
+                self._images_by_batch[key] = paths
+        return [{"type": "file", "path": path} for path in paths]
+
+    async def aclose(self) -> None:
+        async with self._lock:
+            cached_paths = [path for paths in self._images_by_batch.values() for path in paths]
+            self._images_by_batch.clear()
+
+        for path in cached_paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 async def _get_client() -> CopilotClient:
@@ -53,6 +121,14 @@ async def _get_client() -> CopilotClient:
         _client = CopilotClient(opts)
         await _client.start()
     return _client
+
+
+def _get_request_semaphore() -> asyncio.Semaphore:
+    global _request_semaphore, _request_semaphore_limit
+    if _request_semaphore is None or _request_semaphore_limit != OCR_LLM_REQUEST_CONCURRENCY:
+        _request_semaphore = asyncio.Semaphore(OCR_LLM_REQUEST_CONCURRENCY)
+        _request_semaphore_limit = OCR_LLM_REQUEST_CONCURRENCY
+    return _request_semaphore
 
 
 async def shutdown_client() -> None:
@@ -77,45 +153,47 @@ async def _ask(system_prompt: str, user_prompt: str, *, attachments: list | None
         attachment_count,
         len(user_prompt),
     )
-    client = await _get_client()
-    session = await client.create_session(
-        {
-            "model": settings.COPILOT_MODEL,
-            "system_message": {"mode": "replace", "content": system_prompt},
-            "available_tools": [],  # pure chat, no tool use
-            "on_permission_request": PermissionHandler.approve_all,
-        }
-    )
     content = ""
     observed_usage_cost = 0.0
     request_error: Exception | None = None
 
-    def handle_session_event(event) -> None:
-        nonlocal observed_usage_cost
-        if event.type != SessionEventType.ASSISTANT_USAGE:
-            return
+    async with _get_request_semaphore():
+        client = await _get_client()
+        session = await client.create_session(
+            {
+                "model": settings.COPILOT_MODEL,
+                "system_message": {"mode": "replace", "content": system_prompt},
+                "available_tools": [],  # pure chat, no tool use
+                "on_permission_request": PermissionHandler.approve_all,
+            }
+        )
 
-        cost = getattr(event.data, "cost", None)
-        if isinstance(cost, int | float) and cost > 0:
-            observed_usage_cost += float(cost)
+        def handle_session_event(event) -> None:
+            nonlocal observed_usage_cost
+            if event.type != SessionEventType.ASSISTANT_USAGE:
+                return
 
-    unsubscribe = session.on(handle_session_event)
-    try:
-        msg_opts: MessageOptions = {"prompt": user_prompt}
-        if attachments:
-            msg_opts["attachments"] = attachments
-        response = await session.send_and_wait(msg_opts, timeout=timeout)
-        content = getattr(response.data, "content", "") if response else ""
-        if content is None:
-            content = ""
-    except Exception as exc:
-        request_error = exc
-    finally:
-        unsubscribe()
+            cost = getattr(event.data, "cost", None)
+            if isinstance(cost, int | float) and cost > 0:
+                observed_usage_cost += float(cost)
+
+        unsubscribe = session.on(handle_session_event)
         try:
-            await session.disconnect()
+            msg_opts: MessageOptions = {"prompt": user_prompt}
+            if attachments:
+                msg_opts["attachments"] = attachments
+            response = await session.send_and_wait(msg_opts, timeout=timeout)
+            content = getattr(response.data, "content", "") if response else ""
+            if content is None:
+                content = ""
         except Exception as exc:
-            logger.warning("Copilot session disconnect had errors: %s", exc)
+            request_error = exc
+        finally:
+            unsubscribe()
+            try:
+                await session.disconnect()
+            except Exception as exc:
+                logger.warning("Copilot session disconnect had errors: %s", exc)
 
     duration = time.perf_counter() - started_at
 
@@ -150,6 +228,130 @@ def _parse_json_response(raw: str) -> dict:
     if raw.endswith("```"):
         raw = raw.rsplit("```", 1)[0]
     return json.loads(raw.strip())
+
+
+def _chunk_items(items: list, chunk_size: int) -> list[list]:
+    return [items[index:index + chunk_size] for index in range(0, len(items), chunk_size)]
+
+
+def _build_marker_group_user_text(batch_groups: list[MarkerUnitGroup]) -> str:
+    user_text = "MARKER groups to normalize:\n"
+    for group in batch_groups:
+        user_text += f"\n- Marker: {group.marker_name}\n"
+        user_text += f"  Existing canonical unit: {group.existing_canonical_unit or '(none)'}\n"
+        user_text += "  Observations:\n"
+        for observation in group.observations:
+            user_text += (
+                f"value={observation.value}; "
+                f"unit={observation.unit or '(none)'}; "
+                f"reference_low={observation.reference_low}; "
+                f"reference_high={observation.reference_high}\n"
+            )
+    return user_text
+
+
+def _parse_canonical_unit_response(payload: dict, batch_groups: list[MarkerUnitGroup]) -> dict[str, str | None]:
+    normalized: dict[str, str | None] = {}
+    for group in batch_groups:
+        group_payload = payload.get(group.marker_name) if isinstance(payload, dict) else None
+        if not isinstance(group_payload, dict):
+            group_payload = {}
+
+        canonical_unit = group_payload.get("canonical_unit")
+        if not isinstance(canonical_unit, str) or not canonical_unit.strip():
+            canonical_unit = _default_canonical_unit(group)
+        else:
+            canonical_unit = canonical_unit.strip()
+
+        normalized[group.marker_name] = canonical_unit
+    return normalized
+
+
+def _build_conversion_request_user_text(batch_requests: list[UnitConversionRequest]) -> str:
+    user_text = "Conversion requests:\n"
+    for request in batch_requests:
+        user_text += (
+            f"\n- id={request.id}; "
+            f"marker={request.marker_name or '(unknown)'}; "
+            f"original_unit={request.original_unit or '(none)'}; "
+            f"canonical_unit={request.canonical_unit or '(none)'}; "
+            f"example_value={request.example_value}; "
+            f"reference_low={request.reference_low}; "
+            f"reference_high={request.reference_high}\n"
+        )
+    return user_text
+
+
+def _build_qualitative_request_user_text(
+    batch_requests: list[QualitativeNormalizationRequest],
+    existing_canonical: list[str],
+) -> str:
+    user_text = "EXISTING canonical qualitative values:\n"
+    if existing_canonical:
+        for value in existing_canonical:
+            user_text += f"- {value}\n"
+    else:
+        user_text += "(none yet)\n"
+
+    user_text += "\nQualitative normalization requests:\n"
+    for request in batch_requests:
+        user_text += (
+            f"\n- id={request.id}; "
+            f"marker={request.marker_name or '(unknown)'}; "
+            f"original_value={request.original_value or '(none)'}\n"
+        )
+    return user_text
+
+
+def _parse_scale_factor_response(payload: dict, batch_requests: list[UnitConversionRequest]) -> dict[str, float | None]:
+    result: dict[str, float | None] = {}
+    for request in batch_requests:
+        request_payload = payload.get(request.id) if isinstance(payload, dict) else None
+        if not isinstance(request_payload, dict):
+            result[request.id] = None
+            continue
+        result[request.id] = _coerce_normalized_number(request_payload.get("scale_factor"))
+    return result
+
+
+def _parse_qualitative_response(
+    payload: dict,
+    batch_requests: list[QualitativeNormalizationRequest],
+) -> dict[str, tuple[str | None, bool | None]]:
+    normalized: dict[str, tuple[str | None, bool | None]] = {}
+    for request in batch_requests:
+        request_payload = payload.get(request.id) if isinstance(payload, dict) else None
+        if not isinstance(request_payload, dict):
+            normalized[request.id] = (None, None)
+            continue
+
+        canonical_value = request_payload.get("canonical_value")
+        boolean_value = request_payload.get("boolean_value")
+        if not isinstance(canonical_value, str) or not canonical_value.strip():
+            normalized[request.id] = (None, None)
+            continue
+
+        normalized[request.id] = (canonical_value.strip(), boolean_value if isinstance(boolean_value, bool) else None)
+    return normalized
+
+
+async def _run_batched_tasks(
+    items: list,
+    *,
+    batch_size: int,
+    concurrency: int,
+    run_batch: Callable[[list], Awaitable[dict]],
+) -> list[dict]:
+    if not items:
+        return []
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _run(items_batch: list) -> dict:
+        async with semaphore:
+            return await run_batch(items_batch)
+
+    return await asyncio.gather(*[_run(batch) for batch in _chunk_items(items, batch_size)])
 
 
 def _is_request_too_large_error(exc: Exception) -> bool:
@@ -424,6 +626,7 @@ async def _pdf_batch_extract(
     dpi: int,
     filename: str | None = None,
     extract_fn: Callable[..., Awaitable[dict]],
+    render_cache: _PdfRenderCache | None = None,
 ) -> dict:
     temp_images: list[str] = []
     started_at = time.perf_counter()
@@ -438,8 +641,15 @@ async def _pdf_batch_extract(
         dpi,
     )
     try:
-        temp_images = _pdf_to_images(pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi)
-        attachments = [{"type": "file", "path": path} for path in temp_images]
+        if render_cache is None:
+            temp_images = _pdf_to_images(pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi)
+            attachments = [{"type": "file", "path": path} for path in temp_images]
+        else:
+            attachments = await render_cache.attachments_for_range(
+                start_page=start_page,
+                stop_page=stop_page,
+                dpi=dpi,
+            )
         result = await extract_fn(attachments, filename=filename)
         logger.info(
             "Finished PDF batch extract kind=%s path=%s filename=%s pages=%s-%s dpi=%s duration=%.2fs",
@@ -479,10 +689,11 @@ async def _extract_structured_medical_data_pdf_batch(
     stop_page: int,
     dpi: int,
     filename: str | None = None,
+    render_cache: _PdfRenderCache | None = None,
 ) -> dict:
     return await _pdf_batch_extract(
         pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi,
-        filename=filename, extract_fn=_extract_structured_medical_data_from_attachments,
+        filename=filename, extract_fn=_extract_structured_medical_data_from_attachments, render_cache=render_cache,
     )
 
 
@@ -493,10 +704,11 @@ async def _extract_document_text_from_pdf_batch(
     stop_page: int,
     dpi: int,
     filename: str | None = None,
+    render_cache: _PdfRenderCache | None = None,
 ) -> dict:
     return await _pdf_batch_extract(
         pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi,
-        filename=filename, extract_fn=_extract_document_text_from_attachments,
+        filename=filename, extract_fn=_extract_document_text_from_attachments, render_cache=render_cache,
     )
 
 
@@ -511,6 +723,7 @@ async def _pdf_range_with_retries(
     merge_fn: Callable[[list[dict]], dict],
     post_process_fn: Callable[[dict, int], dict] | None = None,
     label: str,
+    render_cache: _PdfRenderCache | None = None,
 ) -> dict:
     page_count = stop_page - start_page
     started_at = time.perf_counter()
@@ -547,6 +760,7 @@ async def _pdf_range_with_retries(
             merge_fn=merge_fn,
             post_process_fn=post_process_fn,
             label=label,
+            render_cache=render_cache,
             **kw,
         )
 
@@ -557,6 +771,7 @@ async def _pdf_range_with_retries(
             stop_page=stop_page,
             dpi=dpi,
             filename=filename,
+            render_cache=render_cache,
         )
         logger.info(
             "%s range success path=%s filename=%s pages=%s-%s dpi=%s duration=%.2fs",
@@ -639,6 +854,7 @@ async def _run_pdf_batches_parallel(
     filename: str | None,
     range_fn: Callable[..., Awaitable[dict]],
     merge_fn: Callable[[list[dict]], dict],
+    render_cache: _PdfRenderCache | None = None,
 ) -> dict:
     semaphore = asyncio.Semaphore(OCR_PDF_BATCH_CONCURRENCY)
 
@@ -649,6 +865,7 @@ async def _run_pdf_batches_parallel(
                 start_page=start_page,
                 stop_page=stop_page,
                 filename=filename,
+                render_cache=render_cache,
             )
 
     tasks = [
@@ -660,80 +877,128 @@ async def _run_pdf_batches_parallel(
     return merge_fn(await asyncio.gather(*tasks))
 
 
-async def _extract_structured_medical_data_from_pdf(pdf_path: str, *, filename: str | None = None) -> dict:
+async def _extract_pdf_in_batches(
+    pdf_path: str,
+    *,
+    filename: str | None,
+    label: str,
+    range_fn: Callable[..., Awaitable[dict]],
+    merge_fn: Callable[[list[dict]], dict],
+    render_cache: _PdfRenderCache | None = None,
+) -> dict:
     with fitz.open(pdf_path) as doc:
         page_count = doc.page_count
 
     started_at = time.perf_counter()
-    logger.info("Structured medical PDF start path=%s filename=%s page_count=%s", pdf_path, filename, page_count)
+    logger.info("%s start path=%s filename=%s page_count=%s", label, pdf_path, filename, page_count)
     result = await _run_pdf_batches_parallel(
         pdf_path,
         page_count=page_count,
         filename=filename,
+        range_fn=range_fn,
+        merge_fn=merge_fn,
+        render_cache=render_cache,
+    )
+    logger.info(
+        "%s finished path=%s filename=%s page_count=%s duration=%.2fs",
+        label,
+        pdf_path,
+        filename,
+        page_count,
+        time.perf_counter() - started_at,
+    )
+    return result
+
+
+async def _extract_structured_medical_data_from_pdf(
+    pdf_path: str,
+    *,
+    filename: str | None = None,
+    render_cache: _PdfRenderCache | None = None,
+) -> dict:
+    return await _extract_pdf_in_batches(
+        pdf_path,
+        filename=filename,
+        label="Structured medical PDF",
         range_fn=_extract_structured_medical_data_pdf_range,
         merge_fn=_merge_structured_medical_results,
+        render_cache=render_cache,
     )
 
-    logger.info(
-        "Structured medical PDF finished path=%s filename=%s page_count=%s duration=%.2fs",
+
+async def _extract_document_text_from_pdf(
+    pdf_path: str,
+    *,
+    filename: str | None = None,
+    render_cache: _PdfRenderCache | None = None,
+) -> dict:
+    return await _extract_pdf_in_batches(
         pdf_path,
-        filename,
-        page_count,
-        time.perf_counter() - started_at,
-    )
-    return result
-
-
-async def _extract_document_text_from_pdf(pdf_path: str, *, filename: str | None = None) -> dict:
-    with fitz.open(pdf_path) as doc:
-        page_count = doc.page_count
-
-    started_at = time.perf_counter()
-    logger.info("Document text PDF start path=%s filename=%s page_count=%s", pdf_path, filename, page_count)
-    result = await _run_pdf_batches_parallel(
-        pdf_path,
-        page_count=page_count,
         filename=filename,
+        label="Document text PDF",
         range_fn=_extract_document_text_from_pdf_range,
         merge_fn=_merge_document_text_results,
+        render_cache=render_cache,
     )
 
+
+async def _extract_file_with_optional_pdf_batches(
+    file_path: str,
+    *,
+    filename: str | None,
+    label: str,
+    pdf_extract_fn: Callable[..., Awaitable[dict]],
+    attachment_extract_fn: Callable[..., Awaitable[dict]],
+    render_cache: _PdfRenderCache | None = None,
+) -> dict:
+    started_at = time.perf_counter()
+    logger.info("%s start path=%s filename=%s", label, file_path, filename)
+
+    if Path(file_path).suffix.lower() == ".pdf":
+        result = await pdf_extract_fn(file_path, filename=filename, render_cache=render_cache)
+    else:
+        result = await attachment_extract_fn([{"type": "file", "path": file_path}], filename=filename)
+
     logger.info(
-        "Document text PDF finished path=%s filename=%s page_count=%s duration=%.2fs",
-        pdf_path,
+        "%s finished path=%s filename=%s duration=%.2fs",
+        label,
+        file_path,
         filename,
-        page_count,
         time.perf_counter() - started_at,
     )
     return result
 
 
-async def _extract_structured_medical_data(file_path: str, *, filename: str | None = None) -> dict:
-    started_at = time.perf_counter()
-    logger.info("Medical extraction start path=%s filename=%s", file_path, filename)
-    if Path(file_path).suffix.lower() == ".pdf":
-        result = await _extract_structured_medical_data_from_pdf(file_path, filename=filename)
-        logger.info("Medical extraction finished path=%s filename=%s duration=%.2fs", file_path, filename, time.perf_counter() - started_at)
-        return result
+async def _extract_structured_medical_data(
+    file_path: str,
+    *,
+    filename: str | None = None,
+    render_cache: _PdfRenderCache | None = None,
+) -> dict:
+    return await _extract_file_with_optional_pdf_batches(
+        file_path,
+        filename=filename,
+        label="Medical extraction",
+        pdf_extract_fn=_extract_structured_medical_data_from_pdf,
+        attachment_extract_fn=_extract_structured_medical_data_from_attachments,
+        render_cache=render_cache,
+    )
 
-    attachments = [{"type": "file", "path": file_path}]
-    result = await _extract_structured_medical_data_from_attachments(attachments, filename=filename)
-    logger.info("Medical extraction finished path=%s filename=%s duration=%.2fs", file_path, filename, time.perf_counter() - started_at)
-    return result
 
-
-async def _extract_document_text(file_path: str, *, filename: str | None = None) -> dict:
-    started_at = time.perf_counter()
-    logger.info("Document text extraction start path=%s filename=%s", file_path, filename)
-    if Path(file_path).suffix.lower() == ".pdf":
-        result = await _extract_document_text_from_pdf(file_path, filename=filename)
-        logger.info("Document text extraction finished path=%s filename=%s duration=%.2fs", file_path, filename, time.perf_counter() - started_at)
-        return result
-
-    attachments = [{"type": "file", "path": file_path}]
-    result = await _extract_document_text_from_attachments(attachments, filename=filename)
-    logger.info("Document text extraction finished path=%s filename=%s duration=%.2fs", file_path, filename, time.perf_counter() - started_at)
-    return result
+async def _extract_document_text(
+    file_path: str,
+    *,
+    filename: str | None = None,
+    render_cache: _PdfRenderCache | None = None,
+) -> dict:
+    return await _extract_file_with_optional_pdf_batches(
+        file_path,
+        filename=filename,
+        label="Document text extraction",
+        pdf_extract_fn=_extract_document_text_from_pdf,
+        attachment_extract_fn=_extract_document_text_from_attachments,
+        render_cache=render_cache,
+    )
 
 
 async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
@@ -750,14 +1015,26 @@ async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
     """
     started_at = time.perf_counter()
     logger.info("OCR pipeline start path=%s filename=%s", file_path, filename)
-    medical_task = asyncio.create_task(_extract_structured_medical_data(file_path, filename=filename))
-    text_task = asyncio.create_task(_extract_document_text(file_path, filename=filename))
+    render_cache = _PdfRenderCache(file_path) if Path(file_path).suffix.lower() == ".pdf" else None
 
-    medical_result_or_error, text_result_or_error = await asyncio.gather(
-        medical_task,
-        text_task,
-        return_exceptions=True,
+    # Keep structured extraction separate from free-form OCR + translation.
+    # They are intentionally distinct steps even when they share rendered page batches.
+    medical_task = asyncio.create_task(
+        _extract_structured_medical_data(file_path, filename=filename, render_cache=render_cache)
     )
+    text_task = asyncio.create_task(
+        _extract_document_text(file_path, filename=filename, render_cache=render_cache)
+    )
+
+    try:
+        medical_result_or_error, text_result_or_error = await asyncio.gather(
+            medical_task,
+            text_task,
+            return_exceptions=True,
+        )
+    finally:
+        if render_cache is not None:
+            await render_cache.aclose()
 
     if isinstance(medical_result_or_error, BaseException):
         logger.warning(
@@ -913,34 +1190,62 @@ Do not include commentary outside the JSON.\
 """
 
 
+QUALITATIVE_NORMALIZATION_SYSTEM_PROMPT = """\
+You are a medical lab qualitative value normalization assistant. The user will give you:
+1. A list of EXISTING canonical qualitative values already used in the database.
+2. One or more qualitative normalization requests. Each request includes a request id,
+     a marker name for context, and a raw qualitative result value.
+
+For each request:
+- Reuse an existing canonical value when it clearly means the same thing.
+- Normalize spelling, case, punctuation, and whitespace variants to one concise canonical value.
+- Translate non-English qualitative result words to concise English when you can do so confidently.
+- Prefer short lower-case medical result labels such as "positive", "negative", "reactive",
+    "non-reactive", "detected", "not detected", or "indeterminate" when appropriate.
+- If the raw value is a literal boolean-like value such as "true" or "false", use the marker context
+    and standard lab-report meaning to map it to the closest concise qualitative result.
+- Also return the boolean semantic when the result clearly means presence/abnormality versus absence/normality.
+    Use true for outcomes like positive, reactive, or detected.
+    Use false for outcomes like negative, non-reactive, or not detected.
+    Use null when the result is indeterminate or cannot be safely reduced to true/false.
+- If the meaning is unclear, return a cleaned-up lower-case version of the original value rather than null.
+
+Return ONLY valid JSON as an object keyed by request id. Each value must be an object with:
+- "canonical_value": string or null
+- "boolean_value": boolean or null
+
+Do not include commentary outside the JSON.\
+"""
+
+
 def _coerce_normalized_number(value) -> float | None:
-        if value is None or isinstance(value, bool):
-                return None
-        if isinstance(value, int | float):
-                numeric = float(value)
-                return numeric if math.isfinite(numeric) else None
-        if isinstance(value, str):
-                stripped = value.strip()
-                if not stripped:
-                        return None
-                try:
-                        numeric = float(stripped)
-                except (TypeError, ValueError, OverflowError):
-                        return None
-                return numeric if math.isfinite(numeric) else None
+    if value is None or isinstance(value, bool):
         return None
+    if isinstance(value, int | float):
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            numeric = float(stripped)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return numeric if math.isfinite(numeric) else None
+    return None
 
 
 def _normalize_marker_lookup_key(name: str) -> str:
     return normalize_marker_alias_key(re.sub(r"\[[^\]]*\]", " ", name))
 
 
-def _default_canonical_unit(group: dict) -> str | None:
-    canonical_unit = group.get("existing_canonical_unit") or next(
+def _default_canonical_unit(group: MarkerUnitGroup) -> str | None:
+    canonical_unit = group.existing_canonical_unit or next(
         (
-            observation.get("unit")
-            for observation in group.get("observations", [])
-            if observation.get("unit")
+            observation.unit
+            for observation in group.observations
+            if observation.unit
         ),
         None,
     )
@@ -957,13 +1262,13 @@ def _unit_key_likely_requires_llm(unit_key: str | None) -> bool:
     return bool(re.search(r"(?:cells?|zellen|tys|tis|/ul|/μl|/µl)", unit_key))
 
 
-def _can_skip_canonical_unit_selection(group: dict) -> bool:
+def _can_skip_canonical_unit_selection(group: MarkerUnitGroup) -> bool:
     observation_unit_keys = {
         unit_key
-        for observation in group.get("observations", [])
-        if (unit_key := normalize_unit_key(observation.get("unit"))) is not None
+        for observation in group.observations
+        if (unit_key := normalize_unit_key(observation.unit)) is not None
     }
-    existing_unit_key = normalize_unit_key(group.get("existing_canonical_unit"))
+    existing_unit_key = normalize_unit_key(group.existing_canonical_unit)
 
     if existing_unit_key is not None:
         return not observation_unit_keys or observation_unit_keys == {existing_unit_key}
@@ -1046,18 +1351,13 @@ async def normalize_marker_names(new_names: list[str], existing_canonical: list[
                 mapping[n] = n
         return mapping
 
-    batches = [
-        representative_names[index:index + MARKER_NORMALIZATION_BATCH_SIZE]
-        for index in range(0, len(representative_names), MARKER_NORMALIZATION_BATCH_SIZE)
-    ]
-    semaphore = asyncio.Semaphore(MARKER_NORMALIZATION_CONCURRENCY)
-
-    async def _run_batch(batch_names: list[str]) -> dict[str, str]:
-        async with semaphore:
-            return await _normalize_batch(batch_names)
-
     merged_mapping: dict[str, str] = dict(direct_mapping)
-    for batch_mapping in await asyncio.gather(*[_run_batch(batch) for batch in batches]):
+    for batch_mapping in await _run_batched_tasks(
+        representative_names,
+        batch_size=MARKER_NORMALIZATION_BATCH_SIZE,
+        concurrency=MARKER_NORMALIZATION_CONCURRENCY,
+        run_batch=_normalize_batch,
+    ):
         for representative_name, canonical_name in batch_mapping.items():
             normalized_key = _normalize_marker_lookup_key(representative_name) or representative_name
             for original_name in names_by_key.get(normalized_key, [representative_name]):
@@ -1102,117 +1402,96 @@ async def normalize_source_name(
     return normalized_source or None
 
 
-async def choose_canonical_units(marker_groups: list[dict]) -> dict[str, str | None]:
+async def choose_canonical_units(marker_groups: list[MarkerUnitGroup]) -> dict[str, str | None]:
     """Use the LLM to choose canonical units for numeric marker groups."""
     if not marker_groups:
         return {}
 
     canonical_units: dict[str, str | None] = {}
-    unresolved_groups: list[dict] = []
+    unresolved_groups: list[MarkerUnitGroup] = []
     for group in marker_groups:
         if _can_skip_canonical_unit_selection(group):
-            canonical_units[group["marker_name"]] = _default_canonical_unit(group)
+            canonical_units[group.marker_name] = _default_canonical_unit(group)
             continue
         unresolved_groups.append(group)
 
     if not unresolved_groups:
         return canonical_units
 
-    async def _normalize_batch(batch_groups: list[dict]) -> dict[str, str | None]:
-        user_text = "MARKER groups to normalize:\n"
-        for group in batch_groups:
-            user_text += f"\n- Marker: {group['marker_name']}\n"
-            user_text += f"  Existing canonical unit: {group.get('existing_canonical_unit') or '(none)'}\n"
-            user_text += "  Observations:\n"
-            for observation in group.get("observations", []):
-                user_text += (
-                    f"value={observation['value']}; "
-                    f"unit={observation.get('unit') or '(none)'}; "
-                    f"reference_low={observation.get('reference_low')}; "
-                    f"reference_high={observation.get('reference_high')}\n"
-                )
+    async def _normalize_batch(batch_groups: list[MarkerUnitGroup]) -> dict[str, str | None]:
+        user_text = _build_marker_group_user_text(batch_groups)
 
         try:
             payload = _parse_json_response(await _ask(UNIT_CANONICAL_SYSTEM_PROMPT, user_text))
         except (json.JSONDecodeError, ValueError):
             payload = {}
-
-        normalized: dict[str, str | None] = {}
-        for group in batch_groups:
-            marker_name = group["marker_name"]
-            group_payload = payload.get(marker_name) if isinstance(payload, dict) else None
-            if not isinstance(group_payload, dict):
-                group_payload = {}
-
-            canonical_unit = group_payload.get("canonical_unit")
-            if not isinstance(canonical_unit, str) or not canonical_unit.strip():
-                canonical_unit = _default_canonical_unit(group)
-            else:
-                canonical_unit = canonical_unit.strip()
-
-            normalized[marker_name] = canonical_unit
-
-        return normalized
-
-    batches = [
-        unresolved_groups[index:index + UNIT_NORMALIZATION_BATCH_SIZE]
-        for index in range(0, len(unresolved_groups), UNIT_NORMALIZATION_BATCH_SIZE)
-    ]
-    semaphore = asyncio.Semaphore(UNIT_NORMALIZATION_CONCURRENCY)
-
-    async def _run_batch(batch_groups: list[dict]) -> dict[str, str | None]:
-        async with semaphore:
-            return await _normalize_batch(batch_groups)
+        return _parse_canonical_unit_response(payload, batch_groups)
 
     merged_mapping: dict[str, str | None] = dict(canonical_units)
-    for batch_mapping in await asyncio.gather(*[_run_batch(batch) for batch in batches]):
+    for batch_mapping in await _run_batched_tasks(
+        unresolved_groups,
+        batch_size=UNIT_NORMALIZATION_BATCH_SIZE,
+        concurrency=UNIT_NORMALIZATION_CONCURRENCY,
+        run_batch=_normalize_batch,
+    ):
         merged_mapping.update(batch_mapping)
 
     return merged_mapping
 
 
-async def infer_rescaling_factors(conversion_requests: list[dict]) -> dict[str, float | None]:
+async def infer_rescaling_factors(conversion_requests: list[UnitConversionRequest]) -> dict[str, float | None]:
     """Use the LLM to infer multiplicative scale factors for source/target unit pairs."""
     if not conversion_requests:
         return {}
 
-    batches = [
-        conversion_requests[index:index + UNIT_NORMALIZATION_BATCH_SIZE]
-        for index in range(0, len(conversion_requests), UNIT_NORMALIZATION_BATCH_SIZE)
-    ]
-    semaphore = asyncio.Semaphore(UNIT_NORMALIZATION_CONCURRENCY)
-
-    async def _run_batch(batch_requests: list[dict]) -> dict[str, float | None]:
-        user_text = "Conversion requests:\n"
-        for request in batch_requests:
-            user_text += (
-                f"\n- id={request['id']}; "
-                f"marker={request.get('marker_name') or '(unknown)'}; "
-                f"original_unit={request.get('original_unit') or '(none)'}; "
-                f"canonical_unit={request.get('canonical_unit') or '(none)'}; "
-                f"example_value={request.get('example_value')}; "
-                f"reference_low={request.get('reference_low')}; "
-                f"reference_high={request.get('reference_high')}\n"
-            )
+    async def _run_batch(batch_requests: list[UnitConversionRequest]) -> dict[str, float | None]:
+        user_text = _build_conversion_request_user_text(batch_requests)
 
         try:
             payload = _parse_json_response(await _ask(UNIT_SCALE_SYSTEM_PROMPT, user_text))
         except (json.JSONDecodeError, ValueError):
             payload = {}
-
-        result: dict[str, float | None] = {}
-        for request in batch_requests:
-            request_payload = payload.get(request["id"]) if isinstance(payload, dict) else None
-            if not isinstance(request_payload, dict):
-                result[request["id"]] = None
-                continue
-            result[request["id"]] = _coerce_normalized_number(request_payload.get("scale_factor"))
-        return result
+        return _parse_scale_factor_response(payload, batch_requests)
 
     merged: dict[str, float | None] = {}
-    for batch_mapping in await asyncio.gather(*[_run_batch(batch) for batch in batches]):
+    for batch_mapping in await _run_batched_tasks(
+        conversion_requests,
+        batch_size=UNIT_NORMALIZATION_BATCH_SIZE,
+        concurrency=UNIT_NORMALIZATION_CONCURRENCY,
+        run_batch=_run_batch,
+    ):
         merged.update(batch_mapping)
     return merged
+
+
+async def normalize_qualitative_values(
+    requests: list[QualitativeNormalizationRequest],
+    existing_canonical: list[str],
+) -> dict[str, tuple[str | None, bool | None]]:
+    """Use the LLM to map raw qualitative values to canonical labels."""
+    if not requests:
+        return {}
+    unresolved_requests = list(requests)
+
+    async def _normalize_batch(batch_requests: list[QualitativeNormalizationRequest]) -> dict[str, tuple[str | None, bool | None]]:
+        user_text = _build_qualitative_request_user_text(batch_requests, existing_canonical)
+
+        try:
+            payload = _parse_json_response(await _ask(QUALITATIVE_NORMALIZATION_SYSTEM_PROMPT, user_text))
+        except (json.JSONDecodeError, ValueError):
+            payload = {}
+
+        return _parse_qualitative_response(payload, batch_requests)
+
+    merged_mapping: dict[str, tuple[str | None, bool | None]] = {}
+    for batch_mapping in await _run_batched_tasks(
+        unresolved_requests,
+        batch_size=QUALITATIVE_NORMALIZATION_BATCH_SIZE,
+        concurrency=QUALITATIVE_NORMALIZATION_CONCURRENCY,
+        run_batch=_normalize_batch,
+    ):
+        merged_mapping.update(batch_mapping)
+    return merged_mapping
 
 
 # ── Explanations ─────────────────────────────────────────────────────────────

@@ -729,20 +729,42 @@ async def test_ocr_persists_qualitative_measurements_and_excludes_them_from_nume
         ],
     }
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=qualitative_result):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=qualitative_result), patch(
+        "illdashboard.services.ocr.normalize_marker_names",
+        new_callable=AsyncMock,
+        side_effect=lambda names, _existing: {name: name for name in names},
+    ), patch(
+        "illdashboard.services.ocr.choose_canonical_units",
+        new_callable=AsyncMock,
+        return_value={},
+    ), patch(
+        "illdashboard.services.ocr.normalize_qualitative_values",
+        new_callable=AsyncMock,
+        return_value={
+            "negative": ("negative", False),
+            "true": ("positive", True),
+        },
+    ) as normalize_qualitative_mock:
         resp = await client.post(f"/api/files/{file_id}/ocr")
 
     assert resp.status_code == 200
+    normalize_qualitative_mock.assert_awaited_once()
     body = resp.json()
     assert len(body) == 3
     assert body[0]["marker_name"] == "Chlamydia psittaci IgG"
     assert body[0]["canonical_value"] is None
+    assert body[0]["original_qualitative_value"] == "negative"
+    assert body[0]["qualitative_bool"] is False
     assert body[0]["qualitative_value"] == "negative"
     assert body[1]["marker_name"] == "Varicella-zoster IgG"
     assert body[1]["canonical_value"] is None
+    assert body[1]["original_qualitative_value"] == "true"
+    assert body[1]["qualitative_bool"] is True
     assert body[1]["qualitative_value"] == "positive"
     assert body[2]["marker_name"] == "Ferritin"
     assert body[2]["canonical_value"] == 414
+    assert body[2]["original_qualitative_value"] is None
+    assert body[2]["qualitative_bool"] is None
     assert body[2]["qualitative_value"] is None
 
     file_measurements_resp = await client.get(f"/api/files/{file_id}/measurements")
