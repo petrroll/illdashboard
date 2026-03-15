@@ -33,7 +33,7 @@ dev-backend:
 
 # Run the Vite frontend dev server
 dev-frontend:
-    cd frontend && npx vite --host
+    cd frontend && if [ ! -d node_modules ]; then npm ci; fi && npm run dev -- --host
 
 # ── Build ────────────────────────────────────────────────────────────────────
 
@@ -43,7 +43,7 @@ build-backend:
 
 # Build the frontend for production
 build-frontend:
-    cd frontend && npm run build
+    cd frontend && if [ ! -d node_modules ]; then npm ci; fi && npm run build
 
 # Build everything
 build: build-backend build-frontend
@@ -56,7 +56,7 @@ test-backend:
 
 # Type-check frontend
 test-frontend:
-    cd frontend && npx tsc --noEmit
+    cd frontend && if [ ! -d node_modules ]; then npm ci; fi && npx tsc --noEmit
 
 # Run all tests
 test: test-backend test-frontend
@@ -67,7 +67,7 @@ lint-backend:
 
 # Lint frontend with tsc
 lint-frontend:
-    cd frontend && npx tsc --noEmit
+    cd frontend && if [ ! -d node_modules ]; then npm ci; fi && npx tsc --noEmit
 
 # Lint everything
 lint: lint-backend lint-frontend
