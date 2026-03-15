@@ -4,9 +4,9 @@ import os
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from illdashboard.database import get_db
+from illdashboard.database import create_database_engine, get_db
 from illdashboard.models import Base
 
 
@@ -15,7 +15,7 @@ async def client(tmp_path):
     """Create a test client with a temporary SQLite database."""
     db_path = tmp_path / "test.db"
     db_url = f"sqlite+aiosqlite:///{db_path}"
-    engine = create_async_engine(db_url, echo=False)
+    engine = create_database_engine(db_url)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     async with engine.begin() as conn:

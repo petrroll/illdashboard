@@ -5,9 +5,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from illdashboard import config
+from illdashboard.database import create_database_engine
 from illdashboard.main import preload_uploaded_files
 from illdashboard.models import Base, LabFile, MarkerTag, Measurement, MeasurementType
 
@@ -23,7 +25,7 @@ async def test_list_files_empty(client):
 async def test_preload_uploaded_files_adds_supported_disk_files_without_duplicates(tmp_path):
     db_path = tmp_path / "preload.db"
     db_url = f"sqlite+aiosqlite:///{db_path}"
-    engine = create_async_engine(db_url, echo=False)
+    engine = create_database_engine(db_url)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     async with engine.begin() as conn:
@@ -167,9 +169,37 @@ def _parse_ndjson(text: str) -> list[dict]:
 
 
 def _open_current_test_db():
-    engine = create_async_engine(config.settings.DATABASE_URL, echo=False)
+    engine = create_database_engine(config.settings.DATABASE_URL)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     return engine, session_factory
+
+
+@pytest.mark.asyncio
+async def test_measurement_requires_existing_measurement_type(client):
+    engine, session_factory = _open_current_test_db()
+
+    try:
+        async with session_factory() as session:
+            lab_file = LabFile(
+                filename="lab.pdf",
+                filepath="lab.pdf",
+                mime_type="application/pdf",
+            )
+            session.add(lab_file)
+            await session.flush()
+
+            session.add(
+                Measurement(
+                    lab_file_id=lab_file.id,
+                    measurement_type_id=999999,
+                    value=1.23,
+                )
+            )
+
+            with pytest.raises(IntegrityError):
+                await session.commit()
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
