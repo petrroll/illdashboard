@@ -5,6 +5,7 @@ copilot CLI subprocess, authentication, and model communication.
 """
 
 import json
+import logging
 import math
 import os
 import tempfile
@@ -17,6 +18,9 @@ from copilot.types import CopilotClientOptions, MessageOptions
 
 from illdashboard.config import settings
 from illdashboard.metrics import add_premium_requests
+
+
+logger = logging.getLogger(__name__)
 
 # ── Client management ────────────────────────────────────────────────────────
 
@@ -105,6 +109,33 @@ def _parse_json_response(raw: str) -> dict:
 def _is_request_too_large_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return "413" in message or "failed to parse request" in message
+
+
+def _is_request_timeout_error(exc: Exception) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+
+    message = str(exc).lower()
+    return "timeout" in message and "session.idle" in message
+
+
+def _is_rate_limited_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "429" in message or "rate limit" in message or "too many requests" in message
+
+
+def _is_retryable_pdf_error(exc: Exception) -> bool:
+    return _is_request_too_large_error(exc) or _is_request_timeout_error(exc) or _is_rate_limited_error(exc)
+
+
+def _retryable_pdf_error_reason(exc: Exception) -> str:
+    if _is_request_timeout_error(exc):
+        return "timeout"
+    if _is_rate_limited_error(exc):
+        return "rate-limit"
+    if _is_request_too_large_error(exc):
+        return "request-too-large"
+    return exc.__class__.__name__
 
 
 # ── OCR ──────────────────────────────────────────────────────────────────────
@@ -243,6 +274,8 @@ async def _ocr_extract_pdf_range(
     dpi: int = OCR_PDF_RENDER_DPI,
     filename: str | None = None,
 ) -> dict:
+    page_count = stop_page - start_page
+
     try:
         result = await _ocr_extract_pdf_batch(
             pdf_path,
@@ -253,11 +286,51 @@ async def _ocr_extract_pdf_range(
         )
         return _offset_result_page_numbers(result, start_page)
     except Exception as exc:
-        if not _is_request_too_large_error(exc):
+        retry_reason = _retryable_pdf_error_reason(exc)
+        if not _is_retryable_pdf_error(exc):
+            logger.exception(
+                "OCR PDF extraction failed for %s (filename=%s, pages=%s-%s, dpi=%s)",
+                pdf_path,
+                filename,
+                start_page + 1,
+                stop_page,
+                dpi,
+            )
             raise
 
-        page_count = stop_page - start_page
+        if page_count > 1 and (_is_request_timeout_error(exc) or _is_rate_limited_error(exc)):
+            logger.warning(
+                "OCR PDF batch request failed for %s (filename=%s, pages=%s-%s, dpi=%s, reason=%s); falling back to single-page retries",
+                pdf_path,
+                filename,
+                start_page + 1,
+                stop_page,
+                dpi,
+                retry_reason,
+            )
+            results: list[dict] = []
+            for page_index in range(start_page, stop_page):
+                results.append(
+                    await _ocr_extract_pdf_range(
+                        pdf_path,
+                        start_page=page_index,
+                        stop_page=page_index + 1,
+                        dpi=dpi,
+                        filename=filename,
+                    )
+                )
+            return _merge_ocr_results(results)
+
         if page_count > 1:
+            logger.warning(
+                "OCR PDF batch request failed for %s (filename=%s, pages=%s-%s, dpi=%s, reason=%s); splitting batch",
+                pdf_path,
+                filename,
+                start_page + 1,
+                stop_page,
+                dpi,
+                retry_reason,
+            )
             midpoint = start_page + math.ceil(page_count / 2)
             left = await _ocr_extract_pdf_range(
                 pdf_path,
@@ -277,6 +350,15 @@ async def _ocr_extract_pdf_range(
 
         smaller_dpi = max(OCR_PDF_MIN_RENDER_DPI, dpi - 24)
         if smaller_dpi != dpi:
+            logger.warning(
+                "OCR PDF page request failed for %s (filename=%s, page=%s, dpi=%s, reason=%s); retrying at dpi=%s",
+                pdf_path,
+                filename,
+                start_page + 1,
+                dpi,
+                retry_reason,
+                smaller_dpi,
+            )
             return await _ocr_extract_pdf_range(
                 pdf_path,
                 start_page=start_page,
@@ -284,6 +366,13 @@ async def _ocr_extract_pdf_range(
                 dpi=smaller_dpi,
                 filename=filename,
             )
+        logger.exception(
+            "OCR PDF extraction failed at minimum DPI for %s (filename=%s, page=%s, dpi=%s)",
+            pdf_path,
+            filename,
+            start_page + 1,
+            dpi,
+        )
         raise
 
 
@@ -341,6 +430,9 @@ standard English canonical lab marker name when you can translate it confidently
 canonical medical name instead of preserving the source-language wording.
 - Prefer concise English medical names such as \"White Blood Cell (WBC) Count\" \
 or \"Platelet Count\" over local-language labels.
+- Treat abbreviations like \"Abs\" carefully: in immunology or assay contexts it often \
+means \"Absorbance\", not \"Absolute\". Only expand it to \"Absolute\" when the \
+source label clearly indicates an absolute count.
 
 Return ONLY valid JSON: a mapping object where keys are the original new names \
 and values are the canonical names.
@@ -468,9 +560,14 @@ a single biomarker across time, including units and reference ranges when availa
 
 Write a short markdown explanation with these sections:
 1. What this marker measures.
-2. What the latest value means relative to its range.
+2. What the latest value means relative to its range. If the latest value is below or above the
+    reference range, explicitly explain in plain language what being below or above the limit means.
 3. What the recent trend suggests, based only on the supplied values.
-4. A short caution that this is not a diagnosis and should be interpreted with a clinician.
+
+Do not add a generic caution or disclaimer section. Do not say that this is not a diagnosis and do
+not tell the user to ask a clinician unless the supplied data itself requires a specific limitation
+to be mentioned. If only a single value is supplied, do not dwell on the lack of a trend; focus on
+explaining what that value means.
 
 Keep the language plain, factual, and concise. Do not invent causes that are not \
 supported by the data.\

@@ -52,26 +52,37 @@ def fallback_marker_explanation(marker_name: str, measurements: list[Measurement
     latest = measurements[-1]
     previous = measurements[-2] if len(measurements) > 1 else None
     status = measurement_status(latest).replace("_", " ")
+    unit_suffix = f" {latest.unit}" if latest.unit else ""
     parts = [
         f"## {marker_name}",
-        f"Latest value: **{latest.value:g} {latest.unit or ''}**. Status: **{status}**.",
+        f"Latest value: **{latest.value:g}{unit_suffix}**. Status: **{status}**.",
     ]
 
     if latest.reference_low is not None and latest.reference_high is not None:
         parts.append(
-            f"Reference range from the report: **{latest.reference_low:g} to {latest.reference_high:g} {latest.unit or ''}**."
+            f"Reference range from the report: **{latest.reference_low:g} to {latest.reference_high:g}{unit_suffix}**."
+        )
+
+    if status == "low":
+        parts.append(
+            "The latest result is below the reported range, which means it is lower than the lab's usual reference interval for this marker."
+        )
+    elif status == "high":
+        parts.append(
+            "The latest result is above the reported range, which means it is higher than the lab's usual reference interval for this marker."
+        )
+    elif status == "in range":
+        parts.append(
+            "The latest result is within the reported range, which means it falls inside the lab's usual reference interval for this marker."
         )
 
     if previous is not None:
         delta = latest.value - previous.value
         direction = "up" if delta > 0 else "down" if delta < 0 else "unchanged"
         parts.append(
-            f"Compared with the previous result, the marker is **{direction}** by **{abs(delta):g} {latest.unit or ''}**."
+            f"Compared with the previous result, the marker is **{direction}** by **{abs(delta):g}{unit_suffix}**."
         )
 
-    parts.append(
-        "This is a basic summary generated from your stored results. Clinical interpretation should be confirmed with a clinician who knows your history."
-    )
     return "\n\n".join(parts)
 
 

@@ -5,11 +5,14 @@ import {
   explainMeasurement,
   explainMeasurements,
   fetchFile,
+  fetchFileTags,
   fetchFileMeasurements,
   fetchFilePageInfo,
   runFileOcr,
+  setFileTags,
   type PageInfo,
 } from "../api";
+import TagInput from "../components/TagInput";
 import type { LabFile, Measurement, ExplainRequest } from "../types";
 import {
   formatDate,
@@ -30,6 +33,7 @@ export default function FileDetail() {
   const [explanation, setExplanation] = useState<string | null>(null);
   const [explaining, setExplaining] = useState(false);
   const [pageInfo, setPageInfo] = useState<PageInfo | null>(null);
+  const [allFileTags, setAllFileTags] = useState<string[]>([]);
   const [highlightedPage, setHighlightedPage] = useState<number | null>(null);
   const [search, setSearch] = useState("");
   const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
@@ -40,13 +44,15 @@ export default function FileDetail() {
       return;
     }
 
-    const [fileResponse, measurementsResponse] = await Promise.all([
+    const [fileResponse, measurementsResponse, allTagsResponse] = await Promise.all([
       fetchFile(fileId),
       fetchFileMeasurements(fileId),
+      fetchFileTags(),
     ]);
 
     setFile(fileResponse);
     setMeasurements(measurementsResponse);
+    setAllFileTags(allTagsResponse);
 
     try {
       setPageInfo(await fetchFilePageInfo(fileId));
@@ -172,6 +178,41 @@ export default function FileDetail() {
         Uploaded {formatDateTime(file.uploaded_at)}
         {file.lab_date && ` · Lab date: ${formatDate(file.lab_date)}`}
       </p>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "flex-start",
+          gap: "0.6rem",
+          flexWrap: "wrap",
+          marginBottom: "1rem",
+        }}
+      >
+        <span
+          style={{
+            color: "var(--text-muted)",
+            fontSize: "0.8rem",
+            fontWeight: 600,
+            textTransform: "uppercase",
+            letterSpacing: "0.04em",
+          }}
+        >
+          Tags
+        </span>
+        <div style={{ flex: "1 1 320px", minWidth: "220px", maxWidth: "560px" }}>
+          <TagInput
+            tags={file.tags}
+            allTags={allFileTags}
+            onChange={async (newTags) => {
+              const savedTags = await setFileTags(file.id, newTags);
+              setFile((previousFile) =>
+                previousFile ? { ...previousFile, tags: savedTags } : previousFile,
+              );
+              setAllFileTags(await fetchFileTags());
+            }}
+            placeholder="Add tag…"
+          />
+        </div>
+      </div>
 
       {/* OCR controls */}
       <div className="flex-row mb-1">

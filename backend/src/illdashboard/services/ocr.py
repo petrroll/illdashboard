@@ -306,6 +306,12 @@ async def stream_ocr_for_labs(labs: list[LabFile], db: AsyncSession):
                 result = await extract_ocr_result(lab)
                 return index, lab, result, None
             except Exception as exc:
+                logger.exception(
+                    "OCR extraction failed for file id=%s filename=%r path=%r",
+                    lab.id,
+                    lab.filename,
+                    lab.filepath,
+                )
                 return index, lab, None, exc
 
     tasks = [asyncio.create_task(extract_one(index, lab)) for index, lab in enumerate(labs)]
@@ -323,6 +329,12 @@ async def stream_ocr_for_labs(labs: list[LabFile], db: AsyncSession):
             yield progress_payload(lab=lab, index=index, total=total, status="done")
         except Exception as exc:
             await db.rollback()
+            logger.exception(
+                "Persisting OCR result failed for file id=%s filename=%r path=%r",
+                lab.id,
+                lab.filename,
+                lab.filepath,
+            )
             yield progress_payload(lab=lab, index=index, total=total, status="error", error=str(exc))
 
     yield json.dumps({"type": "complete"}) + "\n"

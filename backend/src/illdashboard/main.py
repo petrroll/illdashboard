@@ -1,5 +1,7 @@
 """FastAPI application entry point."""
 
+import logging
+from logging.config import dictConfig
 import mimetypes
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -23,6 +25,48 @@ PRELOADABLE_MIME_TYPES = {
     ".jpeg": "image/jpeg",
     ".webp": "image/webp",
 }
+
+
+def configure_logging() -> None:
+    dictConfig(
+        {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {
+                "default": {
+                    "format": "%(asctime)s %(levelname)s %(name)s %(message)s",
+                    "datefmt": "%Y-%m-%d %H:%M:%S",
+                },
+                "access": {
+                    "()": "uvicorn.logging.AccessFormatter",
+                    "fmt": "%(asctime)s %(levelprefix)s %(client_addr)s - \"%(request_line)s\" %(status_code)s",
+                    "datefmt": "%Y-%m-%d %H:%M:%S",
+                },
+            },
+            "handlers": {
+                "default": {
+                    "class": "logging.StreamHandler",
+                    "formatter": "default",
+                    "stream": "ext://sys.stderr",
+                },
+                "access": {
+                    "class": "logging.StreamHandler",
+                    "formatter": "access",
+                    "stream": "ext://sys.stdout",
+                },
+            },
+            "loggers": {
+                "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
+                "uvicorn.error": {"handlers": ["default"], "level": "INFO", "propagate": False},
+                "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
+            },
+            "root": {"handlers": ["default"], "level": "INFO"},
+        }
+    )
+
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 
 async def preload_uploaded_files() -> int:
@@ -70,7 +114,9 @@ async def lifespan(app: FastAPI):
     await upgrade_database_schema(engine)
     # Ensure upload directory exists
     Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
-    await preload_uploaded_files()
+    preloaded_files = await preload_uploaded_files()
+    if preloaded_files:
+        logger.info("Preloaded %s uploaded files from disk", preloaded_files)
     yield
     # Shutdown Copilot SDK client
     await shutdown_client()
