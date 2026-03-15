@@ -207,7 +207,7 @@ async def test_reprocess_file_no_duplicates(client):
     """Running OCR twice on the same file should NOT create duplicate measurements."""
     file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
         # First OCR run
         resp1 = await client.post(f"/api/files/{file_id}/ocr")
         assert resp1.status_code == 200
@@ -242,12 +242,12 @@ async def test_reprocess_replaces_old_values(client):
         ],
     }
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
         resp1 = await client.post(f"/api/files/{file_id}/ocr")
         assert resp1.status_code == 200
         assert len(resp1.json()) == 2
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=updated_result):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=updated_result):
         resp2 = await client.post(f"/api/files/{file_id}/ocr")
         assert resp2.status_code == 200
         assert len(resp2.json()) == 1
@@ -283,24 +283,24 @@ async def test_set_file_tags_allows_extending_existing_tag_list(client):
 async def test_set_marker_tags_allows_extending_existing_tag_list(client):
     file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
         ocr_resp = await client.post(f"/api/files/{file_id}/ocr")
     assert ocr_resp.status_code == 200
 
     first_resp = await client.put("/api/markers/Sodium/tags", json={"tags": ["electrolyte"]})
     assert first_resp.status_code == 200
-    assert first_resp.json() == ["electrolyte"]
+    assert first_resp.json() == ["electrolyte", "group:Electrolytes", "singlemeasurement"]
 
     second_resp = await client.put(
         "/api/markers/Sodium/tags",
         json={"tags": ["electrolyte", "fasting", "fasting"]},
     )
     assert second_resp.status_code == 200
-    assert second_resp.json() == ["electrolyte", "fasting"]
+    assert second_resp.json() == ["electrolyte", "fasting", "group:Electrolytes", "singlemeasurement"]
 
     detail_resp = await client.get("/api/measurements/detail", params={"marker_name": "Sodium"})
     assert detail_resp.status_code == 200
-    assert detail_resp.json()["tags"] == ["electrolyte", "fasting"]
+    assert detail_resp.json()["tags"] == ["electrolyte", "fasting", "group:Electrolytes", "singlemeasurement"]
 
 
 @pytest.mark.asyncio
@@ -309,7 +309,7 @@ async def test_batch_and_unprocessed_share_streaming_behavior(client):
     first_file_id = await _upload_pdf(client)
     second_file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
         unprocessed_resp = await client.post("/api/files/ocr/unprocessed")
 
     assert unprocessed_resp.status_code == 200
@@ -335,7 +335,7 @@ async def test_batch_and_unprocessed_share_streaming_behavior(client):
             }
         ],
     }
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=batch_result):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=batch_result):
         batch_resp = await client.post("/api/files/ocr/batch", json={"file_ids": [first_file_id]})
 
     assert batch_resp.status_code == 200
@@ -360,11 +360,11 @@ async def test_measurement_overview_groups_latest_and_previous_values(client):
     first_file_id = await _upload_pdf(client)
     second_file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_RESULT):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_RESULT):
         resp = await client.post(f"/api/files/{first_file_id}/ocr")
         assert resp.status_code == 200
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_UPDATED_RESULT):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_UPDATED_RESULT):
         resp = await client.post(f"/api/files/{second_file_id}/ocr")
         assert resp.status_code == 200
 
@@ -385,7 +385,7 @@ async def test_measurement_overview_groups_latest_and_previous_values(client):
 async def test_measurement_overview_groups_electrolytes_separately(client):
     file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
         resp = await client.post(f"/api/files/{file_id}/ocr")
         assert resp.status_code == 200
 
@@ -402,7 +402,7 @@ async def test_measurement_overview_groups_electrolytes_separately(client):
 async def test_measurement_overview_groups_magnesium_as_electrolyte(client):
     file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=MAGNESIUM_RESULT):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=MAGNESIUM_RESULT):
         resp = await client.post(f"/api/files/{file_id}/ocr")
         assert resp.status_code == 200
 
@@ -420,11 +420,11 @@ async def test_measurement_overview_exposes_and_filters_by_derived_tags(client):
     first_file_id = await _upload_pdf(client)
     second_file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_RESULT):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_RESULT):
         resp = await client.post(f"/api/files/{first_file_id}/ocr")
         assert resp.status_code == 200
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_UPDATED_RESULT):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_UPDATED_RESULT):
         resp = await client.post(f"/api/files/{second_file_id}/ocr")
         assert resp.status_code == 200
 
@@ -455,7 +455,7 @@ async def test_measurement_overview_exposes_and_filters_by_derived_tags(client):
 async def test_marker_tags_endpoint_includes_derived_tags_and_does_not_persist_them(client):
     file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
         resp = await client.post(f"/api/files/{file_id}/ocr")
         assert resp.status_code == 200
 
@@ -491,7 +491,7 @@ async def test_marker_tags_endpoint_includes_derived_tags_and_does_not_persist_t
 async def test_measurements_persist_with_measurement_type_references(client):
     file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
         resp = await client.post(f"/api/files/{file_id}/ocr")
         assert resp.status_code == 200
 
@@ -542,8 +542,8 @@ async def test_normalize_existing_markers_merges_measurement_types_and_tags(clie
         ],
     }
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=na_result), patch(
-        "illdashboard.routes.normalize_marker_names",
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=na_result), patch(
+        "illdashboard.services.ocr.normalize_marker_names",
         new_callable=AsyncMock,
         return_value={"Na": "Na"},
     ):
@@ -554,8 +554,8 @@ async def test_normalize_existing_markers_merges_measurement_types_and_tags(clie
     assert tag_resp.status_code == 200
     assert tag_resp.json() == ["electrolyte", "group:Electrolytes", "singlemeasurement"]
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=sodium_result), patch(
-        "illdashboard.routes.normalize_marker_names",
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=sodium_result), patch(
+        "illdashboard.services.ocr.normalize_marker_names",
         new_callable=AsyncMock,
         return_value={"Sodium": "Sodium"},
     ):
@@ -563,7 +563,7 @@ async def test_normalize_existing_markers_merges_measurement_types_and_tags(clie
         assert resp.status_code == 200
 
     with patch(
-        "illdashboard.routes.normalize_marker_names",
+        "illdashboard.services.ocr.normalize_marker_names",
         new_callable=AsyncMock,
         return_value={"Na": "Sodium", "Sodium": "Sodium"},
     ):
@@ -598,12 +598,12 @@ async def test_measurement_detail_uses_cached_explanation_until_values_change(cl
     first_file_id = await _upload_pdf(client)
     second_file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_RESULT):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_RESULT):
         resp = await client.post(f"/api/files/{first_file_id}/ocr")
         assert resp.status_code == 200
 
     with patch(
-        "illdashboard.routes.explain_marker_history",
+        "illdashboard.services.insights.explain_marker_history",
         new_callable=AsyncMock,
         side_effect=AssertionError("detail endpoint should not block on insight generation"),
     ) as explain_mock:
@@ -619,7 +619,7 @@ async def test_measurement_detail_uses_cached_explanation_until_values_change(cl
     explain_mock.assert_not_awaited()
 
     with patch(
-        "illdashboard.routes.explain_marker_history",
+        "illdashboard.services.insights.explain_marker_history",
         new_callable=AsyncMock,
         return_value="cached platelet explanation",
     ) as explain_mock:
@@ -635,7 +635,7 @@ async def test_measurement_detail_uses_cached_explanation_until_values_change(cl
     explain_mock.assert_awaited_once()
 
     with patch(
-        "illdashboard.routes.explain_marker_history",
+        "illdashboard.services.insights.explain_marker_history",
         new_callable=AsyncMock,
         side_effect=AssertionError("cache should prevent regeneration"),
     ) as explain_mock:
@@ -659,12 +659,12 @@ async def test_measurement_detail_uses_cached_explanation_until_values_change(cl
     assert cached_detail["explanation"] == "cached platelet explanation"
     assert cached_detail["explanation_cached"] is True
 
-    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_UPDATED_RESULT):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_UPDATED_RESULT):
         resp = await client.post(f"/api/files/{second_file_id}/ocr")
         assert resp.status_code == 200
 
     with patch(
-        "illdashboard.routes.explain_marker_history",
+        "illdashboard.services.insights.explain_marker_history",
         new_callable=AsyncMock,
         return_value="fresh platelet explanation",
     ) as explain_mock:

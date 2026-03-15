@@ -3,6 +3,13 @@ import { useParams, Link } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import api from "../api";
 import type { LabFile, Measurement, ExplainRequest, ExplainResponse } from "../types";
+import {
+  formatDate,
+  formatDateTime,
+  formatReferenceRange,
+  getDisplayUnit,
+  getMeasurementValueClass,
+} from "../utils/measurements";
 
 interface PageInfo {
   page_count: number;
@@ -21,26 +28,51 @@ export default function FileDetail() {
   const [highlightedPage, setHighlightedPage] = useState<number | null>(null);
   const [search, setSearch] = useState("");
   const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const highlightTimeoutRef = useRef<number | null>(null);
 
-  const load = async () => {
-    const [fRes, mRes] = await Promise.all([
+  const load = useCallback(async () => {
+    if (!id) {
+      return;
+    }
+
+    const [fileResponse, measurementsResponse] = await Promise.all([
       api.get<LabFile>(`/files/${id}`),
       api.get<Measurement[]>(`/files/${id}/measurements`),
     ]);
-    setFile(fRes.data);
-    setMeasurements(mRes.data);
-    // Load page info
+
+    setFile(fileResponse.data);
+    setMeasurements(measurementsResponse.data);
+
     try {
-      const pRes = await api.get<PageInfo>(`/files/${id}/pages`);
-      setPageInfo(pRes.data);
+      const pageInfoResponse = await api.get<PageInfo>(`/files/${id}/pages`);
+      setPageInfo(pageInfoResponse.data);
     } catch {
       setPageInfo(null);
     }
-  };
+  }, [id]);
 
   useEffect(() => {
-    load();
-  }, [id]);
+    void load();
+  }, [load]);
+
+  useEffect(() => {
+    return () => {
+      if (highlightTimeoutRef.current !== null) {
+        window.clearTimeout(highlightTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  const requestExplanation = async (path: string, payload: object) => {
+    setExplaining(true);
+    setExplanation(null);
+    try {
+      const response = await api.post<ExplainResponse>(path, payload);
+      setExplanation(response.data.explanation);
+    } finally {
+      setExplaining(false);
+    }
+  };
 
   const runOcr = async () => {
     setOcrRunning(true);
@@ -72,33 +104,17 @@ export default function FileDetail() {
         reference_high: m.reference_high,
       }));
     if (items.length === 0) return;
-    setExplaining(true);
-    setExplanation(null);
-    try {
-      const res = await api.post<ExplainResponse>("/explain/multi", {
-        measurements: items,
-      });
-      setExplanation(res.data.explanation);
-    } finally {
-      setExplaining(false);
-    }
+    await requestExplanation("/explain/multi", { measurements: items });
   };
 
   const explainSingle = async (m: Measurement) => {
-    setExplaining(true);
-    setExplanation(null);
-    try {
-      const res = await api.post<ExplainResponse>("/explain", {
-        marker_name: m.marker_name,
-        value: m.value,
-        unit: m.unit,
-        reference_low: m.reference_low,
-        reference_high: m.reference_high,
-      });
-      setExplanation(res.data.explanation);
-    } finally {
-      setExplaining(false);
-    }
+    await requestExplanation("/explain", {
+      marker_name: m.marker_name,
+      value: m.value,
+      unit: m.unit,
+      reference_low: m.reference_low,
+      reference_high: m.reference_high,
+    });
   };
 
   const scrollToPage = useCallback((pageNum: number) => {
@@ -107,8 +123,15 @@ export default function FileDetail() {
     if (el) {
       el.scrollIntoView({ behavior: "smooth", block: "center" });
     }
-    // Clear highlight after animation
-    setTimeout(() => setHighlightedPage(null), 1500);
+
+    if (highlightTimeoutRef.current !== null) {
+      window.clearTimeout(highlightTimeoutRef.current);
+    }
+
+    highlightTimeoutRef.current = window.setTimeout(() => {
+      setHighlightedPage(null);
+      highlightTimeoutRef.current = null;
+    }, 1500);
   }, []);
 
   const setPageRef = useCallback((pageNum: number, el: HTMLDivElement | null) => {
@@ -119,9 +142,11 @@ export default function FileDetail() {
     }
   }, []);
 
+  if (!id) return <p>File not found.</p>;
   if (!file) return <p>Loading…</p>;
 
   const hasPages = pageInfo && pageInfo.page_count > 0;
+  const showPageColumn = (pageInfo?.page_count ?? 0) > 1;
   const searchLower = search.toLowerCase();
   const filteredMeasurements = searchLower
     ? measurements.filter((m) => m.marker_name.toLowerCase().includes(searchLower))
@@ -134,8 +159,8 @@ export default function FileDetail() {
       </Link>
       <h2 style={{ marginTop: "0.5rem" }}>{file.filename}</h2>
       <p style={{ color: "var(--text-muted)", marginBottom: "1rem" }}>
-        Uploaded {new Date(file.uploaded_at).toLocaleString()}
-        {file.lab_date && ` · Lab date: ${new Date(file.lab_date).toLocaleDateString()}`}
+        Uploaded {formatDateTime(file.uploaded_at)}
+        {file.lab_date && ` · Lab date: ${formatDate(file.lab_date)}`}
       </p>
 
       {/* OCR controls */}
@@ -223,18 +248,12 @@ export default function FileDetail() {
                     <th>Unit</th>
                     <th>Reference</th>
                     <th>Date</th>
-                    {hasPages && pageInfo.page_count > 1 && <th>Page</th>}
+                    {hasPages && showPageColumn && <th>Page</th>}
                     <th></th>
                   </tr>
                 </thead>
                 <tbody>
                   {filteredMeasurements.map((m) => {
-                    const status =
-                      m.reference_low != null && m.value < m.reference_low
-                        ? "value-low"
-                        : m.reference_high != null && m.value > m.reference_high
-                        ? "value-high"
-                        : "value-normal";
                     return (
                       <tr key={m.id}>
                         <td>
@@ -247,21 +266,13 @@ export default function FileDetail() {
                           </label>
                         </td>
                         <td style={{ fontWeight: 500 }}>{m.marker_name}</td>
-                        <td className={status} style={{ fontWeight: 600 }}>
+                        <td className={getMeasurementValueClass(m)} style={{ fontWeight: 600 }}>
                           {m.value}
                         </td>
-                        <td>{m.unit && m.unit !== "1" ? m.unit : "—"}</td>
-                        <td>
-                          {m.reference_low != null && m.reference_high != null
-                            ? `${m.reference_low}–${m.reference_high}`
-                            : "—"}
-                        </td>
-                        <td>
-                          {m.measured_at
-                            ? new Date(m.measured_at).toLocaleDateString()
-                            : "—"}
-                        </td>
-                        {hasPages && pageInfo.page_count > 1 && (
+                        <td>{getDisplayUnit(m.unit) ?? "—"}</td>
+                        <td>{formatReferenceRange(m.reference_low, m.reference_high)}</td>
+                        <td>{formatDate(m.measured_at)}</td>
+                        {hasPages && showPageColumn && (
                           <td>
                             {m.page_number ? (
                               <button

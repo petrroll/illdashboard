@@ -7,6 +7,12 @@ import FileDetail from "./pages/FileDetail";
 import MarkerChart from "./pages/MarkerChart";
 import "./App.css";
 
+const navigationItems = [
+  { to: "/charts", label: "Biomarkers" },
+  { to: "/files", label: "Lab Files" },
+  { to: "/settings", label: "Settings" },
+];
+
 function HomeRedirect() {
   const [target, setTarget] = useState<string | null>(null);
 
@@ -26,10 +32,15 @@ function App() {
     <BrowserRouter>
       <div className="app">
         <nav className="sidebar">
-          <h1 className="logo">🩺 Health Dashboard</h1>
-          <NavLink to="/charts">Biomarkers</NavLink>
-          <NavLink to="/files">Lab Files</NavLink>
-          <NavLink to="/settings">Settings</NavLink>
+          <h1 className="logo">
+            <img className="logo-mark" src="/favicon.svg" alt="" aria-hidden="true" />
+            <span>Health Dashboard</span>
+          </h1>
+          {navigationItems.map((item) => (
+            <NavLink key={item.to} to={item.to}>
+              {item.label}
+            </NavLink>
+          ))}
         </nav>
         <main className="content">
           <Routes>

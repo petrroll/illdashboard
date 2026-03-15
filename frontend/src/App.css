@@ -48,9 +48,20 @@ body {
 }
 
 .sidebar .logo {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.65rem;
   font-size: 1.1rem;
   margin-bottom: 1.5rem;
   font-weight: 700;
+}
+
+.sidebar .logo-mark {
+  width: 1.75rem;
+  height: 1.75rem;
+  flex-shrink: 0;
+  image-rendering: pixelated;
+  filter: drop-shadow(0 0 10px rgba(18, 199, 142, 0.18));
 }
 
 .sidebar a {
@@ -847,6 +858,11 @@ input[type="file"] {
   .sidebar .logo {
     width: 100%;
     margin-bottom: 0.5rem;
+  }
+
+  .sidebar .logo-mark {
+    width: 1.5rem;
+    height: 1.5rem;
   }
 
   .marker-browser-header,

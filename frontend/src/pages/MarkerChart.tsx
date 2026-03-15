@@ -1,4 +1,4 @@
-import { startTransition, useDeferredValue, useEffect, useRef, useState } from "react";
+import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import {
   LineChart,
@@ -22,6 +22,13 @@ import type {
   MarkerInsightResponse,
   MarkerOverviewItem,
 } from "../types";
+import {
+  formatDate,
+  formatMeasurementValue,
+  formatReferenceRange,
+  getDisplayUnit,
+  getMarkerStatusLabel,
+} from "../utils/measurements";
 
 const LIST_PANE_STORAGE_KEY = "illdashboard.markerListWidth";
 const MIN_LIST_PANE_WIDTH = 300;
@@ -162,48 +169,51 @@ export default function MarkerChart() {
     };
   }, [selectedMarker]);
 
-  const filteredOverview = overview
-    .map((group) => ({
-      ...group,
-      markers: group.markers.filter((marker) => {
-        const searchText = [marker.marker_name, marker.group_name, ...marker.tags]
-          .join(" ")
-          .toLowerCase();
-        if (deferredSearch && !searchText.includes(deferredSearch)) {
-          return false;
-        }
-        return true;
-      }),
-    }))
-    .filter((group) => group.markers.length > 0);
+  const filteredOverview = useMemo(
+    () =>
+      overview
+        .map((group) => ({
+          ...group,
+          markers: group.markers.filter((marker) => {
+            const searchText = [marker.marker_name, marker.group_name, ...marker.tags]
+              .join(" ")
+              .toLowerCase();
+            return !deferredSearch || searchText.includes(deferredSearch);
+          }),
+        }))
+        .filter((group) => group.markers.length > 0),
+    [deferredSearch, overview],
+  );
 
-  const measurements = detail?.measurements ?? [];
-  const chartData = measurements.map((measurement) => ({
-    dateLabel: measurement.measured_at
-      ? new Date(measurement.measured_at).toLocaleDateString()
-      : "?",
-    measuredAt: measurement.measured_at ?? "",
-    value: measurement.value,
-    reference_low: measurement.reference_low,
-    reference_high: measurement.reference_high,
-  }));
+  const measurements = useMemo(() => detail?.measurements ?? [], [detail]);
+  const chartData = useMemo(
+    () =>
+      measurements.map((measurement) => ({
+        dateLabel: formatDate(measurement.measured_at),
+        measuredAt: measurement.measured_at ?? "",
+        value: measurement.value,
+        reference_low: measurement.reference_low,
+        reference_high: measurement.reference_high,
+      })),
+    [measurements],
+  );
 
-  const rawUnit = detail?.latest_measurement.unit || "";
-  const unit = rawUnit === "1" ? "" : rawUnit;
+  const unit = getDisplayUnit(detail?.latest_measurement.unit) ?? "";
   const refLow = detail?.latest_measurement.reference_low ?? null;
   const refHigh = detail?.latest_measurement.reference_high ?? null;
-  const yAxisValues = measurements.flatMap((measurement) => {
-    const values = [
-      measurement.value,
-      measurement.reference_low,
-      measurement.reference_high,
-    ];
+  const yAxisDomain: [number, number] = useMemo(() => {
+    const yAxisValues = measurements.flatMap((measurement) => {
+      const values = [
+        measurement.value,
+        measurement.reference_low,
+        measurement.reference_high,
+      ];
 
-    return values.filter(
-      (value): value is number => value != null && Number.isFinite(value),
-    );
-  });
-  const yAxisDomain: [number, number] = (() => {
+      return values.filter(
+        (value): value is number => value != null && Number.isFinite(value),
+      );
+    });
+
     if (yAxisValues.length === 0) {
       return [0, 1];
     }
@@ -214,7 +224,7 @@ export default function MarkerChart() {
     const padding = span === 0 ? Math.max(Math.abs(max) * 0.1, 1) : span * 0.1;
 
     return [min - padding, max + padding];
-  })();
+  }, [measurements]);
 
   const selectMarker = (markerName: string) => {
     startTransition(() => {
@@ -223,40 +233,19 @@ export default function MarkerChart() {
   };
 
   const totalMarkers = overview.reduce((count, group) => count + group.markers.length, 0);
-  const selectedOverviewItem = overview
-    .flatMap((group) => group.markers)
-    .find((item) => item.marker_name === selectedMarker);
+  const selectedOverviewItem = useMemo(
+    () =>
+      overview
+        .flatMap((group) => group.markers)
+        .find((item) => item.marker_name === selectedMarker),
+    [overview, selectedMarker],
+  );
   const summarySource = detail ?? selectedOverviewItem ?? null;
 
-  const formatValue = (value: number, itemUnit?: string | null) => {
-    const rendered = Number.isInteger(value) ? value.toString() : value.toFixed(2).replace(/\.00$/, "");
-    // Hide the dimensionless unit "1" — it's confusing when displayed next to numbers
-    const displayUnit = itemUnit && itemUnit !== "1" ? itemUnit : null;
-    return displayUnit ? `${rendered} ${displayUnit}` : rendered;
-  };
-
-  const formatDate = (value: string | null) => {
-    if (!value) return "—";
-    return new Date(value).toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    });
-  };
-
   const rangeMeter = (item: MarkerOverviewItem) => {
-    const statusLabel =
-      item.status === "in_range"
-        ? "In range"
-        : item.status === "low"
-        ? "Below range"
-        : item.status === "high"
-        ? "Above range"
-        : "No range";
-
     return (
       <div className="range-meter">
-        <span className={`status-pill status-${item.status}`}>{statusLabel}</span>
+        <span className={`status-pill status-${item.status}`}>{getMarkerStatusLabel(item.status)}</span>
         <img
           className="sparkline-img"
           src={`/api/measurements/sparkline?marker_name=${encodeURIComponent(item.marker_name)}&v=4`}
@@ -286,6 +275,33 @@ export default function MarkerChart() {
     window.addEventListener("mousemove", onMouseMove);
     window.addEventListener("mouseup", stopResize);
   };
+
+  const handleMarkerTagsChange = async (markerName: string, newTags: string[]) => {
+    const savedTags = await setMarkerTags(markerName, newTags);
+
+    if (detail?.marker_name === markerName) {
+      setDetail({ ...detail, tags: savedTags });
+    }
+
+    setOverview((previousOverview) =>
+      previousOverview.map((group) => ({
+        ...group,
+        markers: group.markers.map((marker) =>
+          marker.marker_name === markerName ? { ...marker, tags: savedTags } : marker,
+        ),
+      })),
+    );
+
+    const markerTags = await fetchMarkerTags();
+    setAllMarkerTags(markerTags);
+  };
+
+  const emptyStateMessage =
+    overview.length === 0
+      ? "No measurements yet. Upload and OCR lab files first."
+      : filterTags.length > 0
+      ? "No biomarkers match this search or tag filters."
+      : "No biomarkers match this search.";
 
   return (
     <div
@@ -348,13 +364,7 @@ export default function MarkerChart() {
             <span className="spinner" /> Loading biomarkers…
           </div>
         ) : filteredOverview.length === 0 ? (
-          <div className="card-empty">
-            {overview.length === 0
-              ? "No measurements yet. Upload and OCR lab files first."
-              : filterTags.length > 0
-              ? "No biomarkers match this search or tag filters."
-              : "No biomarkers match this search."}
-          </div>
+          <div className="card-empty">{emptyStateMessage}</div>
         ) : (
           <div className="marker-groups">
             {filteredOverview.map((group) => (
@@ -399,11 +409,11 @@ export default function MarkerChart() {
                         </div>
 
                         <div className="marker-row-value">
-                          <strong>{formatValue(latest.value, latest.unit)}</strong>
+                          <strong>{formatMeasurementValue(latest.value, latest.unit)}</strong>
                           <span>
                             {delta == null
                               ? "First result"
-                              : `${delta > 0 ? "+" : ""}${formatValue(delta, latest.unit)}`}
+                              : `${delta > 0 ? "+" : ""}${formatMeasurementValue(delta, latest.unit)}`}
                           </span>
                         </div>
 
@@ -411,11 +421,11 @@ export default function MarkerChart() {
 
                         <div className="marker-row-previous">
                           <strong>
-                            {previous ? formatValue(previous.value, previous.unit) : "—"}
+                            {previous ? formatMeasurementValue(previous.value, previous.unit) : "—"}
                           </strong>
                           {otherCount > 0 && item.value_min != null && item.value_max != null && (
                             <span className="marker-row-history-note">
-                              {otherCount} more ({formatValue(item.value_min)}–{formatValue(item.value_max)})
+                              {otherCount} more ({formatMeasurementValue(item.value_min)}–{formatMeasurementValue(item.value_max)})
                             </span>
                           )}
                         </div>
@@ -456,40 +466,20 @@ export default function MarkerChart() {
                   <TagInput
                     tags={detail?.tags ?? summarySource.tags}
                     allTags={allMarkerTags}
-                    onChange={async (newTags) => {
-                      const saved = await setMarkerTags(summarySource.marker_name, newTags);
-                      if (detail) {
-                        setDetail({ ...detail, tags: saved });
-                      }
-                      setOverview((prev) =>
-                        prev.map((g) => ({
-                          ...g,
-                          markers: g.markers.map((m) =>
-                            m.marker_name === summarySource.marker_name ? { ...m, tags: saved } : m,
-                          ),
-                        })),
-                      );
-                      fetchMarkerTags().then(setAllMarkerTags);
-                    }}
+                    onChange={(newTags) => handleMarkerTagsChange(summarySource.marker_name, newTags)}
                     placeholder="Add marker tag…"
                   />
                 </div>
               </div>
               <span className={`status-pill status-${summarySource.status}`}>
-                {summarySource.status === "in_range"
-                  ? "In range"
-                  : summarySource.status === "low"
-                  ? "Below range"
-                  : summarySource.status === "high"
-                  ? "Above range"
-                  : "No range"}
+                {getMarkerStatusLabel(summarySource.status)}
               </span>
             </div>
 
             <div className="detail-summary-grid">
               <div className="detail-stat-card">
                 <span>Latest</span>
-                <strong>{formatValue(summarySource.latest_measurement.value, summarySource.latest_measurement.unit)}</strong>
+                <strong>{formatMeasurementValue(summarySource.latest_measurement.value, summarySource.latest_measurement.unit)}</strong>
                 <small>{formatDate(summarySource.latest_measurement.measured_at)}</small>
               </div>
 
@@ -497,7 +487,7 @@ export default function MarkerChart() {
                 <span>Previous</span>
                 <strong>
                   {summarySource.previous_measurement
-                    ? formatValue(summarySource.previous_measurement.value, summarySource.previous_measurement.unit)
+                    ? formatMeasurementValue(summarySource.previous_measurement.value, summarySource.previous_measurement.unit)
                     : "—"}
                 </strong>
                 <small>
@@ -510,11 +500,12 @@ export default function MarkerChart() {
               <div className="detail-stat-card">
                 <span>Reference range</span>
                 <strong>
-                  {summarySource.latest_measurement.reference_low != null && summarySource.latest_measurement.reference_high != null
-                    ? `${summarySource.latest_measurement.reference_low}–${summarySource.latest_measurement.reference_high}`
-                    : "—"}
+                  {formatReferenceRange(
+                    summarySource.latest_measurement.reference_low,
+                    summarySource.latest_measurement.reference_high,
+                  )}
                 </strong>
-                <small>{summarySource.latest_measurement.unit || "No unit recorded"}</small>
+                <small>{getDisplayUnit(summarySource.latest_measurement.unit) ?? "No unit recorded"}</small>
               </div>
             </div>
 
@@ -539,7 +530,7 @@ export default function MarkerChart() {
                         }}
                       />
                       <Tooltip
-                        formatter={(value) => formatValue(Number(value ?? 0), unit)}
+                        formatter={(value) => formatMeasurementValue(Number(value ?? 0), unit)}
                         labelFormatter={(label) => `Date: ${label}`}
                         contentStyle={{ background: "#161d27", border: "1px solid #303c4d", borderRadius: "8px", color: "#edf1f7" }}
                       />
@@ -583,12 +574,8 @@ export default function MarkerChart() {
                         .map((measurement) => (
                           <tr key={measurement.id}>
                             <td>{formatDate(measurement.measured_at)}</td>
-                            <td>{formatValue(measurement.value, measurement.unit)}</td>
-                            <td>
-                              {measurement.reference_low != null && measurement.reference_high != null
-                                ? `${measurement.reference_low}–${measurement.reference_high}`
-                                : "—"}
-                            </td>
+                            <td>{formatMeasurementValue(measurement.value, measurement.unit)}</td>
+                            <td>{formatReferenceRange(measurement.reference_low, measurement.reference_high)}</td>
                             <td>
                               <Link
                                 className="history-source-link"

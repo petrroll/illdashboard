@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import api, { fetchFileTags, setFileTags } from "../api";
 import TagInput from "../components/TagInput";
 import TagFilter from "../components/TagFilter";
 import type { LabFile } from "../types";
+import { formatDate } from "../utils/measurements";
 
 interface OcrProgress {
   file_id: number;
@@ -14,32 +15,73 @@ interface OcrProgress {
   error?: string;
 }
 
+interface OcrSummary {
+  latest: OcrProgress;
+  completedCount: number;
+  errorCount: number;
+}
+
 async function streamOcr(
   url: string,
   body: object | undefined,
-  onProgress: (p: OcrProgress) => void,
+  onProgress: (progress: OcrProgress) => void,
 ): Promise<void> {
-  const resp = await fetch(url, {
+  const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
   });
-  if (!resp.ok || !resp.body) throw new Error("Stream request failed");
-  const reader = resp.body.getReader();
+
+  if (!response.ok || !response.body) {
+    throw new Error("Stream request failed");
+  }
+
+  const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+
   while (true) {
     const { done, value } = await reader.read();
-    if (done) break;
+    if (done) {
+      break;
+    }
+
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split("\n");
     buffer = lines.pop() ?? "";
+
     for (const line of lines) {
-      if (!line.trim()) continue;
-      const msg = JSON.parse(line);
-      if (msg.type === "progress") onProgress(msg as OcrProgress);
+      if (!line.trim()) {
+        continue;
+      }
+
+      const message = JSON.parse(line);
+      if (message.type === "progress") {
+        onProgress(message as OcrProgress);
+      }
     }
   }
+}
+
+function buildTagQueryParams(tags: string[]) {
+  const params = new URLSearchParams();
+  for (const tag of tags) {
+    params.append("tags", tag);
+  }
+  return params;
+}
+
+function summarizeOcrProgress(progressByFile: Map<number, OcrProgress>): OcrSummary | null {
+  const entries = Array.from(progressByFile.values());
+  if (entries.length === 0) {
+    return null;
+  }
+
+  return {
+    latest: entries[entries.length - 1],
+    completedCount: entries.filter((entry) => entry.status === "done").length,
+    errorCount: entries.filter((entry) => entry.status === "error").length,
+  };
 }
 
 export default function Files() {
@@ -47,101 +89,157 @@ export default function Files() {
   const [uploading, setUploading] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
-  // Maps file_id -> current processing status
   const [fileProgress, setFileProgress] = useState<Map<number, OcrProgress>>(new Map());
-  const inputRef = useRef<HTMLInputElement>(null);
   const [allFileTags, setAllFileTags] = useState<string[]>([]);
   const [filterTags, setFilterTags] = useState<string[]>([]);
   const [editingTagsFileId, setEditingTagsFileId] = useState<number | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
-  const load = () => {
-    const params = new URLSearchParams();
-    for (const t of filterTags) params.append("tags", t);
-    api.get<LabFile[]>("/files", { params }).then((r) => setFiles(r.data));
-  };
-
-  const loadAllTags = () => fetchFileTags().then(setAllFileTags);
-
-  useEffect(() => {
-    load();
+  const loadFiles = useCallback(async () => {
+    const response = await api.get<LabFile[]>("/files", {
+      params: buildTagQueryParams(filterTags),
+    });
+    setFiles(response.data);
   }, [filterTags]);
 
-  useEffect(() => {
-    loadAllTags();
+  const loadAllTags = useCallback(async () => {
+    const tags = await fetchFileTags();
+    setAllFileTags(tags);
   }, []);
 
-  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = e.target.files;
-    if (!selected) return;
-    setUploading(true);
-    for (const file of Array.from(selected)) {
-      const form = new FormData();
-      form.append("file", file);
-      await api.post("/files/upload", form);
+  useEffect(() => {
+    void loadFiles();
+  }, [loadFiles]);
+
+  useEffect(() => {
+    void loadAllTags();
+  }, [loadAllTags]);
+
+  const handleUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = event.target.files;
+    if (!selectedFiles) {
+      return;
     }
-    setUploading(false);
-    load();
+
+    setUploading(true);
+    try {
+      for (const file of Array.from(selectedFiles)) {
+        const form = new FormData();
+        form.append("file", file);
+        await api.post("/files/upload", form);
+      }
+
+      await Promise.all([loadFiles(), loadAllTags()]);
+    } finally {
+      setUploading(false);
+      event.target.value = "";
+    }
   };
 
   const handleDelete = async (id: number) => {
-    if (!confirm("Delete this file and all its measurements?")) return;
+    if (!confirm("Delete this file and all its measurements?")) {
+      return;
+    }
+
     await api.delete(`/files/${id}`);
-    load();
+    await Promise.all([loadFiles(), loadAllTags()]);
   };
 
   const toggleSelect = (id: number) => {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
+    setSelected((previousSelected) => {
+      const nextSelected = new Set(previousSelected);
+      if (nextSelected.has(id)) {
+        nextSelected.delete(id);
+      } else {
+        nextSelected.add(id);
+      }
+      return nextSelected;
     });
   };
 
   const toggleSelectAll = () => {
-    if (selected.size === files.length) {
-      setSelected(new Set());
-    } else {
-      setSelected(new Set(files.map((f) => f.id)));
-    }
+    setSelected((previousSelected) => {
+      if (previousSelected.size === files.length) {
+        return new Set();
+      }
+      return new Set(files.map((file) => file.id));
+    });
   };
 
-  const runStreamingOcr = async (
-    url: string,
-    body: object | undefined,
-  ) => {
-    setProcessing(true);
-    setFileProgress(new Map());
-    try {
-      await streamOcr(url, body, (p) => {
-        setFileProgress((prev) => new Map(prev).set(p.file_id, p));
-        // When a file is done, refresh the file list so its OCR badge updates
-        if (p.status === "done") load();
-      });
-    } finally {
-      setProcessing(false);
+  const runStreamingOcr = useCallback(
+    async (url: string, body: object | undefined) => {
+      setProcessing(true);
       setFileProgress(new Map());
-      await load();
-    }
-  };
 
-  const handleProcessUnprocessed = () =>
-    runStreamingOcr("/api/files/ocr/unprocessed", undefined);
+      try {
+        await streamOcr(url, body, (progress) => {
+          setFileProgress((previousProgress) => {
+            const nextProgress = new Map(previousProgress);
+            nextProgress.set(progress.file_id, progress);
+            return nextProgress;
+          });
+
+          if (progress.status === "done") {
+            void loadFiles();
+          }
+        });
+      } finally {
+        setProcessing(false);
+        setFileProgress(new Map());
+        await loadFiles();
+      }
+    },
+    [loadFiles],
+  );
+
+  const handleProcessUnprocessed = () => {
+    void runStreamingOcr("/api/files/ocr/unprocessed", undefined);
+  };
 
   const handleReprocessSelected = async () => {
-    if (selected.size === 0) return;
-    const ids = Array.from(selected);
+    if (selected.size === 0) {
+      return;
+    }
+
+    const fileIds = Array.from(selected);
     setSelected(new Set());
-    await runStreamingOcr("/api/files/ocr/batch", { file_ids: ids });
+    await runStreamingOcr("/api/files/ocr/batch", { file_ids: fileIds });
   };
 
-  const unprocessedCount = files.filter((f) => !f.ocr_raw).length;
+  const unprocessedCount = files.filter((file) => !file.ocr_raw).length;
+  const allFilesSelected = files.length > 0 && selected.size === files.length;
+  const ocrSummary = summarizeOcrProgress(fileProgress);
+
+  const renderOcrStatus = (file: LabFile) => {
+    const progress = fileProgress.get(file.id);
+
+    if (progress?.status === "processing") {
+      return (
+        <span className="badge badge-info">
+          <span className="spinner" style={{ width: 12, height: 12 }} /> Processing…
+        </span>
+      );
+    }
+
+    if (progress?.status === "error") {
+      return (
+        <span className="badge badge-danger" title={progress.error}>
+          Error
+        </span>
+      );
+    }
+
+    if (file.ocr_raw) {
+      return <span className="badge badge-success">Done</span>;
+    }
+
+    return <span className="badge badge-warning">Pending</span>;
+  };
 
   return (
     <>
       <h2>Lab Files</h2>
 
-      {/* Upload area */}
       <div className="upload-area" onClick={() => inputRef.current?.click()}>
         {uploading ? (
           <span className="flex-row" style={{ justifyContent: "center" }}>
@@ -164,7 +262,6 @@ export default function Files() {
         />
       </div>
 
-      {/* Batch action bar */}
       {files.length > 0 && (
         <div style={{ margin: "1rem 0" }}>
           <div className="flex-row" style={{ gap: "0.5rem" }}>
@@ -178,35 +275,42 @@ export default function Files() {
                 : `Process Unprocessed (${unprocessedCount})`}
             </button>
           </div>
-          {processing && fileProgress.size > 0 && (() => {
-            const entries = Array.from(fileProgress.values());
-            const latest = entries[entries.length - 1];
-            const doneCount = entries.filter((e) => e.status === "done").length;
-            const errorCount = entries.filter((e) => e.status === "error").length;
-            return (
-              <div style={{ marginTop: "0.5rem" }}>
-                <div style={{ fontSize: "0.85rem", color: "var(--text-muted)", marginBottom: "0.25rem" }}>
-                  {latest.status === "processing"
-                    ? `Processing ${latest.filename}… (${doneCount + errorCount}/${latest.total})`
-                    : `Processed ${doneCount + errorCount}/${latest.total}`}
-                </div>
-                <div style={{ background: "#303c4d", borderRadius: "4px", height: "6px", overflow: "hidden" }}>
-                  <div
-                    style={{
-                      width: `${((doneCount + errorCount) / latest.total) * 100}%`,
-                      height: "100%",
-                      background: errorCount > 0 ? "#f85149" : "#12c78e",
-                      transition: "width 0.3s ease",
-                    }}
-                  />
-                </div>
+
+          {processing && ocrSummary && (
+            <div style={{ marginTop: "0.5rem" }}>
+              <div
+                style={{
+                  fontSize: "0.85rem",
+                  color: "var(--text-muted)",
+                  marginBottom: "0.25rem",
+                }}
+              >
+                {ocrSummary.latest.status === "processing"
+                  ? `Processing ${ocrSummary.latest.filename}… (${ocrSummary.completedCount + ocrSummary.errorCount}/${ocrSummary.latest.total})`
+                  : `Processed ${ocrSummary.completedCount + ocrSummary.errorCount}/${ocrSummary.latest.total}`}
               </div>
-            );
-          })()}
+              <div
+                style={{
+                  background: "#303c4d",
+                  borderRadius: "4px",
+                  height: "6px",
+                  overflow: "hidden",
+                }}
+              >
+                <div
+                  style={{
+                    width: `${((ocrSummary.completedCount + ocrSummary.errorCount) / ocrSummary.latest.total) * 100}%`,
+                    height: "100%",
+                    background: ocrSummary.errorCount > 0 ? "#f85149" : "#12c78e",
+                    transition: "width 0.3s ease",
+                  }}
+                />
+              </div>
+            </div>
+          )}
         </div>
       )}
 
-      {/* Tag filter */}
       {allFileTags.length > 0 && (
         <div className="tag-filter-bar">
           <label>Filter by tags:</label>
@@ -219,7 +323,6 @@ export default function Files() {
         </div>
       )}
 
-      {/* File list */}
       {files.length === 0 ? (
         <p style={{ color: "var(--text-muted)" }}>
           {filterTags.length > 0
@@ -231,11 +334,7 @@ export default function Files() {
           <thead>
             <tr>
               <th style={{ width: "2rem" }}>
-                <input
-                  type="checkbox"
-                  checked={files.length > 0 && selected.size === files.length}
-                  onChange={toggleSelectAll}
-                />
+                <input type="checkbox" checked={allFilesSelected} onChange={toggleSelectAll} />
               </th>
               <th>Filename</th>
               <th>Type</th>
@@ -247,72 +346,61 @@ export default function Files() {
             </tr>
           </thead>
           <tbody>
-            {files.map((f) => (
-              <tr key={f.id}>
+            {files.map((file) => (
+              <tr key={file.id}>
                 <td>
                   <input
                     type="checkbox"
-                    checked={selected.has(f.id)}
-                    onChange={() => toggleSelect(f.id)}
+                    checked={selected.has(file.id)}
+                    onChange={() => toggleSelect(file.id)}
                   />
                 </td>
                 <td>
-                  <Link to={`/files/${f.id}`}>{f.filename}</Link>
+                  <Link to={`/files/${file.id}`}>{file.filename}</Link>
                 </td>
-                <td>{f.mime_type}</td>
+                <td>{file.mime_type}</td>
                 <td style={{ minWidth: "160px" }}>
-                  {editingTagsFileId === f.id ? (
+                  {editingTagsFileId === file.id ? (
                     <TagInput
-                      tags={f.tags}
+                      tags={file.tags}
                       allTags={allFileTags}
                       onChange={async (newTags) => {
-                        const saved = await setFileTags(f.id, newTags);
-                        setFiles((prev) =>
-                          prev.map((file) =>
-                            file.id === f.id ? { ...file, tags: saved } : file,
+                        const savedTags = await setFileTags(file.id, newTags);
+                        setFiles((previousFiles) =>
+                          previousFiles.map((entry) =>
+                            entry.id === file.id ? { ...entry, tags: savedTags } : entry,
                           ),
                         );
-                        loadAllTags();
+                        await loadAllTags();
                       }}
                       placeholder="Add tag…"
                     />
                   ) : (
                     <div
                       className="tag-list"
-                      onClick={() => setEditingTagsFileId(f.id)}
+                      onClick={() => setEditingTagsFileId(file.id)}
                       style={{ cursor: "pointer", minHeight: "1.5rem" }}
                       title="Click to edit tags"
                     >
-                      {f.tags.length > 0
-                        ? f.tags.map((t) => (
-                            <span key={t} className="tag-pill">{t}</span>
-                          ))
-                        : <span style={{ color: "var(--text-muted)", fontSize: "0.8rem" }}>+ tag</span>}
+                      {file.tags.length > 0 ? (
+                        file.tags.map((tag) => (
+                          <span key={tag} className="tag-pill">
+                            {tag}
+                          </span>
+                        ))
+                      ) : (
+                        <span style={{ color: "var(--text-muted)", fontSize: "0.8rem" }}>
+                          + tag
+                        </span>
+                      )}
                     </div>
                   )}
                 </td>
+                <td>{formatDate(file.lab_date)}</td>
+                <td>{formatDate(file.uploaded_at)}</td>
+                <td>{renderOcrStatus(file)}</td>
                 <td>
-                  {f.lab_date
-                    ? new Date(f.lab_date).toLocaleDateString()
-                    : "—"}
-                </td>
-                <td>{new Date(f.uploaded_at).toLocaleDateString()}</td>
-                <td>
-                  {fileProgress.get(f.id)?.status === "processing" ? (
-                    <span className="badge badge-info"><span className="spinner" style={{ width: 12, height: 12 }} /> Processing…</span>
-                  ) : fileProgress.get(f.id)?.status === "error" ? (
-                    <span className="badge badge-danger" title={fileProgress.get(f.id)?.error}>Error</span>
-                  ) : f.ocr_raw ? (
-                    <span className="badge badge-success">Done</span>
-                  ) : (
-                    <span className="badge badge-warning">Pending</span>
-                  )}
-                </td>
-                <td>
-                  <button
-                    className="btn btn-danger btn-sm"
-                    onClick={() => handleDelete(f.id)}
-                  >
+                  <button className="btn btn-danger btn-sm" onClick={() => handleDelete(file.id)}>
                     Delete
                   </button>
                 </td>
