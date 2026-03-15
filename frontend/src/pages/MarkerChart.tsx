@@ -395,7 +395,10 @@ export default function MarkerChart() {
                   {group.markers.map((item) => {
                     const latest = item.latest_measurement;
                     const previous = item.previous_measurement;
-                    const delta = previous ? latest.value - previous.value : null;
+                    const delta =
+                      previous && latest.value != null && previous.value != null
+                        ? latest.value - previous.value
+                        : null;
                     const otherCount = item.total_count - 1 - (previous ? 1 : 0);
 
                     return (
@@ -420,7 +423,7 @@ export default function MarkerChart() {
                         </div>
 
                         <div className="marker-row-value">
-                          <strong>{formatMeasurementValue(latest.value, latest.unit)}</strong>
+                          <strong>{formatMeasurementValue(latest.value, latest.unit, latest.qualitative_value)}</strong>
                           <span>
                             {delta == null
                               ? "First result"
@@ -432,7 +435,7 @@ export default function MarkerChart() {
 
                         <div className="marker-row-previous">
                           <strong>
-                            {previous ? formatMeasurementValue(previous.value, previous.unit) : "—"}
+                            {previous ? formatMeasurementValue(previous.value, previous.unit, previous.qualitative_value) : "—"}
                           </strong>
                           {otherCount > 0 && item.value_min != null && item.value_max != null && (
                             <span className="marker-row-history-note">
@@ -497,7 +500,7 @@ export default function MarkerChart() {
             <div className="detail-summary-grid">
               <div className="detail-stat-card">
                 <span>Latest</span>
-                <strong>{formatMeasurementValue(summarySource.latest_measurement.value, summarySource.latest_measurement.unit)}</strong>
+                <strong>{formatMeasurementValue(summarySource.latest_measurement.value, summarySource.latest_measurement.unit, summarySource.latest_measurement.qualitative_value)}</strong>
                 <small>{formatDate(summarySource.latest_measurement.measured_at)}</small>
               </div>
 
@@ -505,7 +508,7 @@ export default function MarkerChart() {
                 <span>Previous</span>
                 <strong>
                   {summarySource.previous_measurement
-                    ? formatMeasurementValue(summarySource.previous_measurement.value, summarySource.previous_measurement.unit)
+                    ? formatMeasurementValue(summarySource.previous_measurement.value, summarySource.previous_measurement.unit, summarySource.previous_measurement.qualitative_value)
                     : "—"}
                 </strong>
                 <small>
@@ -589,21 +592,32 @@ export default function MarkerChart() {
                       {detail.measurements
                         .slice()
                         .reverse()
-                        .map((measurement) => (
-                          <tr key={measurement.id}>
-                            <td>{formatDate(measurement.measured_at)}</td>
-                            <td>{formatMeasurementValue(measurement.value, measurement.unit)}</td>
-                            <td>{formatReferenceRange(measurement.reference_low, measurement.reference_high)}</td>
-                            <td>
-                              <Link
-                                className="history-source-link"
-                                to={`/files/${measurement.lab_file_id}`}
-                              >
-                                Open file
-                              </Link>
-                            </td>
-                          </tr>
-                        ))}
+                        .map((measurement) => {
+                          const filename = measurement.lab_file_filename || `File ${measurement.lab_file_id}`;
+
+                          return (
+                            <tr key={measurement.id}>
+                              <td>{formatDate(measurement.measured_at)}</td>
+                              <td>{formatMeasurementValue(measurement.value, measurement.unit, measurement.qualitative_value)}</td>
+                              <td>{formatReferenceRange(measurement.reference_low, measurement.reference_high)}</td>
+                              <td>
+                                <div className="history-source-cell">
+                                  <Link
+                                    className="history-source-link"
+                                    to={`/files/${measurement.lab_file_id}`}
+                                  >
+                                    {filename}
+                                  </Link>
+                                  {measurement.lab_file_source_tag && (
+                                    <span className="badge history-source-tag">
+                                      {measurement.lab_file_source_tag}
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
                     </tbody>
                   </table>
                 </div>

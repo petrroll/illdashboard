@@ -8,7 +8,19 @@ export function getDisplayUnit(unit?: string | null) {
   return unit && unit !== DIMENSIONLESS_UNIT ? unit : null;
 }
 
-export function formatMeasurementValue(value: number, unit?: string | null) {
+export function formatMeasurementValue(
+  value?: number | null,
+  unit?: string | null,
+  qualitativeValue?: string | null,
+) {
+  if (qualitativeValue) {
+    return qualitativeValue;
+  }
+
+  if (value == null) {
+    return "—";
+  }
+
   const renderedValue = Number.isInteger(value)
     ? value.toString()
     : value.toFixed(2).replace(/\.00$/, "");
@@ -43,6 +55,10 @@ export function formatDateTime(value: string | null) {
 }
 
 export function getMeasurementValueClass(measurement: Pick<Measurement, "value" | "reference_low" | "reference_high">) {
+  if (measurement.value == null) {
+    return "value-normal";
+  }
+
   if (measurement.reference_low != null && measurement.value < measurement.reference_low) {
     return "value-low";
   }

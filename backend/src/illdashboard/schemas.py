@@ -39,8 +39,11 @@ class MeasurementOut(BaseModel):
 
     id: int
     lab_file_id: int
+    lab_file_filename: str | None = None
+    lab_file_source_tag: str | None = None
     marker_name: str
-    value: float
+    value: float | None = None
+    qualitative_value: str | None = None
     unit: str | None = None
     reference_low: float | None = None
     reference_high: float | None = None
@@ -54,11 +57,24 @@ class MeasurementOut(BaseModel):
             return data
         if hasattr(data, "measurement_type"):
             measurement_type = data.measurement_type
+            lab_file = data.__dict__.get("lab_file")
+            lab_file_tags = lab_file.__dict__.get("tags", []) if lab_file is not None else []
+            source_tag = next(
+                (
+                    tag.tag
+                    for tag in lab_file_tags
+                    if hasattr(tag, "tag") and tag.tag.casefold().startswith("source:")
+                ),
+                None,
+            )
             return {
                 "id": data.id,
                 "lab_file_id": data.lab_file_id,
+                "lab_file_filename": getattr(lab_file, "filename", None),
+                "lab_file_source_tag": source_tag,
                 "marker_name": measurement_type.name,
                 "value": data.value,
+                "qualitative_value": data.qualitative_value,
                 "unit": data.unit,
                 "reference_low": data.reference_low,
                 "reference_high": data.reference_high,
@@ -111,7 +127,8 @@ class MarkerInsightResponse(BaseModel):
 
 class MeasurementCreate(BaseModel):
     marker_name: str
-    value: float
+    value: float | None = None
+    qualitative_value: str | None = None
     unit: str | None = None
     reference_low: float | None = None
     reference_high: float | None = None
@@ -123,7 +140,8 @@ class MeasurementCreate(BaseModel):
 
 class ExplainRequest(BaseModel):
     marker_name: str
-    value: float
+    value: float | None = None
+    qualitative_value: str | None = None
     unit: str | None = None
     reference_low: float | None = None
     reference_high: float | None = None

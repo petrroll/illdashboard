@@ -53,6 +53,7 @@ async def measurement_overview(
     result = await db.execute(
         select(Measurement)
         .join(Measurement.measurement_type)
+        .where(Measurement.qualitative_value.is_(None))
         .options(
             selectinload(Measurement.measurement_type),
             selectinload(Measurement.lab_file).selectinload(LabFile.tags),
@@ -104,7 +105,13 @@ async def measurement_overview(
 
 @router.get("/measurements/markers", response_model=list[str], tags=["measurements"])
 async def list_marker_names(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(MeasurementType.name).order_by(MeasurementType.name))
+    result = await db.execute(
+        select(MeasurementType.name)
+        .join(MeasurementType.measurements)
+        .where(Measurement.qualitative_value.is_(None))
+        .distinct()
+        .order_by(MeasurementType.name)
+    )
     return result.scalars().all()
 
 
@@ -118,6 +125,7 @@ async def measurement_detail(
         raise HTTPException(404, "Marker not found")
 
     measurements = await marker_service.load_measurements_for_marker(db, marker_name)
+    measurements = [measurement for measurement in measurements if measurement.qualitative_value is None]
     if not measurements:
         raise HTTPException(404, "Marker not found")
 
@@ -157,6 +165,7 @@ async def measurement_insight(
         raise HTTPException(404, "Marker not found")
 
     measurements = await marker_service.load_measurements_for_marker(db, marker_name)
+    measurements = [measurement for measurement in measurements if measurement.qualitative_value is None]
     if not measurements:
         raise HTTPException(404, "Marker not found")
 
@@ -190,6 +199,7 @@ async def measurement_sparkline(
     db: AsyncSession = Depends(get_db),
 ):
     measurements = await marker_service.load_measurements_for_marker(db, marker_name)
+    measurements = [measurement for measurement in measurements if measurement.qualitative_value is None]
     if not measurements:
         raise HTTPException(404, "Marker not found")
 

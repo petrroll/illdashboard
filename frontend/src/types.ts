@@ -12,8 +12,11 @@ export interface LabFile {
 export interface Measurement {
   id: number;
   lab_file_id: number;
+  lab_file_filename?: string | null;
+  lab_file_source_tag?: string | null;
   marker_name: string;
-  value: number;
+  value: number | null;
+  qualitative_value: string | null;
   unit: string | null;
   reference_low: number | null;
   reference_high: number | null;
@@ -64,7 +67,8 @@ export interface MarkerInsightResponse {
 
 export interface ExplainRequest {
   marker_name: string;
-  value: number;
+  value?: number | null;
+  qualitative_value?: string | null;
   unit?: string | null;
   reference_low?: number | null;
   reference_high?: number | null;

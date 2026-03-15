@@ -12,11 +12,21 @@ _METRICS_FILE = Path(settings.UPLOAD_DIR).parent / "metrics.json"
 _PREMIUM_REQUESTS_KEY = "premium_requests_used"
 
 
+def _coerce_float(value: object) -> float | None:
+    if isinstance(value, int | float):
+        return float(value)
+    return None
+
+
 def _load() -> dict:
     try:
-        return json.loads(_METRICS_FILE.read_text())
+        data = json.loads(_METRICS_FILE.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+
+    if not isinstance(data, dict):
+        return {}
+    return data
 
 
 def _save(data: dict) -> None:
@@ -25,12 +35,23 @@ def _save(data: dict) -> None:
 
 
 def store_premium_requests(used: float) -> None:
-    """Persist the SDK-reported premium_interactions used_requests count."""
+    """Persist the cumulative premium request units used by this app."""
     data = _load()
     data[_PREMIUM_REQUESTS_KEY] = used
     _save(data)
 
 
+def add_premium_requests(used: float) -> None:
+    """Add premium request units consumed by a single Copilot call."""
+    if used <= 0:
+        return
+
+    data = _load()
+    current = _coerce_float(data.get(_PREMIUM_REQUESTS_KEY)) or 0.0
+    data[_PREMIUM_REQUESTS_KEY] = current + used
+    _save(data)
+
+
 def get_premium_requests_used() -> float | None:
-    """Return the last known premium_interactions used_requests count, or None if unavailable."""
-    return _load().get(_PREMIUM_REQUESTS_KEY)
+    """Return the cumulative premium request units used by this app."""
+    return _coerce_float(_load().get(_PREMIUM_REQUESTS_KEY))

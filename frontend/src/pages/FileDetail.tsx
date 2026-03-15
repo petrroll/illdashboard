@@ -14,6 +14,7 @@ import type { LabFile, Measurement, ExplainRequest } from "../types";
 import {
   formatDate,
   formatDateTime,
+  formatMeasurementValue,
   formatReferenceRange,
   getDisplayUnit,
   getMeasurementValueClass,
@@ -106,6 +107,7 @@ export default function FileDetail() {
       .map((m) => ({
         marker_name: m.marker_name,
         value: m.value,
+        qualitative_value: m.qualitative_value,
         unit: m.unit,
         reference_low: m.reference_low,
         reference_high: m.reference_high,
@@ -118,6 +120,7 @@ export default function FileDetail() {
     await requestExplanation(() => explainMeasurement({
       marker_name: m.marker_name,
       value: m.value,
+      qualitative_value: m.qualitative_value,
       unit: m.unit,
       reference_low: m.reference_low,
       reference_high: m.reference_high,
@@ -274,7 +277,7 @@ export default function FileDetail() {
                         </td>
                         <td style={{ fontWeight: 500 }}>{m.marker_name}</td>
                         <td className={getMeasurementValueClass(m)} style={{ fontWeight: 600 }}>
-                          {m.value}
+                          {formatMeasurementValue(m.value, m.unit, m.qualitative_value)}
                         </td>
                         <td>{getDisplayUnit(m.unit) ?? "—"}</td>
                         <td>{formatReferenceRange(m.reference_low, m.reference_high)}</td>

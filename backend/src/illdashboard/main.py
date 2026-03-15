@@ -12,7 +12,7 @@ from sqlalchemy import select
 from illdashboard.config import settings
 from illdashboard.copilot_service import shutdown_client
 from illdashboard.api import router
-from illdashboard.database import async_session, engine
+from illdashboard.database import async_session, engine, upgrade_database_schema
 from illdashboard.models import Base, LabFile
 
 
@@ -67,6 +67,7 @@ async def lifespan(app: FastAPI):
     # Create tables on startup
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    await upgrade_database_schema(engine)
     # Ensure upload directory exists
     Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
     await preload_uploaded_files()

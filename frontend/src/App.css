@@ -808,6 +808,18 @@ input[type="file"] {
   text-decoration: underline;
 }
 
+.history-source-cell {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.history-source-tag {
+  width: fit-content;
+  background: rgba(18, 199, 142, 0.12);
+  color: var(--accent);
+  font-weight: 500;
+}
+
 .cache-note {
   background: var(--purple-subtle);
   color: var(--purple);

@@ -396,6 +396,75 @@ async def test_ocr_source_normalization_uses_filename_and_seen_sources(client):
 
 
 @pytest.mark.asyncio
+async def test_ocr_persists_qualitative_measurements_and_excludes_them_from_numeric_overview(client):
+    file_id = await _upload_pdf(client, filename="immunology.pdf")
+
+    qualitative_result = {
+        "lab_date": "2023-01-20",
+        "measurements": [
+            {
+                "marker_name": "Chlamydia psittaci IgG",
+                "value": "negative",
+                "unit": None,
+                "reference_low": None,
+                "reference_high": None,
+                "measured_at": "2023-01-20",
+                "page_number": 2,
+            },
+            {
+                "marker_name": "Varicella-zoster IgG",
+                "value": True,
+                "unit": None,
+                "reference_low": None,
+                "reference_high": None,
+                "measured_at": "2023-01-20",
+                "page_number": 2,
+            },
+            {
+                "marker_name": "Ferritin",
+                "value": 414,
+                "unit": "ug/l",
+                "reference_low": None,
+                "reference_high": None,
+                "measured_at": "2023-01-20",
+                "page_number": 2,
+            },
+        ],
+    }
+
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=qualitative_result):
+        resp = await client.post(f"/api/files/{file_id}/ocr")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 3
+    assert body[0]["marker_name"] == "Chlamydia psittaci IgG"
+    assert body[0]["value"] is None
+    assert body[0]["qualitative_value"] == "negative"
+    assert body[1]["marker_name"] == "Varicella-zoster IgG"
+    assert body[1]["value"] is None
+    assert body[1]["qualitative_value"] == "positive"
+    assert body[2]["marker_name"] == "Ferritin"
+    assert body[2]["value"] == 414
+    assert body[2]["qualitative_value"] is None
+
+    file_measurements_resp = await client.get(f"/api/files/{file_id}/measurements")
+    assert file_measurements_resp.status_code == 200
+    file_measurements = file_measurements_resp.json()
+    assert [item["marker_name"] for item in file_measurements] == [
+        "Chlamydia psittaci IgG",
+        "Ferritin",
+        "Varicella-zoster IgG",
+    ]
+
+    overview_resp = await client.get("/api/measurements/overview")
+    assert overview_resp.status_code == 200
+    overview = overview_resp.json()
+    marker_names = [marker["marker_name"] for group in overview for marker in group["markers"]]
+    assert marker_names == ["Ferritin"]
+
+
+@pytest.mark.asyncio
 async def test_set_marker_tags_allows_extending_existing_tag_list(client):
     file_id = await _upload_pdf(client)
 

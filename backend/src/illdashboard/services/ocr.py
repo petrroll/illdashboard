@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import re
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
@@ -33,9 +34,69 @@ logger = logging.getLogger(__name__)
 
 MAX_OCR_CONCURRENCY = 4
 
+QUALITATIVE_TRUE_VALUES = {
+    "positive",
+    "pozitivni",
+    "pozitivny",
+    "reactive",
+    "reaktivni",
+    "detected",
+    "present",
+    "true",
+    "pos",
+}
+QUALITATIVE_FALSE_VALUES = {
+    "negative",
+    "negativni",
+    "negativny",
+    "non reactive",
+    "non-reactive",
+    "nonreactive",
+    "nereaktivni",
+    "not detected",
+    "undetected",
+    "absent",
+    "false",
+    "neg",
+}
+QUALITATIVE_INDETERMINATE_VALUES = {
+    "equivocal",
+    "borderline",
+    "indeterminate",
+    "inconclusive",
+}
+
+
+def normalize_qualitative_value(raw) -> str | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return "positive" if raw else "negative"
+    if not isinstance(raw, str):
+        return None
+
+    value = raw.strip()
+    if not value:
+        return None
+
+    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    normalized = normalized.casefold().strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = normalized.strip(".:;,()[]{}")
+
+    if normalized in QUALITATIVE_TRUE_VALUES:
+        return "positive"
+    if normalized in QUALITATIVE_FALSE_VALUES:
+        return "negative"
+    if normalized in QUALITATIVE_INDETERMINATE_VALUES:
+        return "indeterminate"
+    return value
+
 
 def parse_numeric_value(raw) -> float | None:
     if raw is None:
+        return None
+    if isinstance(raw, bool):
         return None
     if isinstance(raw, (int, float)):
         if math.isfinite(raw):
@@ -61,6 +122,13 @@ def parse_numeric_value(raw) -> float | None:
     if not math.isfinite(parsed):
         return None
     return parsed
+
+
+def parse_measurement_value(raw) -> tuple[float | None, str | None]:
+    numeric_value = parse_numeric_value(raw)
+    if numeric_value is not None:
+        return numeric_value, None
+    return None, normalize_qualitative_value(raw)
 
 
 def normalize_marker_name_deterministic(name: str) -> str:
@@ -138,8 +206,8 @@ async def apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list
 
     new_measurements: list[Measurement] = []
     for measurement in result.get("measurements", []):
-        value = parse_numeric_value(measurement.get("value"))
-        if value is None:
+        value, qualitative_value = parse_measurement_value(measurement.get("value"))
+        if value is None and qualitative_value is None:
             logger.warning(
                 "Skipping measurement %r: invalid value %r",
                 measurement.get("marker_name"),
@@ -164,6 +232,7 @@ async def apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list
             lab_file_id=lab.id,
             measurement_type=measurement_types[canonical_name],
             value=value,
+            qualitative_value=qualitative_value,
             unit=measurement.get("unit"),
             reference_low=ref_low,
             reference_high=ref_high,

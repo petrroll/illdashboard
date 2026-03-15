@@ -70,7 +70,8 @@ class Measurement(Base):
         nullable=False,
         index=True,
     )
-    value: Mapped[float] = mapped_column(Float, nullable=False)
+    value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    qualitative_value: Mapped[str | None] = mapped_column(String, nullable=True)
     unit: Mapped[str | None] = mapped_column(String, nullable=True)
     reference_low: Mapped[float | None] = mapped_column(Float, nullable=True)
     reference_high: Mapped[float | None] = mapped_column(Float, nullable=True)

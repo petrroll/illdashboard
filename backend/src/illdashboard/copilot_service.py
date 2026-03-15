@@ -12,9 +12,11 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 from copilot import CopilotClient, PermissionHandler
+from copilot.generated.session_events import SessionEventType
+from copilot.types import CopilotClientOptions, MessageOptions
 
 from illdashboard.config import settings
-from illdashboard.metrics import store_premium_requests
+from illdashboard.metrics import add_premium_requests
 
 # ── Client management ────────────────────────────────────────────────────────
 
@@ -30,7 +32,7 @@ async def _get_client() -> CopilotClient:
     global _client
     if _client is None:
         token = settings.GITHUB_TOKEN or os.environ.get("GITHUB_TOKEN", "")
-        opts = {"github_token": token} if token else None
+        opts: CopilotClientOptions | None = {"github_token": token} if token else None
         _client = CopilotClient(opts)
         await _client.start()
     return _client
@@ -55,23 +57,38 @@ async def _ask(system_prompt: str, user_prompt: str, *, attachments: list | None
             "on_permission_request": PermissionHandler.approve_all,
         }
     )
+    content = ""
+    observed_usage_cost = 0.0
+    request_error: Exception | None = None
+
+    def handle_session_event(event) -> None:
+        nonlocal observed_usage_cost
+        if event.type != SessionEventType.ASSISTANT_USAGE:
+            return
+
+        cost = getattr(event.data, "cost", None)
+        if isinstance(cost, int | float) and cost > 0:
+            observed_usage_cost += float(cost)
+
+    unsubscribe = session.on(handle_session_event)
     try:
-        msg_opts: dict = {"prompt": user_prompt}
+        msg_opts: MessageOptions = {"prompt": user_prompt}
         if attachments:
             msg_opts["attachments"] = attachments
         response = await session.send_and_wait(msg_opts, timeout=timeout)
-        content = response.data.content if response else ""
+        content = getattr(response.data, "content", "") if response else ""
+        if content is None:
+            content = ""
+    except Exception as exc:
+        request_error = exc
     finally:
+        unsubscribe()
         await session.disconnect()
 
-    # Update persisted premium request count from the SDK quota API (best-effort).
-    try:
-        quota_result = await client.rpc.account.get_quota()
-        snapshot = quota_result.quota_snapshots.get("premium_interactions")
-        if snapshot is not None:
-            store_premium_requests(snapshot.used_requests)
-    except Exception:
-        pass
+    add_premium_requests(observed_usage_cost)
+
+    if request_error is not None:
+        raise request_error
 
     return content
 
@@ -97,20 +114,29 @@ You are a medical lab report OCR assistant. The user will provide an image or \
 PDF of a lab report as a file attachment. Your job is to:
 
 1. Identify every measured lab marker (e.g. Hemoglobin, WBC, Glucose…).
+    This includes qualitative serology and immunology markers reported as positive/negative/reactive/not detected.
 2. Identify the lab/report source when possible (for example Synlab, Jaeger, Unilabs).
 3. For each marker return a JSON array of objects with keys:
-   "marker_name", "value" (numeric), "unit", "reference_low" (numeric or null),
+    "marker_name", "value" (number for numeric results, string for qualitative results), "unit", "reference_low" (numeric or null),
    "reference_high" (numeric or null), "measured_at" (ISO date string or null),
    "page_number" (integer, 1-indexed – which page/image the value appears on).
 4. Also return "lab_date" (ISO date string or null) for the report date.
 5. Also return "source" as a short raw source/provider name string, or null if unclear.
 
-CRITICAL rules for numeric values:
-- "value", "reference_low", and "reference_high" MUST be JSON numbers (not strings).
+CRITICAL rules for values:
+- Use a JSON number in "value" when the report shows a numeric result.
+- Use a short JSON string in "value" when the report shows a qualitative result such as "positive", "negative", "reactive", "non-reactive", "detected", or "not detected".
+- Do NOT omit a marker just because its value is qualitative.
+- "reference_low" and "reference_high" MUST be JSON numbers or null.
 - Use a dot (.) as the decimal separator, never a comma or space. E.g. 0.1, not "0,1" or "0 1".
 - Do NOT insert spaces into numbers. E.g. 1500, not "1 500".
 - If a value is less than 1, include the leading zero: 0.1, not .1.
 - Read decimal points carefully – "0.1" (zero point one) is very different from "1".
+
+CRITICAL extraction rules:
+- Do not skip dense semicolon-separated or comma-separated sections. Split every assay/result pair into its own measurement object.
+- Serology and immunology pages often list many markers inline on one line. Extract every marker, even when many share the same sentence.
+- Keep marker names specific. For example, include the organism plus antibody class such as "Chlamydia psittaci IgG" rather than only "IgG".
 
 When multiple pages/images are attached, number them starting from 1 in the \
 order they are provided and set "page_number" accordingly for every measurement.
@@ -130,11 +156,10 @@ def _pdf_to_images(pdf_path: str, *, start_page: int = 0, stop_page: int | None 
     """
     doc = fitz.open(pdf_path)
     paths: list[str] = []
-    if stop_page is None:
-        stop_page = doc.page_count
+    page_stop: int = stop_page if stop_page is not None else doc.page_count
 
     try:
-        for page_index in range(start_page, stop_page):
+        for page_index in range(start_page, page_stop):
             page = doc.load_page(page_index)
             pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY, alpha=False)
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
@@ -147,7 +172,7 @@ def _pdf_to_images(pdf_path: str, *, start_page: int = 0, stop_page: int | None 
 
 
 async def _ocr_extract_from_attachments(attachments: list[dict], *, filename: str | None = None) -> dict:
-    prompt = "Extract all lab values from the attached file."
+    prompt = "Extract all lab values from the attached file, including qualitative serology and immunology results."
     if filename:
         prompt = f"Original filename: {filename}\n\n{prompt}"
 
@@ -164,23 +189,27 @@ def _offset_result_page_numbers(result: dict, page_offset: int) -> dict:
     for measurement in result.get("measurements", []):
         shifted = dict(measurement)
         page_number = shifted.get("page_number")
-        try:
-            shifted["page_number"] = int(page_number) + page_offset
-        except (TypeError, ValueError):
-            pass
+        if page_number is not None:
+            try:
+                shifted["page_number"] = int(page_number) + page_offset
+            except (TypeError, ValueError):
+                pass
         measurements.append(shifted)
 
     return {
         "lab_date": result.get("lab_date"),
+        "source": result.get("source"),
         "measurements": measurements,
     }
 
 
 def _merge_ocr_results(results: list[dict]) -> dict:
-    merged = {"lab_date": None, "measurements": []}
+    merged = {"lab_date": None, "source": None, "measurements": []}
     for result in results:
         if merged["lab_date"] is None and result.get("lab_date"):
             merged["lab_date"] = result["lab_date"]
+        if merged["source"] is None and result.get("source"):
+            merged["source"] = result["source"]
         merged["measurements"].extend(result.get("measurements", []))
     return merged
 
@@ -450,7 +479,10 @@ async def explain_markers(markers: list[dict]) -> str:
     """Ask Copilot to explain a set of lab markers."""
     user_text = "Please explain these lab results:\n\n"
     for m in markers:
-        line = f"- **{m['marker_name']}**: {m['value']}"
+        value = m.get("qualitative_value")
+        if value is None:
+            value = m.get("value")
+        line = f"- **{m['marker_name']}**: {value}"
         if m.get("unit"):
             line += f" {m['unit']}"
         if m.get("reference_low") is not None and m.get("reference_high") is not None:
