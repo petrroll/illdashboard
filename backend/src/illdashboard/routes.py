@@ -882,3 +882,121 @@ async def normalize_existing_markers(db: AsyncSession = Depends(get_db)):
             updated += 1
     await db.commit()
     return {"updated": updated}
+
+
+# ── Tags ─────────────────────────────────────────────────────────────────────
+
+
+@router.get("/tags/files", response_model=list[str], tags=["tags"])
+async def list_file_tags(db: AsyncSession = Depends(get_db)):
+    """Return all distinct file tags (for autocomplete)."""
+    result = await db.execute(select(LabFileTag.tag).distinct().order_by(LabFileTag.tag))
+    return result.scalars().all()
+
+
+@router.get("/tags/markers", response_model=list[str], tags=["tags"])
+async def list_marker_tags(db: AsyncSession = Depends(get_db)):
+    """Return all distinct marker tags (for autocomplete)."""
+    result = await db.execute(select(MarkerTag.tag).distinct().order_by(MarkerTag.tag))
+    return result.scalars().all()
+
+
+@router.put("/files/{file_id}/tags", response_model=list[str], tags=["tags"])
+async def set_file_tags(file_id: int, body: TagsUpdate, db: AsyncSession = Depends(get_db)):
+    """Replace all tags for a file."""
+    lab = await db.get(LabFile, file_id)
+    if not lab:
+        raise HTTPException(404, "File not found")
+    # Remove existing
+    existing = await db.execute(select(LabFileTag).where(LabFileTag.lab_file_id == file_id))
+    for t in existing.scalars().all():
+        await db.delete(t)
+    # Add new
+    unique_tags = list(dict.fromkeys(body.tags))  # preserve order, deduplicate
+    for tag in unique_tags:
+        db.add(LabFileTag(lab_file_id=file_id, tag=tag))
+    await db.commit()
+    return unique_tags
+
+
+@router.put("/markers/{marker_name:path}/tags", response_model=list[str], tags=["tags"])
+async def set_marker_tags(marker_name: str, body: TagsUpdate, db: AsyncSession = Depends(get_db)):
+    """Replace all tags for a marker type."""
+    # Verify marker exists
+    result = await db.execute(
+        select(Measurement.marker_name).where(Measurement.marker_name == marker_name).limit(1)
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(404, "Marker not found")
+    # Remove existing
+    existing = await db.execute(select(MarkerTag).where(MarkerTag.marker_name == marker_name))
+    for t in existing.scalars().all():
+        await db.delete(t)
+    # Add new
+    unique_tags = list(dict.fromkeys(body.tags))
+    for tag in unique_tags:
+        db.add(MarkerTag(marker_name=marker_name, tag=tag))
+    await db.commit()
+    return unique_tags
+
+
+# ── Admin / Maintenance ──────────────────────────────────────────────────────
+
+
+@router.delete("/admin/cache/explanations", tags=["admin"])
+async def purge_explanation_cache(db: AsyncSession = Depends(get_db)):
+    """Delete all cached biomarker explanations."""
+    from illdashboard.models import BiomarkerInsight
+
+    result = await db.execute(select(BiomarkerInsight))
+    rows = result.scalars().all()
+    count = len(rows)
+    for row in rows:
+        await db.delete(row)
+    await db.commit()
+    return {"deleted_explanations": count}
+
+
+@router.delete("/admin/cache/all", tags=["admin"])
+async def purge_all_caches(db: AsyncSession = Depends(get_db)):
+    """Delete all cached biomarker explanations and sparkline PNGs."""
+    from illdashboard.models import BiomarkerInsight
+    from illdashboard.sparkline import SPARKLINE_CACHE_DIR
+
+    # Purge explanation cache
+    result = await db.execute(select(BiomarkerInsight))
+    rows = result.scalars().all()
+    explanation_count = len(rows)
+    for row in rows:
+        await db.delete(row)
+    await db.commit()
+
+    # Purge sparkline cache
+    sparkline_count = 0
+    if SPARKLINE_CACHE_DIR.exists():
+        for png in SPARKLINE_CACHE_DIR.glob("*.png"):
+            png.unlink()
+            sparkline_count += 1
+
+    return {"deleted_explanations": explanation_count, "deleted_sparklines": sparkline_count}
+
+
+@router.delete("/admin/database", tags=["admin"])
+async def drop_database():
+    """Drop all tables and recreate the empty schema. This destroys all data."""
+    from illdashboard.database import engine
+    from illdashboard.models import Base
+    from illdashboard.sparkline import SPARKLINE_CACHE_DIR
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+
+    # Also wipe sparkline cache
+    sparkline_count = 0
+    if SPARKLINE_CACHE_DIR.exists():
+        for png in SPARKLINE_CACHE_DIR.glob("*.png"):
+            png.unlink()
+            sparkline_count += 1
+
+    return {"status": "database_reset", "deleted_sparklines": sparkline_count}
