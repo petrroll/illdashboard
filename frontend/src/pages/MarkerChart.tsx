@@ -33,6 +33,10 @@ import {
   formatReferenceRange,
   getDisplayUnit,
   getMarkerStatusLabel,
+  getOriginalMeasurementReferenceHigh,
+  getOriginalMeasurementReferenceLow,
+  getOriginalMeasurementUnit,
+  getOriginalMeasurementValue,
 } from "../utils/measurements";
 
 const LIST_PANE_STORAGE_KEY = "illdashboard.markerListWidth";
@@ -556,6 +560,7 @@ export default function MarkerChart() {
                       <YAxis
                         domain={yAxisDomain}
                         stroke="#96a1ae"
+                        width={84}
                         label={{
                           value: unit,
                           angle: -90,
@@ -610,8 +615,8 @@ export default function MarkerChart() {
                           return (
                             <tr key={measurement.id}>
                               <td>{formatDate(measurement.measured_at)}</td>
-                              <td>{formatMeasurementValue(measurement.value, measurement.unit, measurement.qualitative_value)}</td>
-                              <td>{formatReferenceRange(measurement.reference_low, measurement.reference_high)}</td>
+                              <td>{formatMeasurementValue(getOriginalMeasurementValue(measurement), getOriginalMeasurementUnit(measurement), measurement.qualitative_value)}</td>
+                              <td>{formatReferenceRange(getOriginalMeasurementReferenceLow(measurement), getOriginalMeasurementReferenceHigh(measurement))}</td>
                               <td>
                                 <div className="history-source-cell">
                                   <Link

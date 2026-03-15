@@ -93,9 +93,9 @@ async def refresh_lab_search_document(file_id: int, db: AsyncSession) -> None:
     measurement_result = await db.execute(
         select(
             MeasurementType.name,
-            Measurement.value,
+            Measurement.original_value,
             Measurement.qualitative_value,
-            Measurement.unit,
+            Measurement.original_unit,
         )
         .join(Measurement.measurement_type)
         .where(Measurement.lab_file_id == file_id)

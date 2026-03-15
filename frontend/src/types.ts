@@ -18,11 +18,16 @@ export interface Measurement {
   lab_file_filename?: string | null;
   lab_file_source_tag?: string | null;
   marker_name: string;
+  canonical_unit?: string | null;
   value: number | null;
+  original_value?: number | null;
   qualitative_value: string | null;
   unit: string | null;
+  original_unit?: string | null;
   reference_low: number | null;
   reference_high: number | null;
+  original_reference_low?: number | null;
+  original_reference_high?: number | null;
   measured_at: string | null;
   page_number: number | null;
 }
@@ -30,6 +35,7 @@ export interface Measurement {
 export interface MarkerOverviewItem {
   marker_name: string;
   group_name: string;
+  canonical_unit?: string | null;
   latest_measurement: Measurement;
   previous_measurement: Measurement | null;
   status: "low" | "high" | "in_range" | "no_range";
@@ -50,6 +56,7 @@ export interface MarkerOverviewGroup {
 export interface MarkerDetailResponse {
   marker_name: string;
   group_name: string;
+  canonical_unit?: string | null;
   latest_measurement: Measurement;
   previous_measurement: Measurement | null;
   status: "low" | "high" | "in_range" | "no_range";

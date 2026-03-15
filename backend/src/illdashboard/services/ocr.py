@@ -17,17 +17,21 @@ from pathlib import Path
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import selectinload
 
 from illdashboard.config import settings
-from illdashboard.copilot_service import normalize_marker_names, normalize_source_name, ocr_extract
+from illdashboard.copilot_service import normalize_marker_names, normalize_numeric_measurements, normalize_source_name, ocr_extract
 from illdashboard.models import LabFile, LabFileTag, Measurement, MeasurementType
 import illdashboard.services.search as search_service
 from illdashboard.services.markers import (
+    backfill_measurement_type_aliases,
     build_source_tag,
     classify_marker_group,
+    ensure_measurement_type_aliases,
     ensure_measurement_types,
     get_measurement_type_by_name,
     is_source_tag,
+    load_measurement_type_aliases,
     merge_measurement_types,
     normalize_source_tag_value,
     source_tag_value,
@@ -39,6 +43,7 @@ logger = logging.getLogger(__name__)
 MAX_OCR_CONCURRENCY = 4
 OCR_STREAM_KEEPALIVE_INTERVAL = 10
 OCR_JOB_TTL_SECONDS = 600
+_ocr_persist_lock = asyncio.Lock()
 
 
 @dataclass
@@ -268,20 +273,50 @@ async def apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list
     raw_names = [measurement["marker_name"] for measurement in result.get("measurements", [])]
     deterministic_map = {name: normalize_marker_name_deterministic(name) for name in raw_names}
     cleaned_names = list(dict.fromkeys(deterministic_map.values()))
+    alias_matches = await load_measurement_type_aliases(db, [*raw_names, *cleaned_names])
+
+    alias_resolved_names: dict[str, str] = {}
+    for raw_name in raw_names:
+        alias_match = alias_matches.get(raw_name)
+        if alias_match is not None:
+            alias_resolved_names[deterministic_map[raw_name]] = alias_match.name
+
+    for cleaned_name in cleaned_names:
+        alias_match = alias_matches.get(cleaned_name)
+        if alias_match is not None:
+            alias_resolved_names[cleaned_name] = alias_match.name
 
     existing_result = await db.execute(select(MeasurementType.name).order_by(MeasurementType.name))
     existing_canonical = list(existing_result.scalars().all())
+    unresolved_cleaned_names = [name for name in cleaned_names if name not in alias_resolved_names]
 
-    try:
-        llm_map = await normalize_marker_names(cleaned_names, existing_canonical)
-    except Exception:
-        llm_map = {name: name for name in cleaned_names}
+    if unresolved_cleaned_names:
+        try:
+            llm_map = await normalize_marker_names(unresolved_cleaned_names, existing_canonical)
+        except Exception:
+            llm_map = {name: name for name in unresolved_cleaned_names}
+    else:
+        llm_map = {}
 
-    canonical_map = {raw: llm_map.get(deterministic_map[raw], deterministic_map[raw]) for raw in raw_names}
+    resolved_cleaned_names = {**llm_map, **alias_resolved_names}
+
+    canonical_map = {
+        raw: resolved_cleaned_names.get(deterministic_map[raw], deterministic_map[raw])
+        for raw in raw_names
+    }
     measurement_types = await ensure_measurement_types(db, [canonical_map[raw] for raw in raw_names])
+    await ensure_measurement_type_aliases(
+        db,
+        [
+            (alias_name, measurement_types[canonical_map[raw_name]])
+            for raw_name in raw_names
+            for alias_name in (raw_name, deterministic_map[raw_name])
+        ],
+    )
 
-    new_measurements: list[Measurement] = []
-    for measurement in result.get("measurements", []):
+    parsed_measurements: list[dict] = []
+    numeric_groups: dict[str, dict] = {}
+    for index, measurement in enumerate(result.get("measurements", [])):
         value, qualitative_value = parse_measurement_value(measurement.get("value"))
         if value is None and qualitative_value is None:
             logger.warning(
@@ -293,7 +328,52 @@ async def apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list
 
         ref_low = parse_numeric_value(measurement.get("reference_low"))
         ref_high = parse_numeric_value(measurement.get("reference_high"))
+        canonical_name = canonical_map.get(measurement["marker_name"], measurement["marker_name"])
+        if canonical_name is None:
+            continue
 
+        parsed_measurements.append(
+            {
+                "index": index,
+                "measurement": measurement,
+                "canonical_name": canonical_name,
+                "value": value,
+                "qualitative_value": qualitative_value,
+                "original_unit": measurement.get("unit"),
+                "original_reference_low": ref_low,
+                "original_reference_high": ref_high,
+            }
+        )
+
+        if value is None:
+            continue
+
+        group = numeric_groups.setdefault(
+            canonical_name,
+            {
+                "marker_name": canonical_name,
+                "existing_canonical_unit": measurement_types[canonical_name].canonical_unit,
+                "observations": [],
+            },
+        )
+        group["observations"].append(
+            {
+                "id": str(index),
+                "value": value,
+                "unit": measurement.get("unit"),
+                "reference_low": ref_low,
+                "reference_high": ref_high,
+            }
+        )
+
+    try:
+        normalized_groups = await normalize_numeric_measurements(list(numeric_groups.values()))
+    except Exception:
+        normalized_groups = {}
+
+    new_measurements: list[Measurement] = []
+    for parsed in parsed_measurements:
+        measurement = parsed["measurement"]
         measured_at = None
         if measurement.get("measured_at"):
             try:
@@ -301,17 +381,38 @@ async def apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list
             except (ValueError, TypeError):
                 measured_at = lab.lab_date
 
-        canonical_name = canonical_map.get(measurement["marker_name"], measurement["marker_name"])
-        if canonical_name is None:
-            continue
+        canonical_name = parsed["canonical_name"]
+        value = parsed["value"]
+        qualitative_value = parsed["qualitative_value"]
+        ref_low = parsed["original_reference_low"]
+        ref_high = parsed["original_reference_high"]
+
+        normalized_group = normalized_groups.get(canonical_name, {})
+        normalized_observation = normalized_group.get("observations", {}).get(str(parsed["index"]), {})
+        canonical_unit = (
+            normalized_group.get("canonical_unit")
+            or measurement_types[canonical_name].canonical_unit
+            or parsed["original_unit"]
+        )
+        normalized_value = normalized_observation.get("normalized_value", value)
+        normalized_ref_low = normalized_observation.get("normalized_reference_low", ref_low)
+        normalized_ref_high = normalized_observation.get("normalized_reference_high", ref_high)
+
+        if value is not None and canonical_unit and measurement_types[canonical_name].canonical_unit != canonical_unit:
+            measurement_types[canonical_name].canonical_unit = canonical_unit
+
         model = Measurement(
             lab_file_id=lab.id,
             measurement_type=measurement_types[canonical_name],
-            value=value,
+            value=normalized_value,
+            original_value=value,
             qualitative_value=qualitative_value,
-            unit=measurement.get("unit"),
-            reference_low=ref_low,
-            reference_high=ref_high,
+            unit=canonical_unit if value is not None else measurement.get("unit"),
+            original_unit=measurement.get("unit"),
+            reference_low=normalized_ref_low,
+            reference_high=normalized_ref_high,
+            original_reference_low=ref_low,
+            original_reference_high=ref_high,
             measured_at=measured_at or lab.lab_date,
             page_number=int(measurement["page_number"]) if measurement.get("page_number") is not None else None,
         )
@@ -367,6 +468,23 @@ async def persist_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> li
         len(new_measurements),
     )
     return new_measurements
+
+
+async def persist_ocr_result_with_fresh_session(
+    file_id: int,
+    result: dict,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> list[int]:
+    async with _ocr_persist_lock:
+        async with session_factory() as session:
+            persistent_lab = await session.get(LabFile, file_id)
+            if persistent_lab is None:
+                raise HTTPException(404, f"File {file_id} not found")
+
+            new_measurements = await persist_ocr_result(persistent_lab, result, session)
+            measurement_ids = [measurement.id for measurement in new_measurements]
+            await session.commit()
+            return measurement_ids
 
 
 async def run_ocr_for_file(lab: LabFile, db: AsyncSession) -> list[Measurement]:
@@ -452,6 +570,8 @@ async def _run_ocr_job(job: OcrJobState, labs: list[LabFile], session_factory: a
     _touch_job(job)
 
     semaphore = asyncio.Semaphore(MAX_OCR_CONCURRENCY)
+    completed_extractions: dict[int, tuple[LabFile, dict | None, Exception | None]] = {}
+    next_index_to_persist = 0
 
     async def extract_one(index: int, lab: LabFile):
         async with semaphore:
@@ -489,68 +609,71 @@ async def _run_ocr_job(job: OcrJobState, labs: list[LabFile], session_factory: a
     try:
         for future in asyncio.as_completed(tasks):
             index, lab, result, error = await future
-            if error:
-                logger.warning(
-                    "OCR job extraction error job_id=%s file_id=%s filename=%s queue_index=%s/%s error=%s",
-                    job.job_id,
-                    lab.id,
-                    lab.filename,
-                    index + 1,
-                    total,
-                    error,
-                )
-                job.progress_by_file[lab.id] = _make_progress(
-                    lab=lab,
-                    index=index,
-                    total=total,
-                    status="error",
-                    error=str(error),
-                )
-                job.error_count += 1
-                _touch_job(job)
-                continue
+            completed_extractions[index] = (lab, result, error)
 
-            try:
-                assert result is not None
-                async with session_factory() as session:
-                    persistent_lab = await session.get(LabFile, lab.id)
-                    if persistent_lab is None:
-                        raise HTTPException(404, f"File {lab.id} not found")
-                    await persist_ocr_result(persistent_lab, result, session)
-                    await session.commit()
-                logger.info(
-                    "OCR job file complete job_id=%s file_id=%s filename=%s queue_index=%s/%s",
-                    job.job_id,
-                    lab.id,
-                    lab.filename,
-                    index + 1,
-                    total,
-                )
-                job.progress_by_file[lab.id] = _make_progress(
-                    lab=lab,
-                    index=index,
-                    total=total,
-                    status="done",
-                )
-                job.completed_count += 1
-                _touch_job(job)
-            except Exception as exc:
-                logger.exception(
-                    "Persisting OCR result failed for job_id=%s file id=%s filename=%r path=%r",
-                    job.job_id,
-                    lab.id,
-                    lab.filename,
-                    lab.filepath,
-                )
-                job.progress_by_file[lab.id] = _make_progress(
-                    lab=lab,
-                    index=index,
-                    total=total,
-                    status="error",
-                    error=str(exc),
-                )
-                job.error_count += 1
-                _touch_job(job)
+            while next_index_to_persist in completed_extractions:
+                pending_lab, pending_result, pending_error = completed_extractions.pop(next_index_to_persist)
+
+                if pending_error:
+                    logger.warning(
+                        "OCR job extraction error job_id=%s file_id=%s filename=%s queue_index=%s/%s error=%s",
+                        job.job_id,
+                        pending_lab.id,
+                        pending_lab.filename,
+                        next_index_to_persist + 1,
+                        total,
+                        pending_error,
+                    )
+                    job.progress_by_file[pending_lab.id] = _make_progress(
+                        lab=pending_lab,
+                        index=next_index_to_persist,
+                        total=total,
+                        status="error",
+                        error=str(pending_error),
+                    )
+                    job.error_count += 1
+                    _touch_job(job)
+                    next_index_to_persist += 1
+                    continue
+
+                try:
+                    assert pending_result is not None
+                    await persist_ocr_result_with_fresh_session(pending_lab.id, pending_result, session_factory)
+                    logger.info(
+                        "OCR job file complete job_id=%s file_id=%s filename=%s queue_index=%s/%s",
+                        job.job_id,
+                        pending_lab.id,
+                        pending_lab.filename,
+                        next_index_to_persist + 1,
+                        total,
+                    )
+                    job.progress_by_file[pending_lab.id] = _make_progress(
+                        lab=pending_lab,
+                        index=next_index_to_persist,
+                        total=total,
+                        status="done",
+                    )
+                    job.completed_count += 1
+                    _touch_job(job)
+                except Exception as exc:
+                    logger.exception(
+                        "Persisting OCR result failed for job_id=%s file id=%s filename=%r path=%r",
+                        job.job_id,
+                        pending_lab.id,
+                        pending_lab.filename,
+                        pending_lab.filepath,
+                    )
+                    job.progress_by_file[pending_lab.id] = _make_progress(
+                        lab=pending_lab,
+                        index=next_index_to_persist,
+                        total=total,
+                        status="error",
+                        error=str(exc),
+                    )
+                    job.error_count += 1
+                    _touch_job(job)
+
+                next_index_to_persist += 1
 
         job.status = "completed"
         job.finished_at = time.time()
@@ -707,13 +830,15 @@ async def load_labs_for_ocr(
         return labs
 
     if only_unprocessed:
-        result = await db.execute(select(LabFile).where(LabFile.ocr_raw.is_(None)))
+        result = await db.execute(select(LabFile).where(LabFile.ocr_raw.is_(None)).order_by(LabFile.id.asc()))
         return list(result.scalars().all())
 
     return []
 
 
 async def normalize_existing_measurements(db: AsyncSession) -> int:
+    await backfill_measurement_type_aliases(db)
+
     result = await db.execute(select(MeasurementType).order_by(MeasurementType.id.asc()))
     measurement_types = result.scalars().all()
 
@@ -751,14 +876,138 @@ async def normalize_existing_measurements(db: AsyncSession) -> int:
 
         target = await get_measurement_type_by_name(db, canonical_name)
         if target is None:
+            old_name = measurement_type.name
             measurement_type.name = canonical_name
             measurement_type.group_name = classify_marker_group(canonical_name)
+            await db.flush()
+            await ensure_measurement_type_aliases(db, [(old_name, measurement_type), (canonical_name, measurement_type)])
             updated += 1
             type_by_name[canonical_name] = measurement_type
             continue
 
+        await ensure_measurement_type_aliases(db, [(raw_name, target), (canonical_name, target)])
         await merge_measurement_types(measurement_type, target, db)
         updated += 1
+
+    await backfill_measurement_type_aliases(db)
+
+    result = await db.execute(
+        select(MeasurementType)
+        .options(selectinload(MeasurementType.measurements))
+        .order_by(MeasurementType.id.asc())
+    )
+    measurement_types = result.scalars().all()
+    numeric_groups: list[dict] = []
+
+    for measurement_type in measurement_types:
+        observations: list[dict] = []
+        for measurement in measurement_type.measurements:
+            if measurement.qualitative_value is not None:
+                continue
+
+            original_value = measurement.original_value if measurement.original_value is not None else measurement.value
+            original_unit = measurement.original_unit if measurement.original_unit is not None else measurement.unit
+            original_reference_low = (
+                measurement.original_reference_low
+                if measurement.original_reference_low is not None
+                else measurement.reference_low
+            )
+            original_reference_high = (
+                measurement.original_reference_high
+                if measurement.original_reference_high is not None
+                else measurement.reference_high
+            )
+
+            if measurement.original_value != original_value:
+                measurement.original_value = original_value
+                updated += 1
+            if measurement.original_unit != original_unit:
+                measurement.original_unit = original_unit
+                updated += 1
+            if measurement.original_reference_low != original_reference_low:
+                measurement.original_reference_low = original_reference_low
+                updated += 1
+            if measurement.original_reference_high != original_reference_high:
+                measurement.original_reference_high = original_reference_high
+                updated += 1
+
+            if original_value is None:
+                continue
+
+            observations.append(
+                {
+                    "id": str(measurement.id),
+                    "value": original_value,
+                    "unit": original_unit,
+                    "reference_low": original_reference_low,
+                    "reference_high": original_reference_high,
+                }
+            )
+
+        if observations:
+            numeric_groups.append(
+                {
+                    "marker_name": measurement_type.name,
+                    "existing_canonical_unit": measurement_type.canonical_unit,
+                    "observations": observations,
+                }
+            )
+
+    try:
+        normalized_groups = await normalize_numeric_measurements(numeric_groups)
+    except Exception:
+        normalized_groups = {}
+
+    for measurement_type in measurement_types:
+        normalized_group = normalized_groups.get(measurement_type.name, {})
+        canonical_unit = (
+            normalized_group.get("canonical_unit")
+            or measurement_type.canonical_unit
+            or next(
+                (
+                    measurement.original_unit or measurement.unit
+                    for measurement in measurement_type.measurements
+                    if measurement.qualitative_value is None and (measurement.original_unit or measurement.unit)
+                ),
+                None,
+            )
+        )
+        if measurement_type.canonical_unit != canonical_unit:
+            measurement_type.canonical_unit = canonical_unit
+            updated += 1
+
+        for measurement in measurement_type.measurements:
+            if measurement.qualitative_value is not None:
+                continue
+
+            original_value = measurement.original_value if measurement.original_value is not None else measurement.value
+            original_reference_low = (
+                measurement.original_reference_low
+                if measurement.original_reference_low is not None
+                else measurement.reference_low
+            )
+            original_reference_high = (
+                measurement.original_reference_high
+                if measurement.original_reference_high is not None
+                else measurement.reference_high
+            )
+            normalized_observation = normalized_group.get("observations", {}).get(str(measurement.id), {})
+            normalized_value = normalized_observation.get("normalized_value", original_value)
+            normalized_reference_low = normalized_observation.get("normalized_reference_low", original_reference_low)
+            normalized_reference_high = normalized_observation.get("normalized_reference_high", original_reference_high)
+
+            if measurement.value != normalized_value:
+                measurement.value = normalized_value
+                updated += 1
+            if measurement.unit != canonical_unit:
+                measurement.unit = canonical_unit
+                updated += 1
+            if measurement.reference_low != normalized_reference_low:
+                measurement.reference_low = normalized_reference_low
+                updated += 1
+            if measurement.reference_high != normalized_reference_high:
+                measurement.reference_high = normalized_reference_high
+                updated += 1
 
     await db.commit()
     await search_service.rebuild_lab_search_index(db)

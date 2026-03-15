@@ -45,11 +45,16 @@ class MeasurementOut(BaseModel):
     lab_file_filename: str | None = None
     lab_file_source_tag: str | None = None
     marker_name: str
+    canonical_unit: str | None = None
     value: float | None = None
+    original_value: float | None = None
     qualitative_value: str | None = None
     unit: str | None = None
+    original_unit: str | None = None
     reference_low: float | None = None
     reference_high: float | None = None
+    original_reference_low: float | None = None
+    original_reference_high: float | None = None
     measured_at: datetime | None = None
     page_number: int | None = None
 
@@ -76,11 +81,16 @@ class MeasurementOut(BaseModel):
                 "lab_file_filename": getattr(lab_file, "filename", None),
                 "lab_file_source_tag": source_tag,
                 "marker_name": measurement_type.name,
+                "canonical_unit": measurement_type.canonical_unit,
                 "value": data.value,
+                "original_value": data.original_value,
                 "qualitative_value": data.qualitative_value,
                 "unit": data.unit,
+                "original_unit": data.original_unit,
                 "reference_low": data.reference_low,
                 "reference_high": data.reference_high,
+                "original_reference_low": data.original_reference_low,
+                "original_reference_high": data.original_reference_high,
                 "measured_at": data.measured_at,
                 "page_number": data.page_number,
             }
@@ -90,6 +100,7 @@ class MeasurementOut(BaseModel):
 class MarkerOverviewItem(BaseModel):
     marker_name: str
     group_name: str
+    canonical_unit: str | None = None
     latest_measurement: MeasurementOut
     previous_measurement: MeasurementOut | None = None
     status: str
@@ -110,6 +121,7 @@ class MarkerOverviewGroup(BaseModel):
 class MarkerDetailResponse(BaseModel):
     marker_name: str
     group_name: str
+    canonical_unit: str | None = None
     latest_measurement: MeasurementOut
     previous_measurement: MeasurementOut | None = None
     status: str

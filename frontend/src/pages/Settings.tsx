@@ -20,6 +20,10 @@ import {
   formatReferenceRange,
   getDisplayUnit,
   getMeasurementValueClass,
+  getOriginalMeasurementReferenceHigh,
+  getOriginalMeasurementReferenceLow,
+  getOriginalMeasurementUnit,
+  getOriginalMeasurementValue,
 } from "../utils/measurements";
 
 type SettingsAction =
@@ -39,9 +43,9 @@ interface SettingsActionDefinition {
 const settingsActions: SettingsActionDefinition[] = [
   {
     id: "normalize-markers",
-    label: "Normalize Marker Names",
+    label: "Normalize Markers & Units",
     loadingLabel: "Normalizing…",
-    description: "Merge duplicate biomarker names into their canonical marker definitions.",
+    description: "Merge duplicate biomarker names, choose canonical units, and rescale stored numeric values.",
   },
   {
     id: "purge-explanations",
@@ -69,7 +73,7 @@ async function performSettingsAction(action: SettingsAction) {
     case "normalize-markers": {
       const response = await normalizeMarkers();
       return {
-        message: `Normalized markers. Updated ${response.updated} marker definitions.`,
+        message: `Normalized markers and units. Updated ${response.updated} rows.`,
         shouldReload: true,
       };
     }
@@ -226,12 +230,17 @@ export default function Settings() {
             </thead>
             <tbody>
               {recentMeasurements.map((m) => {
+                const originalValue = getOriginalMeasurementValue(m);
+                const originalUnit = getOriginalMeasurementUnit(m);
+                const originalReferenceLow = getOriginalMeasurementReferenceLow(m);
+                const originalReferenceHigh = getOriginalMeasurementReferenceHigh(m);
+
                 return (
                   <tr key={m.id}>
                     <td>{m.marker_name}</td>
-                    <td className={getMeasurementValueClass(m)}>{formatMeasurementValue(m.value, m.unit, m.qualitative_value)}</td>
-                    <td>{getDisplayUnit(m.unit) ?? "—"}</td>
-                    <td>{formatReferenceRange(m.reference_low, m.reference_high)}</td>
+                    <td className={getMeasurementValueClass({ value: originalValue, reference_low: originalReferenceLow, reference_high: originalReferenceHigh })}>{formatMeasurementValue(originalValue, originalUnit, m.qualitative_value)}</td>
+                    <td>{getDisplayUnit(originalUnit) ?? "—"}</td>
+                    <td>{formatReferenceRange(originalReferenceLow, originalReferenceHigh)}</td>
                     <td>{formatDate(m.measured_at)}</td>
                   </tr>
                 );

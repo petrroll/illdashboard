@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from illdashboard.models import LabFile, MarkerTag, BiomarkerInsight, Measurement, MeasurementType
+from illdashboard.models import BiomarkerInsight, LabFile, MarkerTag, Measurement, MeasurementAlias, MeasurementType
 
 
 GROUP_ORDER = [
@@ -129,6 +129,93 @@ def normalized_marker_key(name: str) -> str:
     return normalized.casefold()
 
 
+def normalize_marker_alias_key(name: str) -> str:
+    normalized = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    normalized = normalized.casefold()
+    normalized = re.sub(r"(?<!\s)\[", " [", normalized)
+    normalized = re.sub(r"\s+-\s*|\s*-\s+", " ", normalized)
+    normalized = normalized.replace("+", "")
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+async def load_measurement_type_aliases(db: AsyncSession, names: list[str]) -> dict[str, MeasurementType]:
+    unique_names = list(dict.fromkeys(name for name in names if name))
+    if not unique_names:
+        return {}
+
+    keys_by_name = {name: normalize_marker_alias_key(name) for name in unique_names}
+    unique_keys = list(dict.fromkeys(key for key in keys_by_name.values() if key))
+    if not unique_keys:
+        return {}
+
+    result = await db.execute(
+        select(MeasurementAlias)
+        .options(selectinload(MeasurementAlias.measurement_type))
+        .where(MeasurementAlias.normalized_key.in_(unique_keys))
+    )
+    alias_by_key = {alias.normalized_key: alias.measurement_type for alias in result.scalars().all()}
+    return {
+        name: alias_by_key[key]
+        for name, key in keys_by_name.items()
+        if key in alias_by_key
+    }
+
+
+async def ensure_measurement_type_aliases(
+    db: AsyncSession,
+    alias_pairs: list[tuple[str, MeasurementType]],
+) -> None:
+    normalized_pairs: list[tuple[str, str, MeasurementType]] = []
+    seen_keys: set[str] = set()
+    for alias_name, measurement_type in alias_pairs:
+        cleaned_alias = alias_name.strip()
+        normalized_key = normalize_marker_alias_key(cleaned_alias)
+        if not cleaned_alias or not normalized_key or normalized_key in seen_keys:
+            continue
+        seen_keys.add(normalized_key)
+        normalized_pairs.append((cleaned_alias, normalized_key, measurement_type))
+
+    if not normalized_pairs:
+        return
+
+    result = await db.execute(
+        select(MeasurementAlias).where(
+            MeasurementAlias.normalized_key.in_([normalized_key for _, normalized_key, _ in normalized_pairs])
+        )
+    )
+    existing_by_key = {alias.normalized_key: alias for alias in result.scalars().all()}
+
+    for alias_name, normalized_key, measurement_type in normalized_pairs:
+        alias = existing_by_key.get(normalized_key)
+        if alias is None:
+            db.add(
+                MeasurementAlias(
+                    alias_name=alias_name,
+                    normalized_key=normalized_key,
+                    measurement_type_id=measurement_type.id,
+                )
+            )
+            continue
+
+        if alias.alias_name != alias_name:
+            alias.alias_name = alias_name
+        if alias.measurement_type_id != measurement_type.id:
+            alias.measurement_type_id = measurement_type.id
+
+    await db.flush()
+
+
+async def backfill_measurement_type_aliases(db: AsyncSession) -> None:
+    result = await db.execute(select(MeasurementType).order_by(MeasurementType.id.asc()))
+    measurement_types = result.scalars().all()
+    await ensure_measurement_type_aliases(
+        db,
+        [(measurement_type.name, measurement_type) for measurement_type in measurement_types],
+    )
+
+
 def marker_matches(name: str, keywords: tuple[str, ...], patterns: tuple[str, ...] = ()) -> bool:
     return any(keyword in name for keyword in keywords) or any(re.search(pattern, name) for pattern in patterns)
 
@@ -232,23 +319,32 @@ async def ensure_measurement_types(db: AsyncSession, names: list[str]) -> dict[s
         by_name[name] = measurement_type
 
     await db.flush()
+    await ensure_measurement_type_aliases(db, [(name, by_name[name]) for name in unique_names])
     return by_name
 
 
 async def get_measurement_type_by_name(db: AsyncSession, marker_name: str) -> MeasurementType | None:
     result = await db.execute(select(MeasurementType).where(MeasurementType.name == marker_name))
-    return result.scalar_one_or_none()
+    measurement_type = result.scalar_one_or_none()
+    if measurement_type is not None:
+        return measurement_type
+
+    aliases = await load_measurement_type_aliases(db, [marker_name])
+    return aliases.get(marker_name)
 
 
 async def load_measurements_for_marker(db: AsyncSession, marker_name: str) -> list[Measurement]:
+    measurement_type = await get_measurement_type_by_name(db, marker_name)
+    if measurement_type is None:
+        return []
+
     result = await db.execute(
         select(Measurement)
-        .join(Measurement.measurement_type)
         .options(
             selectinload(Measurement.measurement_type),
             selectinload(Measurement.lab_file).selectinload(LabFile.tags),
         )
-        .where(MeasurementType.name == marker_name)
+        .where(Measurement.measurement_type_id == measurement_type.id)
         .order_by(Measurement.measured_at.asc(), Measurement.id.asc())
     )
     return list(result.scalars().all())
@@ -267,6 +363,14 @@ async def merge_measurement_types(source: MeasurementType, target: MeasurementTy
     source_tags_result = await db.execute(select(MarkerTag).where(MarkerTag.measurement_type_id == source.id))
     source_tags = source_tags_result.scalars().all()
 
+    source_alias_result = await db.execute(select(MeasurementAlias).where(MeasurementAlias.measurement_type_id == source.id))
+    source_aliases = source_alias_result.scalars().all()
+
+    target_alias_result = await db.execute(
+        select(MeasurementAlias.normalized_key).where(MeasurementAlias.measurement_type_id == target.id)
+    )
+    existing_target_alias_keys = set(target_alias_result.scalars().all())
+
     target_tags_result = await db.execute(select(MarkerTag.tag).where(MarkerTag.measurement_type_id == target.id))
     existing_target_tags = set(target_tags_result.scalars().all())
 
@@ -276,6 +380,13 @@ async def merge_measurement_types(source: MeasurementType, target: MeasurementTy
             continue
         tag.measurement_type_id = target.id
         existing_target_tags.add(tag.tag)
+
+    for alias in source_aliases:
+        if alias.normalized_key in existing_target_alias_keys:
+            await db.delete(alias)
+            continue
+        alias.measurement_type_id = target.id
+        existing_target_alias_keys.add(alias.normalized_key)
 
     source_insight_result = await db.execute(
         select(BiomarkerInsight).where(BiomarkerInsight.measurement_type_id == source.id)
@@ -300,6 +411,9 @@ def measurement_status(measurement: Measurement) -> str:
     reference_high = measurement.reference_high
     value = measurement.value
 
+    if value is None:
+        return "no_range"
+
     if reference_low is not None and value < reference_low:
         return "low"
     if reference_high is not None and value > reference_high:
@@ -314,7 +428,7 @@ def range_position(measurement: Measurement) -> float | None:
     reference_high = measurement.reference_high
     value = measurement.value
 
-    if reference_low is None or reference_high is None or reference_high <= reference_low:
+    if value is None or reference_low is None or reference_high is None or reference_high <= reference_low:
         return None
     return (value - reference_low) / (reference_high - reference_low)
 
@@ -322,17 +436,18 @@ def range_position(measurement: Measurement) -> float | None:
 def build_marker_payload(measurements: list[Measurement]) -> dict:
     latest = measurements[-1]
     previous = measurements[-2] if len(measurements) > 1 else None
-    values = [measurement.value for measurement in measurements]
+    values = [measurement.value for measurement in measurements if measurement.value is not None]
     return {
         "marker_name": latest.marker_name,
         "group_name": latest.group_name,
+        "canonical_unit": latest.canonical_unit,
         "latest_measurement": latest,
         "previous_measurement": previous,
         "status": measurement_status(latest),
         "range_position": range_position(latest),
         "total_count": len(measurements),
-        "value_min": min(values),
-        "value_max": max(values),
+        "value_min": min(values) if values else None,
+        "value_max": max(values) if values else None,
     }
 
 

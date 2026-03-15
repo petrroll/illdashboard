@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, patch
@@ -355,6 +356,87 @@ async def test_normalize_marker_names_splits_large_batches():
 
 
 @pytest.mark.asyncio
+async def test_normalize_numeric_measurements_splits_large_batches():
+    responses = [
+        json.dumps(
+            {
+                "Marker 1": {
+                    "canonical_unit": "cells/µL",
+                    "observations": {
+                        "0": {
+                            "normalized_value": 380,
+                            "normalized_reference_low": None,
+                            "normalized_reference_high": None,
+                        }
+                    },
+                },
+                "Marker 2": {
+                    "canonical_unit": "mmol/L",
+                    "observations": {
+                        "1": {
+                            "normalized_value": 4.2,
+                            "normalized_reference_low": 3.5,
+                            "normalized_reference_high": 5.1,
+                        }
+                    },
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "Marker 3": {
+                    "canonical_unit": "g/L",
+                    "observations": {
+                        "2": {
+                            "normalized_value": 156,
+                            "normalized_reference_low": 135,
+                            "normalized_reference_high": 175,
+                        }
+                    },
+                }
+            }
+        ),
+    ]
+
+    marker_groups = [
+        {
+            "marker_name": "Marker 1",
+            "existing_canonical_unit": None,
+            "observations": [
+                {"id": "0", "value": 0.38, "unit": "10^9/L", "reference_low": None, "reference_high": None},
+            ],
+        },
+        {
+            "marker_name": "Marker 2",
+            "existing_canonical_unit": "mmol/L",
+            "observations": [
+                {"id": "1", "value": 75.6, "unit": "mg/dL", "reference_low": 63.0, "reference_high": 91.8},
+            ],
+        },
+        {
+            "marker_name": "Marker 3",
+            "existing_canonical_unit": "g/L",
+            "observations": [
+                {"id": "2", "value": 15.6, "unit": "g/dL", "reference_low": 13.5, "reference_high": 17.5},
+            ],
+        },
+    ]
+
+    with patch.object(copilot_service, "UNIT_NORMALIZATION_BATCH_SIZE", 2), patch.object(
+        copilot_service,
+        "UNIT_NORMALIZATION_CONCURRENCY",
+        1,
+    ), patch("illdashboard.copilot_service._ask", new=AsyncMock(side_effect=responses)) as ask_mock:
+        result = await copilot_service.normalize_numeric_measurements(marker_groups)
+
+    assert result["Marker 1"]["canonical_unit"] == "cells/µL"
+    assert result["Marker 1"]["observations"]["0"]["normalized_value"] == 380
+    assert result["Marker 2"]["canonical_unit"] == "mmol/L"
+    assert result["Marker 3"]["observations"]["2"]["normalized_reference_high"] == 175
+    assert ask_mock.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_ask_adds_observed_premium_usage_cost():
     session = DummySession(
         response=SimpleNamespace(data=SimpleNamespace(content="ok")),
@@ -403,9 +485,109 @@ async def test_normalize_marker_names_prompt_prefers_english_for_czech_labels():
     assert ask_mock.await_args is not None
     system_prompt, user_prompt = ask_mock.await_args.args
     assert "including Czech, prefer the English canonical medical name" in system_prompt
+    assert "If multiple NEW marker names refer to the same biomarker" in system_prompt
+    assert "Ignore specimen prefixes, analyzer noise, sample annotations" in system_prompt
+    assert "When a label includes a standard lab abbreviation such as MCHC" in system_prompt
     assert 'it often means "Absorbance", not "Absolute"' in system_prompt
     assert '"Lymfocyty -abs.počet": "Absolute Lymphocyte Count"' in system_prompt
     assert "NEW marker names to normalize:\n- Leukocyty\n" in user_prompt
+
+
+@pytest.mark.asyncio
+async def test_normalize_marker_names_reuses_existing_alias_key_without_llm():
+    with patch("illdashboard.copilot_service._ask", new=AsyncMock()) as ask_mock:
+        result = await copilot_service.normalize_marker_names(
+            ["Sodium [Serum]", "Sodium"],
+            ["Sodium"],
+        )
+
+    assert result == {
+        "Sodium [Serum]": "Sodium",
+        "Sodium": "Sodium",
+    }
+    ask_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_normalize_numeric_measurements_prompt_mentions_count_conversion_example():
+    response = json.dumps(
+        {
+            "Absolute CD4+ T-Helper Cell Count": {
+                "canonical_unit": "Zellen/µl",
+                "observations": {
+                    "0": {
+                        "normalized_value": 380,
+                        "normalized_reference_low": None,
+                        "normalized_reference_high": None,
+                    }
+                },
+            }
+        }
+    )
+
+    with patch("illdashboard.copilot_service._ask", new=AsyncMock(return_value=response)) as ask_mock:
+        result = await copilot_service.normalize_numeric_measurements(
+            [
+                {
+                    "marker_name": "Absolute CD4+ T-Helper Cell Count",
+                    "existing_canonical_unit": None,
+                    "observations": [
+                        {
+                            "id": "0",
+                            "value": 0.38,
+                            "unit": "10^9/L",
+                            "reference_low": None,
+                            "reference_high": None,
+                        }
+                    ],
+                }
+            ]
+        )
+
+    assert result["Absolute CD4+ T-Helper Cell Count"]["canonical_unit"] == "Zellen/µl"
+
+    assert ask_mock.await_args is not None
+    system_prompt, user_prompt = ask_mock.await_args.args
+    assert "0.38 in 10^9/L is 380 in /µL" in system_prompt
+    assert "Marker: Absolute CD4+ T-Helper Cell Count" in user_prompt
+    assert "id=0; value=0.38; unit=10^9/L" in user_prompt
+
+
+@pytest.mark.asyncio
+async def test_normalize_numeric_measurements_skips_homogeneous_units_without_llm():
+    with patch("illdashboard.copilot_service._ask", new=AsyncMock()) as ask_mock:
+        result = await copilot_service.normalize_numeric_measurements(
+            [
+                {
+                    "marker_name": "Sodium",
+                    "existing_canonical_unit": "mmol/L",
+                    "observations": [
+                        {
+                            "id": "0",
+                            "value": 141,
+                            "unit": "mmol/l",
+                            "reference_low": 136,
+                            "reference_high": 145,
+                        },
+                        {
+                            "id": "1",
+                            "value": 139,
+                            "unit": "mmol/L",
+                            "reference_low": 136,
+                            "reference_high": 145,
+                        },
+                    ],
+                }
+            ]
+        )
+
+    assert result == {
+        "Sodium": {
+            "canonical_unit": "mmol/L",
+            "observations": {},
+        }
+    }
+    ask_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

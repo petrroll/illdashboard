@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ from copilot.types import CopilotClientOptions, MessageOptions
 
 from illdashboard.config import settings
 from illdashboard.metrics import add_premium_requests
+from illdashboard.services.markers import normalize_marker_alias_key
 
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,8 @@ OCR_RETRY_DELAY = 3
 OCR_PDF_BATCH_CONCURRENCY = 4
 MARKER_NORMALIZATION_BATCH_SIZE = 40
 MARKER_NORMALIZATION_CONCURRENCY = 2
+UNIT_NORMALIZATION_BATCH_SIZE = 20
+UNIT_NORMALIZATION_CONCURRENCY = 2
 
 
 async def _get_client() -> CopilotClient:
@@ -54,7 +58,10 @@ async def shutdown_client() -> None:
     """Stop the Copilot client (call on app shutdown)."""
     global _client
     if _client is not None:
-        await _client.stop()
+        try:
+            await _client.stop()
+        except Exception as exc:
+            logger.warning("Copilot client shutdown had errors: %s", exc)
         _client = None
 
 
@@ -104,7 +111,10 @@ async def _ask(system_prompt: str, user_prompt: str, *, attachments: list | None
         request_error = exc
     finally:
         unsubscribe()
-        await session.disconnect()
+        try:
+            await session.disconnect()
+        except Exception as exc:
+            logger.warning("Copilot session disconnect had errors: %s", exc)
 
     duration = time.perf_counter() - started_at
 
@@ -807,10 +817,17 @@ You are a medical lab data normalization assistant. The user will give you:
 For each new marker name, decide:
 - If it matches an existing canonical name (same test, just different formatting, \
 spacing, abbreviation, or punctuation), map it to that existing canonical name.
+- If multiple NEW marker names refer to the same biomarker, map all of them to the \
+same single canonical name.
 - If it is genuinely new (no match in the existing list), return a cleaned-up, \
 standard English canonical lab marker name when you can translate it confidently.
 - If the source label is in another language, including Czech, prefer the English \
 canonical medical name instead of preserving the source-language wording.
+- Ignore specimen prefixes, analyzer noise, sample annotations, and bracketed \
+context when they do not change the underlying biomarker.
+- When a label includes a standard lab abbreviation such as MCHC, MCV, ALT, AST, \
+CRP, TSH, HDL, LDL, or HbA1c, prefer that standard abbreviation as the canonical \
+name unless there is a clearly more established English database label already present.
 - Prefer concise English medical names such as \"White Blood Cell (WBC) Count\" \
 or \"Platelet Count\" over local-language labels.
 - Treat abbreviations like \"Abs\" carefully: in immunology or assay contexts it often \
@@ -841,6 +858,114 @@ Do not include any commentary outside the JSON.\
 """
 
 
+UNIT_NORMALIZE_SYSTEM_PROMPT = """\
+You are a medical lab unit normalization assistant. The user will give you one or more
+marker groups. Each group contains:
+1. One canonical marker name.
+2. An optional existing canonical unit already used in the database.
+3. One or more numeric observations from lab reports, each with an id, a reported value,
+     a reported unit, and optional reference bounds.
+
+For each marker group:
+- Reuse the existing canonical unit when one is provided, unless it is clearly wrong.
+- If no canonical unit exists yet, choose one concise canonical unit that is medically standard
+    and consistent across that marker's observations.
+- Convert every numeric value and reference bound into the canonical unit when the conversion is
+    clear and exact.
+- Keep null reference bounds as null.
+- If the conversion is unclear, keep the original numbers unchanged and keep the reported unit as
+    the canonical unit for that marker group.
+- Treat unit-only formatting differences as equivalent, such as mmol/l vs mmol/L.
+- Be careful with count units. For example, 0.38 in 10^9/L is 380 in /µL.
+
+Return ONLY valid JSON as an object keyed by marker name. Each value must be an object with:
+- "canonical_unit": string or null
+- "observations": object keyed by observation id, where each value contains
+    "normalized_value", "normalized_reference_low", and "normalized_reference_high".
+
+Do not include commentary outside the JSON.\
+"""
+
+
+def _coerce_normalized_number(value) -> float | None:
+        if value is None or isinstance(value, bool):
+                return None
+        if isinstance(value, int | float):
+                numeric = float(value)
+                return numeric if math.isfinite(numeric) else None
+        if isinstance(value, str):
+                stripped = value.strip()
+                if not stripped:
+                        return None
+                try:
+                        numeric = float(stripped)
+                except (TypeError, ValueError, OverflowError):
+                        return None
+                return numeric if math.isfinite(numeric) else None
+        return None
+
+
+def _normalize_unit_equivalence_key(unit: str | None) -> str | None:
+    if unit is None:
+        return None
+
+    normalized = unit.strip()
+    if not normalized:
+        return None
+
+    normalized = normalized.replace("μ", "µ")
+    normalized = re.sub(r"\s+", "", normalized)
+    normalized = normalized.casefold()
+    normalized = normalized.replace("µ", "u")
+    return normalized or None
+
+
+def _normalize_marker_lookup_key(name: str) -> str:
+    return normalize_marker_alias_key(re.sub(r"\[[^\]]*\]", " ", name))
+
+
+def _default_numeric_normalization(group: dict) -> dict:
+    canonical_unit = group.get("existing_canonical_unit") or next(
+        (
+            observation.get("unit")
+            for observation in group.get("observations", [])
+            if observation.get("unit")
+        ),
+        None,
+    )
+    if isinstance(canonical_unit, str):
+        canonical_unit = canonical_unit.strip() or None
+    return {
+        "canonical_unit": canonical_unit,
+        "observations": {},
+    }
+
+
+def _unit_key_likely_requires_llm(unit_key: str | None) -> bool:
+    if unit_key is None:
+        return False
+    return bool(re.search(r"(?:^|[^a-z])(?:10\^?\d+|x10\^?\d+)", unit_key))
+
+
+def _can_skip_numeric_normalization(group: dict) -> bool:
+    observation_unit_keys = {
+        unit_key
+        for observation in group.get("observations", [])
+        if (unit_key := _normalize_unit_equivalence_key(observation.get("unit"))) is not None
+    }
+    existing_unit_key = _normalize_unit_equivalence_key(group.get("existing_canonical_unit"))
+
+    if existing_unit_key is not None:
+        return not observation_unit_keys or observation_unit_keys == {existing_unit_key}
+
+    if not observation_unit_keys:
+        return True
+    if len(observation_unit_keys) > 1:
+        return False
+
+    return not _unit_key_likely_requires_llm(next(iter(observation_unit_keys)))
+
+
 async def normalize_marker_names(new_names: list[str], existing_canonical: list[str]) -> dict[str, str]:
     """Use the LLM to map raw marker names to canonical forms.
 
@@ -853,6 +978,34 @@ async def normalize_marker_names(new_names: list[str], existing_canonical: list[
     """
     if not new_names:
         return {}
+
+    existing_by_key: dict[str, str] = {}
+    for canonical_name in existing_canonical:
+        normalized_key = _normalize_marker_lookup_key(canonical_name)
+        if normalized_key and normalized_key not in existing_by_key:
+            existing_by_key[normalized_key] = canonical_name
+
+    direct_mapping: dict[str, str] = {}
+    unresolved_names: list[str] = []
+    for new_name in new_names:
+        normalized_key = _normalize_marker_lookup_key(new_name)
+        direct_match = existing_by_key.get(normalized_key)
+        if direct_match is not None:
+            direct_mapping[new_name] = direct_match
+            continue
+        unresolved_names.append(new_name)
+
+    if not unresolved_names:
+        return direct_mapping
+
+    representative_names: list[str] = []
+    names_by_key: dict[str, list[str]] = {}
+    for new_name in unresolved_names:
+        normalized_key = _normalize_marker_lookup_key(new_name) or new_name
+        if normalized_key not in names_by_key:
+            names_by_key[normalized_key] = []
+            representative_names.append(new_name)
+        names_by_key[normalized_key].append(new_name)
 
     async def _normalize_batch(batch_names: list[str]) -> dict[str, str]:
         user_text = "EXISTING canonical marker names:\n"
@@ -884,8 +1037,8 @@ async def normalize_marker_names(new_names: list[str], existing_canonical: list[
         return mapping
 
     batches = [
-        new_names[index:index + MARKER_NORMALIZATION_BATCH_SIZE]
-        for index in range(0, len(new_names), MARKER_NORMALIZATION_BATCH_SIZE)
+        representative_names[index:index + MARKER_NORMALIZATION_BATCH_SIZE]
+        for index in range(0, len(representative_names), MARKER_NORMALIZATION_BATCH_SIZE)
     ]
     semaphore = asyncio.Semaphore(MARKER_NORMALIZATION_CONCURRENCY)
 
@@ -893,9 +1046,12 @@ async def normalize_marker_names(new_names: list[str], existing_canonical: list[
         async with semaphore:
             return await _normalize_batch(batch_names)
 
-    merged_mapping: dict[str, str] = {}
+    merged_mapping: dict[str, str] = dict(direct_mapping)
     for batch_mapping in await asyncio.gather(*[_run_batch(batch) for batch in batches]):
-        merged_mapping.update(batch_mapping)
+        for representative_name, canonical_name in batch_mapping.items():
+            normalized_key = _normalize_marker_lookup_key(representative_name) or representative_name
+            for original_name in names_by_key.get(normalized_key, [representative_name]):
+                merged_mapping[original_name] = canonical_name
 
     return merged_mapping
 
@@ -934,6 +1090,99 @@ async def normalize_source_name(
 
     normalized_source = normalized_source.strip()
     return normalized_source or None
+
+
+async def normalize_numeric_measurements(marker_groups: list[dict]) -> dict[str, dict]:
+    """Use the LLM to choose canonical units and rescale numeric values by marker."""
+    if not marker_groups:
+        return {}
+
+    normalized: dict[str, dict] = {}
+    unresolved_groups: list[dict] = []
+    for group in marker_groups:
+        if _can_skip_numeric_normalization(group):
+            normalized[group["marker_name"]] = _default_numeric_normalization(group)
+            continue
+        unresolved_groups.append(group)
+
+    if not unresolved_groups:
+        return normalized
+
+    async def _normalize_batch(batch_groups: list[dict]) -> dict[str, dict]:
+        user_text = "MARKER groups to normalize:\n"
+        for group in batch_groups:
+            user_text += f"\n- Marker: {group['marker_name']}\n"
+            user_text += f"  Existing canonical unit: {group.get('existing_canonical_unit') or '(none)'}\n"
+            user_text += "  Observations:\n"
+            for observation in group.get("observations", []):
+                user_text += (
+                    f"  - id={observation['id']}; "
+                    f"value={observation['value']}; "
+                    f"unit={observation.get('unit') or '(none)'}; "
+                    f"reference_low={observation.get('reference_low')}; "
+                    f"reference_high={observation.get('reference_high')}\n"
+                )
+
+        try:
+            payload = _parse_json_response(await _ask(UNIT_NORMALIZE_SYSTEM_PROMPT, user_text))
+        except (json.JSONDecodeError, ValueError):
+            payload = {}
+
+        normalized: dict[str, dict] = {}
+        for group in batch_groups:
+            marker_name = group["marker_name"]
+            group_payload = payload.get(marker_name) if isinstance(payload, dict) else None
+            if not isinstance(group_payload, dict):
+                group_payload = {}
+
+            canonical_unit = group_payload.get("canonical_unit")
+            if not isinstance(canonical_unit, str) or not canonical_unit.strip():
+                canonical_unit = group.get("existing_canonical_unit") or next(
+                    (
+                        observation.get("unit")
+                        for observation in group.get("observations", [])
+                        if observation.get("unit")
+                    ),
+                    None,
+                )
+            else:
+                canonical_unit = canonical_unit.strip()
+
+            observation_payload = group_payload.get("observations")
+            normalized_observations: dict[str, dict[str, float | None]] = {}
+            if isinstance(observation_payload, dict):
+                for observation in group.get("observations", []):
+                    raw_result = observation_payload.get(observation["id"])
+                    if not isinstance(raw_result, dict):
+                        continue
+                    normalized_observations[observation["id"]] = {
+                        "normalized_value": _coerce_normalized_number(raw_result.get("normalized_value")),
+                        "normalized_reference_low": _coerce_normalized_number(raw_result.get("normalized_reference_low")),
+                        "normalized_reference_high": _coerce_normalized_number(raw_result.get("normalized_reference_high")),
+                    }
+
+            normalized[marker_name] = {
+                "canonical_unit": canonical_unit,
+                "observations": normalized_observations,
+            }
+
+        return normalized
+
+    batches = [
+        unresolved_groups[index:index + UNIT_NORMALIZATION_BATCH_SIZE]
+        for index in range(0, len(unresolved_groups), UNIT_NORMALIZATION_BATCH_SIZE)
+    ]
+    semaphore = asyncio.Semaphore(UNIT_NORMALIZATION_CONCURRENCY)
+
+    async def _run_batch(batch_groups: list[dict]) -> dict[str, dict]:
+        async with semaphore:
+            return await _normalize_batch(batch_groups)
+
+    merged_mapping: dict[str, dict] = dict(normalized)
+    for batch_mapping in await asyncio.gather(*[_run_batch(batch) for batch in batches]):
+        merged_mapping.update(batch_mapping)
+
+    return merged_mapping
 
 
 # ── Explanations ─────────────────────────────────────────────────────────────

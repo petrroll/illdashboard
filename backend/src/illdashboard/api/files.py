@@ -190,16 +190,21 @@ async def get_file_page_image(file_id: int, page_num: int, db: AsyncSession = De
 @router.post("/files/{file_id}/ocr", response_model=list[MeasurementOut], tags=["ocr"])
 async def run_ocr(file_id: int, db: AsyncSession = Depends(get_db)):
     lab = await get_lab_file_or_404(file_id, db)
-    new_measurements = await ocr_service.run_ocr_for_file(lab, db)
-    await db.commit()
-    measurement_ids = [measurement.id for measurement in new_measurements]
-    result = await db.execute(
-        select(Measurement)
-        .options(selectinload(Measurement.measurement_type))
-        .where(Measurement.id.in_(measurement_ids))
-        .order_by(Measurement.id.asc())
+    result = await ocr_service.extract_ocr_result(lab)
+    measurement_ids = await ocr_service.persist_ocr_result_with_fresh_session(
+        lab.id,
+        result,
+        get_session_factory(db),
     )
-    return result.scalars().all()
+
+    async with get_session_factory(db)() as session:
+        persisted_result = await session.execute(
+            select(Measurement)
+            .options(selectinload(Measurement.measurement_type))
+            .where(Measurement.id.in_(measurement_ids))
+            .order_by(Measurement.id.asc())
+        )
+        return persisted_result.scalars().all()
 
 
 @router.post("/files/ocr/batch", response_model=OcrJobStartResponse, tags=["ocr"])

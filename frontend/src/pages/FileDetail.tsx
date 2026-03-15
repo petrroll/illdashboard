@@ -21,6 +21,10 @@ import {
   formatReferenceRange,
   getDisplayUnit,
   getMeasurementValueClass,
+  getOriginalMeasurementReferenceHigh,
+  getOriginalMeasurementReferenceLow,
+  getOriginalMeasurementUnit,
+  getOriginalMeasurementValue,
 } from "../utils/measurements";
 
 export default function FileDetail() {
@@ -112,11 +116,11 @@ export default function FileDetail() {
       .filter((m) => selected.has(m.id))
       .map((m) => ({
         marker_name: m.marker_name,
-        value: m.value,
+        value: getOriginalMeasurementValue(m),
         qualitative_value: m.qualitative_value,
-        unit: m.unit,
-        reference_low: m.reference_low,
-        reference_high: m.reference_high,
+        unit: getOriginalMeasurementUnit(m),
+        reference_low: getOriginalMeasurementReferenceLow(m),
+        reference_high: getOriginalMeasurementReferenceHigh(m),
       }));
     if (items.length === 0) return;
     await requestExplanation(() => explainMeasurements(items));
@@ -125,11 +129,11 @@ export default function FileDetail() {
   const explainSingle = async (m: Measurement) => {
     await requestExplanation(() => explainMeasurement({
       marker_name: m.marker_name,
-      value: m.value,
+      value: getOriginalMeasurementValue(m),
       qualitative_value: m.qualitative_value,
-      unit: m.unit,
-      reference_low: m.reference_low,
-      reference_high: m.reference_high,
+      unit: getOriginalMeasurementUnit(m),
+      reference_low: getOriginalMeasurementReferenceLow(m),
+      reference_high: getOriginalMeasurementReferenceHigh(m),
     }));
   };
 
@@ -337,6 +341,11 @@ export default function FileDetail() {
                 </thead>
                 <tbody>
                   {filteredMeasurements.map((m) => {
+                    const originalValue = getOriginalMeasurementValue(m);
+                    const originalUnit = getOriginalMeasurementUnit(m);
+                    const originalReferenceLow = getOriginalMeasurementReferenceLow(m);
+                    const originalReferenceHigh = getOriginalMeasurementReferenceHigh(m);
+
                     return (
                       <tr key={m.id}>
                         <td>
@@ -349,11 +358,11 @@ export default function FileDetail() {
                           </label>
                         </td>
                         <td style={{ fontWeight: 500 }}>{m.marker_name}</td>
-                        <td className={getMeasurementValueClass(m)} style={{ fontWeight: 600 }}>
-                          {formatMeasurementValue(m.value, m.unit, m.qualitative_value)}
+                        <td className={getMeasurementValueClass({ value: originalValue, reference_low: originalReferenceLow, reference_high: originalReferenceHigh })} style={{ fontWeight: 600 }}>
+                          {formatMeasurementValue(originalValue, originalUnit, m.qualitative_value)}
                         </td>
-                        <td>{getDisplayUnit(m.unit) ?? "—"}</td>
-                        <td>{formatReferenceRange(m.reference_low, m.reference_high)}</td>
+                        <td>{getDisplayUnit(originalUnit) ?? "—"}</td>
+                        <td>{formatReferenceRange(originalReferenceLow, originalReferenceHigh)}</td>
                         <td>{formatDate(m.measured_at)}</td>
                         {hasPages && showPageColumn && (
                           <td>

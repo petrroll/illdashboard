@@ -16,6 +16,7 @@ from illdashboard.copilot_service import shutdown_client
 from illdashboard.api import router
 from illdashboard.database import async_session, engine, upgrade_database_schema
 from illdashboard.models import Base, LabFile
+from illdashboard.services.markers import backfill_measurement_type_aliases
 import illdashboard.services.search as search_service
 
 
@@ -115,6 +116,7 @@ async def lifespan(app: FastAPI):
     await upgrade_database_schema(engine)
     # Create FTS5 virtual table for search (not handled by SQLAlchemy metadata)
     async with async_session() as session:
+        await backfill_measurement_type_aliases(session)
         await search_service.ensure_search_schema(session)
         await session.commit()
     # Ensure upload directory exists

@@ -38,6 +38,26 @@ export function formatReferenceRange(
     : "—";
 }
 
+export function getOriginalMeasurementValue(measurement: Pick<Measurement, "original_value" | "value">) {
+  return measurement.original_value ?? measurement.value;
+}
+
+export function getOriginalMeasurementUnit(measurement: Pick<Measurement, "original_unit" | "unit">) {
+  return measurement.original_unit ?? measurement.unit;
+}
+
+export function getOriginalMeasurementReferenceLow(
+  measurement: Pick<Measurement, "original_reference_low" | "reference_low">,
+) {
+  return measurement.original_reference_low ?? measurement.reference_low;
+}
+
+export function getOriginalMeasurementReferenceHigh(
+  measurement: Pick<Measurement, "original_reference_high" | "reference_high">,
+) {
+  return measurement.original_reference_high ?? measurement.reference_high;
+}
+
 export function formatDate(value: string | null, options?: Intl.DateTimeFormatOptions) {
   if (!value) {
     return "—";

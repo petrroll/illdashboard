@@ -48,9 +48,14 @@ class MeasurementType(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
     group_name: Mapped[str] = mapped_column(String, nullable=False)
+    canonical_unit: Mapped[str | None] = mapped_column(String, nullable=True)
 
     measurements: Mapped[list[Measurement]] = relationship(back_populates="measurement_type")
     tags: Mapped[list[MarkerTag]] = relationship(
+        back_populates="measurement_type",
+        cascade="all, delete-orphan",
+    )
+    aliases: Mapped[list[MeasurementAlias]] = relationship(
         back_populates="measurement_type",
         cascade="all, delete-orphan",
     )
@@ -74,10 +79,14 @@ class Measurement(Base):
         index=True,
     )
     value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    original_value: Mapped[float | None] = mapped_column(Float, nullable=True)
     qualitative_value: Mapped[str | None] = mapped_column(String, nullable=True)
     unit: Mapped[str | None] = mapped_column(String, nullable=True)
+    original_unit: Mapped[str | None] = mapped_column(String, nullable=True)
     reference_low: Mapped[float | None] = mapped_column(Float, nullable=True)
     reference_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    original_reference_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    original_reference_high: Mapped[float | None] = mapped_column(Float, nullable=True)
     measured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
@@ -91,6 +100,10 @@ class Measurement(Base):
     @property
     def group_name(self) -> str:
         return self.measurement_type.group_name
+
+    @property
+    def canonical_unit(self) -> str | None:
+        return self.measurement_type.canonical_unit
 
 
 class LabFileTag(Base):
@@ -128,6 +141,24 @@ class MarkerTag(Base):
     @property
     def marker_name(self) -> str:
         return self.measurement_type.name
+
+
+class MeasurementAlias(Base):
+    """A normalized marker alias that points to one canonical measurement type."""
+
+    __tablename__ = "measurement_aliases"
+    __table_args__ = (UniqueConstraint("normalized_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    alias_name: Mapped[str] = mapped_column(String, nullable=False)
+    normalized_key: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
+    measurement_type_id: Mapped[int] = mapped_column(
+        ForeignKey("measurement_types.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    measurement_type: Mapped[MeasurementType] = relationship(back_populates="aliases")
 
 
 class BiomarkerInsight(Base):

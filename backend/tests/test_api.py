@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from illdashboard import config
 from illdashboard.database import create_database_engine
 from illdashboard.main import preload_uploaded_files
-from illdashboard.models import Base, LabFile, LabFileTag, MarkerTag, Measurement, MeasurementType
+from illdashboard.models import Base, LabFile, LabFileTag, MarkerTag, Measurement, MeasurementAlias, MeasurementType
 from illdashboard.services import ocr as ocr_service
 
 
@@ -204,6 +204,28 @@ OVERVIEW_UPDATED_RESULT = {
     ],
 }
 
+CANONICAL_UNIT_RESULT = {
+    "lab_date": "2024-10-29",
+    "measurements": [
+        {
+            "marker_name": "Absolute CD4+ T-Helper Cell Count",
+            "value": 0.38,
+            "unit": "10^9/L",
+            "reference_low": None,
+            "reference_high": None,
+            "measured_at": "2023-02-17",
+        },
+        {
+            "marker_name": "Absolute CD4+ T-Helper Cell Count",
+            "value": 432,
+            "unit": "Zellen/µl",
+            "reference_low": 440,
+            "reference_high": 2160,
+            "measured_at": "2024-10-29",
+        },
+    ],
+}
+
 
 async def _upload_pdf(client, filename: str = "lab.pdf"):
     """Helper: upload a dummy PDF and return the file_id."""
@@ -325,6 +347,62 @@ async def test_reprocess_replaces_old_values(client):
     assert len(measurements) == 1, f"Expected 1 measurement but got {len(measurements)}"
     assert measurements[0]["marker_name"] == "Sodium"
     assert measurements[0]["value"] == 142
+
+
+@pytest.mark.asyncio
+async def test_ocr_persists_original_values_while_marker_views_use_canonical_units(client):
+    file_id = await _upload_pdf(client)
+
+    normalized_payload = {
+        "Absolute CD4+ T-Helper Cell Count": {
+            "canonical_unit": "Zellen/µl",
+            "observations": {
+                "0": {
+                    "normalized_value": 380,
+                    "normalized_reference_low": None,
+                    "normalized_reference_high": None,
+                },
+                "1": {
+                    "normalized_value": 432,
+                    "normalized_reference_low": 440,
+                    "normalized_reference_high": 2160,
+                },
+            },
+        }
+    }
+
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=CANONICAL_UNIT_RESULT), patch(
+        "illdashboard.services.ocr.normalize_marker_names",
+        new=AsyncMock(return_value={"Absolute CD4+ T-Helper Cell Count": "Absolute CD4+ T-Helper Cell Count"}),
+    ), patch(
+        "illdashboard.services.ocr.normalize_numeric_measurements",
+        new=AsyncMock(return_value=normalized_payload),
+    ):
+        resp = await client.post(f"/api/files/{file_id}/ocr")
+
+    assert resp.status_code == 200
+
+    file_measurements = await client.get(f"/api/files/{file_id}/measurements")
+    assert file_measurements.status_code == 200
+    rows = file_measurements.json()
+    assert len(rows) == 2
+    assert rows[0]["value"] == 380
+    assert rows[0]["unit"] == "Zellen/µl"
+    assert rows[0]["original_value"] == 0.38
+    assert rows[0]["original_unit"] == "10^9/L"
+    assert rows[1]["canonical_unit"] == "Zellen/µl"
+
+    marker_detail = await client.get(
+        "/api/measurements/detail",
+        params={"marker_name": "Absolute CD4+ T-Helper Cell Count"},
+    )
+    assert marker_detail.status_code == 200
+    detail = marker_detail.json()
+    assert detail["canonical_unit"] == "Zellen/µl"
+    assert detail["latest_measurement"]["value"] == 432
+    assert detail["previous_measurement"]["value"] == 380
+    assert detail["measurements"][0]["original_value"] == 0.38
+    assert detail["measurements"][0]["original_unit"] == "10^9/L"
 
 
 @pytest.mark.asyncio
@@ -629,15 +707,21 @@ async def test_batch_and_unprocessed_share_job_behavior(client):
     first_file_id = await _upload_pdf(client)
     second_file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT), patch(
+        "illdashboard.services.ocr.normalize_marker_names",
+        new=AsyncMock(return_value={"Sodium": "Sodium", "Potassium": "Potassium"}),
+    ), patch(
+        "illdashboard.services.ocr.normalize_numeric_measurements",
+        new=AsyncMock(return_value={}),
+    ), patch("illdashboard.services.ocr.normalize_source_name", new=AsyncMock(return_value=None)):
         unprocessed_resp = await client.post("/api/files/ocr/unprocessed")
 
-    assert unprocessed_resp.status_code == 200
-    unprocessed_job = await _wait_for_ocr_job(client, unprocessed_resp.json()["job_id"])
-    assert unprocessed_job["status"] == "completed"
-    assert sorted(
-        item["file_id"] for item in unprocessed_job["progress"] if item["status"] == "done"
-    ) == [first_file_id, second_file_id]
+        assert unprocessed_resp.status_code == 200
+        unprocessed_job = await _wait_for_ocr_job(client, unprocessed_resp.json()["job_id"])
+        assert unprocessed_job["status"] == "completed"
+        assert sorted(
+            item["file_id"] for item in unprocessed_job["progress"] if item["status"] == "done"
+        ) == [first_file_id, second_file_id]
 
     batch_result = {
         "lab_date": "2025-09-06",
@@ -652,13 +736,19 @@ async def test_batch_and_unprocessed_share_job_behavior(client):
             }
         ],
     }
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=batch_result):
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=batch_result), patch(
+        "illdashboard.services.ocr.normalize_marker_names",
+        new=AsyncMock(return_value={"Sodium": "Sodium"}),
+    ), patch(
+        "illdashboard.services.ocr.normalize_numeric_measurements",
+        new=AsyncMock(return_value={}),
+    ), patch("illdashboard.services.ocr.normalize_source_name", new=AsyncMock(return_value=None)):
         batch_resp = await client.post("/api/files/ocr/batch", json={"file_ids": [first_file_id]})
 
-    assert batch_resp.status_code == 200
-    batch_job = await _wait_for_ocr_job(client, batch_resp.json()["job_id"])
-    assert batch_job["status"] == "completed"
-    assert [item["file_id"] for item in batch_job["progress"] if item["status"] == "done"] == [first_file_id]
+        assert batch_resp.status_code == 200
+        batch_job = await _wait_for_ocr_job(client, batch_resp.json()["job_id"])
+        assert batch_job["status"] == "completed"
+        assert [item["file_id"] for item in batch_job["progress"] if item["status"] == "done"] == [first_file_id]
 
     measurements_resp = await client.get(f"/api/files/{first_file_id}/measurements")
     assert measurements_resp.status_code == 200
@@ -675,21 +765,110 @@ async def test_batch_ocr_job_reports_processing_before_completion(client):
         await asyncio.sleep(0.02)
         return OCR_RESULT
 
-    with patch("illdashboard.services.ocr.extract_ocr_result", side_effect=slow_extract):
+    with patch("illdashboard.services.ocr.extract_ocr_result", side_effect=slow_extract), patch(
+        "illdashboard.services.ocr.normalize_marker_names",
+        new=AsyncMock(return_value={"Sodium": "Sodium", "Potassium": "Potassium"}),
+    ), patch(
+        "illdashboard.services.ocr.normalize_numeric_measurements",
+        new=AsyncMock(return_value={}),
+    ), patch("illdashboard.services.ocr.normalize_source_name", new=AsyncMock(return_value=None)):
         response = await client.post("/api/files/ocr/batch", json={"file_ids": [file_id]})
 
-    assert response.status_code == 200
-    job_id = response.json()["job_id"]
+        assert response.status_code == 200
+        job_id = response.json()["job_id"]
 
-    status_resp = await client.get(f"/api/files/ocr/jobs/{job_id}")
-    assert status_resp.status_code == 200
-    status_payload = status_resp.json()
-    assert status_payload["status"] in {"queued", "running"}
-    assert any(item["status"] == "processing" for item in status_payload["progress"])
+        status_resp = await client.get(f"/api/files/ocr/jobs/{job_id}")
+        assert status_resp.status_code == 200
+        status_payload = status_resp.json()
+        assert status_payload["status"] in {"queued", "running"}
+        assert any(item["status"] == "processing" for item in status_payload["progress"])
 
-    final_payload = await _wait_for_ocr_job(client, job_id)
-    assert final_payload["status"] == "completed"
-    assert final_payload["completed_count"] == 1
+        final_payload = await _wait_for_ocr_job(client, job_id)
+        assert final_payload["status"] == "completed"
+        assert final_payload["completed_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_ocr_persists_in_request_order_for_progressive_canonicalization(client):
+    first_file_id = await _upload_pdf(client, filename="canonical.pdf")
+    second_file_id = await _upload_pdf(client, filename="alias.pdf")
+
+    canonical_result = {
+        "lab_date": "2025-09-05",
+        "measurements": [
+            {
+                "marker_name": "Canonical Marker",
+                "value": 140,
+                "unit": "mmol/l",
+                "reference_low": 136,
+                "reference_high": 145,
+                "measured_at": "2025-09-05",
+            }
+        ],
+    }
+    alias_result = {
+        "lab_date": "2025-09-06",
+        "measurements": [
+            {
+                "marker_name": "Alias Marker",
+                "value": 141,
+                "unit": "mmol/l",
+                "reference_low": 136,
+                "reference_high": 145,
+                "measured_at": "2025-09-06",
+            }
+        ],
+    }
+
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def extract_side_effect(lab: LabFile):
+        if lab.id == first_file_id:
+            first_started.set()
+            await release_first.wait()
+            return canonical_result
+
+        await first_started.wait()
+        release_first.set()
+        return alias_result
+
+    async def normalize_side_effect(new_names: list[str], existing_canonical: list[str]):
+        if new_names == ["Canonical Marker"]:
+            return {"Canonical Marker": "Canonical Marker"}
+        if new_names == ["Alias Marker"]:
+            if "Canonical Marker" in existing_canonical:
+                return {"Alias Marker": "Canonical Marker"}
+            return {"Alias Marker": "Alias Marker"}
+        return {name: name for name in new_names}
+
+    with patch("illdashboard.services.ocr.extract_ocr_result", side_effect=extract_side_effect), patch(
+        "illdashboard.services.ocr.normalize_marker_names",
+        new=AsyncMock(side_effect=normalize_side_effect),
+    ), patch(
+        "illdashboard.services.ocr.normalize_numeric_measurements",
+        new=AsyncMock(return_value={}),
+    ), patch("illdashboard.services.ocr.normalize_source_name", new=AsyncMock(return_value=None)):
+        response = await client.post("/api/files/ocr/batch", json={"file_ids": [first_file_id, second_file_id]})
+
+        assert response.status_code == 200
+        final_payload = await _wait_for_ocr_job(client, response.json()["job_id"])
+        assert final_payload["status"] == "completed"
+        assert final_payload["completed_count"] == 2
+
+        engine, session_factory = _open_current_test_db()
+        try:
+            async with session_factory() as session:
+                types_result = await session.execute(select(MeasurementType).order_by(MeasurementType.name.asc()))
+                measurement_types = types_result.scalars().all()
+                assert [measurement_type.name for measurement_type in measurement_types] == ["Canonical Marker"]
+
+                measurements_result = await session.execute(select(Measurement).order_by(Measurement.id.asc()))
+                measurements = measurements_result.scalars().all()
+                assert len(measurements) == 2
+                assert len({measurement.measurement_type_id for measurement in measurements}) == 1
+        finally:
+            await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -1051,6 +1230,109 @@ async def test_normalize_existing_markers_merges_measurement_types_and_tags(clie
             assert len(tags) == 1
             assert tags[0].tag == "electrolyte"
             assert tags[0].measurement_type_id == measurements[0].measurement_type_id
+
+            aliases_result = await session.execute(select(MeasurementAlias).order_by(MeasurementAlias.alias_name.asc()))
+            aliases = aliases_result.scalars().all()
+            assert [alias.alias_name for alias in aliases] == ["Na", "Sodium"]
+            assert len({alias.measurement_type_id for alias in aliases}) == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ocr_reuses_alias_mapping_after_marker_merge(client):
+    first_file_id = await _upload_pdf(client)
+    second_file_id = await _upload_pdf(client)
+    third_file_id = await _upload_pdf(client)
+
+    na_result = {
+        "lab_date": "2025-09-05",
+        "measurements": [
+            {
+                "marker_name": "Na",
+                "value": 140,
+                "unit": "mmol/l",
+                "reference_low": 136,
+                "reference_high": 145,
+                "measured_at": "2025-09-05",
+            }
+        ],
+    }
+    sodium_result = {
+        "lab_date": "2025-09-06",
+        "measurements": [
+            {
+                "marker_name": "Sodium",
+                "value": 141,
+                "unit": "mmol/l",
+                "reference_low": 136,
+                "reference_high": 145,
+                "measured_at": "2025-09-06",
+            }
+        ],
+    }
+
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=na_result), patch(
+        "illdashboard.services.ocr.normalize_marker_names",
+        new_callable=AsyncMock,
+        return_value={"Na": "Na"},
+    ), patch(
+        "illdashboard.services.ocr.normalize_numeric_measurements",
+        new=AsyncMock(return_value={}),
+    ):
+        resp = await client.post(f"/api/files/{first_file_id}/ocr")
+        assert resp.status_code == 200
+
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=sodium_result), patch(
+        "illdashboard.services.ocr.normalize_marker_names",
+        new_callable=AsyncMock,
+        return_value={"Sodium": "Sodium"},
+    ), patch(
+        "illdashboard.services.ocr.normalize_numeric_measurements",
+        new=AsyncMock(return_value={}),
+    ):
+        resp = await client.post(f"/api/files/{second_file_id}/ocr")
+        assert resp.status_code == 200
+
+    with patch(
+        "illdashboard.services.ocr.normalize_marker_names",
+        new_callable=AsyncMock,
+        return_value={"Na": "Sodium", "Sodium": "Sodium"},
+    ):
+        normalize_resp = await client.post("/api/measurements/normalize")
+
+    assert normalize_resp.status_code == 200
+
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=na_result), patch(
+        "illdashboard.services.ocr.normalize_marker_names",
+        new=AsyncMock(return_value={"Na": "Na"}),
+    ) as normalize_mock, patch(
+        "illdashboard.services.ocr.normalize_numeric_measurements",
+        new=AsyncMock(return_value={}),
+    ):
+        resp = await client.post(f"/api/files/{third_file_id}/ocr")
+        assert resp.status_code == 200
+        assert normalize_mock.await_count == 0
+
+    detail_resp = await client.get("/api/measurements/detail", params={"marker_name": "Na"})
+    assert detail_resp.status_code == 200
+    assert detail_resp.json()["marker_name"] == "Sodium"
+
+    engine, session_factory = _open_current_test_db()
+    try:
+        async with session_factory() as session:
+            types_result = await session.execute(select(MeasurementType).order_by(MeasurementType.name.asc()))
+            measurement_types = types_result.scalars().all()
+            assert [measurement_type.name for measurement_type in measurement_types] == ["Sodium"]
+
+            aliases_result = await session.execute(select(MeasurementAlias).order_by(MeasurementAlias.alias_name.asc()))
+            aliases = aliases_result.scalars().all()
+            assert [alias.alias_name for alias in aliases] == ["Na", "Sodium"]
+
+            measurements_result = await session.execute(select(Measurement).order_by(Measurement.id.asc()))
+            measurements = measurements_result.scalars().all()
+            assert len(measurements) == 3
+            assert len({measurement.measurement_type_id for measurement in measurements}) == 1
     finally:
         await engine.dispose()
 
