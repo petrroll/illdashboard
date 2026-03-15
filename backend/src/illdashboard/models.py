@@ -59,6 +59,10 @@ class MeasurementType(Base):
         back_populates="measurement_type",
         cascade="all, delete-orphan",
     )
+    rescaling_rules: Mapped[list[RescalingRule]] = relationship(
+        back_populates="measurement_type",
+        cascade="all, delete-orphan",
+    )
     insight: Mapped[BiomarkerInsight | None] = relationship(
         back_populates="measurement_type",
         cascade="all, delete-orphan",
@@ -78,13 +82,12 @@ class Measurement(Base):
         nullable=False,
         index=True,
     )
-    value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    canonical_value: Mapped[float | None] = mapped_column(Float, nullable=True)
     original_value: Mapped[float | None] = mapped_column(Float, nullable=True)
     qualitative_value: Mapped[str | None] = mapped_column(String, nullable=True)
-    unit: Mapped[str | None] = mapped_column(String, nullable=True)
     original_unit: Mapped[str | None] = mapped_column(String, nullable=True)
-    reference_low: Mapped[float | None] = mapped_column(Float, nullable=True)
-    reference_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    canonical_reference_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    canonical_reference_high: Mapped[float | None] = mapped_column(Float, nullable=True)
     original_reference_low: Mapped[float | None] = mapped_column(Float, nullable=True)
     original_reference_high: Mapped[float | None] = mapped_column(Float, nullable=True)
     measured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -159,6 +162,33 @@ class MeasurementAlias(Base):
     )
 
     measurement_type: Mapped[MeasurementType] = relationship(back_populates="aliases")
+
+
+class RescalingRule(Base):
+    """Persisted multiplicative conversion from an original unit to a canonical unit."""
+
+    __tablename__ = "rescaling_rules"
+    __table_args__ = (UniqueConstraint("normalized_original_unit", "normalized_canonical_unit"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    original_unit: Mapped[str] = mapped_column(String, nullable=False)
+    canonical_unit: Mapped[str] = mapped_column(String, nullable=False)
+    scale_factor: Mapped[float | None] = mapped_column(Float, nullable=True)
+    normalized_original_unit: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    normalized_canonical_unit: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    measurement_type_id: Mapped[int | None] = mapped_column(
+        ForeignKey("measurement_types.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    measurement_type: Mapped[MeasurementType | None] = relationship(back_populates="rescaling_rules")
 
 
 class BiomarkerInsight(Base):

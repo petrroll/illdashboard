@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from illdashboard.database import get_db
+from illdashboard.schemas import RescalingRuleOut
 from illdashboard.metrics import get_premium_requests_used
 from illdashboard.services import admin as admin_service
 
@@ -16,6 +17,11 @@ router = APIRouter(prefix="")
 @router.get("/admin/stats", tags=["admin"])
 async def get_stats():
     return {"premium_requests_used": get_premium_requests_used()}
+
+
+@router.get("/admin/rescaling-rules", response_model=list[RescalingRuleOut], tags=["admin"])
+async def get_rescaling_rules(db: AsyncSession = Depends(get_db)):
+    return await admin_service.list_rescaling_rules(db)
 
 
 @router.delete("/admin/cache/explanations", tags=["admin"])

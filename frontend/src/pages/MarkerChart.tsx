@@ -20,6 +20,7 @@ import {
   fetchMarkerTags,
   setMarkerTags,
 } from "../api";
+import StackedMeasurementValue from "../components/StackedMeasurementValue";
 import TagInput from "../components/TagInput";
 import TagFilter from "../components/TagFilter";
 import type {
@@ -33,10 +34,9 @@ import {
   formatReferenceRange,
   getDisplayUnit,
   getMarkerStatusLabel,
-  getOriginalMeasurementReferenceHigh,
-  getOriginalMeasurementReferenceLow,
   getOriginalMeasurementUnit,
   getOriginalMeasurementValue,
+  hasRescaledMeasurementValue,
 } from "../utils/measurements";
 
 const LIST_PANE_STORAGE_KEY = "illdashboard.markerListWidth";
@@ -205,22 +205,22 @@ export default function MarkerChart() {
       measurements.map((measurement) => ({
         dateLabel: formatDate(measurement.measured_at),
         measuredAt: measurement.measured_at ?? "",
-        value: measurement.value,
-        reference_low: measurement.reference_low,
-        reference_high: measurement.reference_high,
+        value: measurement.canonical_value,
+        reference_low: measurement.canonical_reference_low,
+        reference_high: measurement.canonical_reference_high,
       })),
     [measurements],
   );
 
-  const unit = getDisplayUnit(detail?.latest_measurement.unit) ?? "";
-  const refLow = detail?.latest_measurement.reference_low ?? null;
-  const refHigh = detail?.latest_measurement.reference_high ?? null;
+  const unit = getDisplayUnit(detail?.latest_measurement.canonical_unit) ?? "";
+  const refLow = detail?.latest_measurement.canonical_reference_low ?? null;
+  const refHigh = detail?.latest_measurement.canonical_reference_high ?? null;
   const yAxisDomain: [number, number] = useMemo(() => {
     const yAxisValues = measurements.flatMap((measurement) => {
       const values = [
-        measurement.value,
-        measurement.reference_low,
-        measurement.reference_high,
+        measurement.canonical_value,
+        measurement.canonical_reference_low,
+        measurement.canonical_reference_high,
       ];
 
       return values.filter(
@@ -412,8 +412,8 @@ export default function MarkerChart() {
                     const latest = item.latest_measurement;
                     const previous = item.previous_measurement;
                     const delta =
-                      previous && latest.value != null && previous.value != null
-                        ? latest.value - previous.value
+                      previous && latest.canonical_value != null && previous.canonical_value != null
+                        ? latest.canonical_value - previous.canonical_value
                         : null;
                     const otherCount = item.total_count - 1 - (previous ? 1 : 0);
 
@@ -439,11 +439,11 @@ export default function MarkerChart() {
                         </div>
 
                         <div className="marker-row-value">
-                          <strong>{formatMeasurementValue(latest.value, latest.unit, latest.qualitative_value)}</strong>
+                          <strong>{formatMeasurementValue(latest.canonical_value, latest.canonical_unit, latest.qualitative_value)}</strong>
                           <span>
                             {delta == null
                               ? "First result"
-                              : `${delta > 0 ? "+" : ""}${formatMeasurementValue(delta, latest.unit)}`}
+                              : `${delta > 0 ? "+" : ""}${formatMeasurementValue(delta, latest.canonical_unit)}`}
                           </span>
                         </div>
 
@@ -451,7 +451,7 @@ export default function MarkerChart() {
 
                         <div className="marker-row-previous">
                           <strong>
-                            {previous ? formatMeasurementValue(previous.value, previous.unit, previous.qualitative_value) : "—"}
+                            {previous ? formatMeasurementValue(previous.canonical_value, previous.canonical_unit, previous.qualitative_value) : "—"}
                           </strong>
                           {otherCount > 0 && item.value_min != null && item.value_max != null && (
                             <span className="marker-row-history-note">
@@ -516,7 +516,7 @@ export default function MarkerChart() {
             <div className="detail-summary-grid">
               <div className="detail-stat-card">
                 <span>Latest</span>
-                <strong>{formatMeasurementValue(summarySource.latest_measurement.value, summarySource.latest_measurement.unit, summarySource.latest_measurement.qualitative_value)}</strong>
+                <strong>{formatMeasurementValue(summarySource.latest_measurement.canonical_value, summarySource.latest_measurement.canonical_unit, summarySource.latest_measurement.qualitative_value)}</strong>
                 <small>{formatDate(summarySource.latest_measurement.measured_at)}</small>
               </div>
 
@@ -524,7 +524,7 @@ export default function MarkerChart() {
                 <span>Previous</span>
                 <strong>
                   {summarySource.previous_measurement
-                    ? formatMeasurementValue(summarySource.previous_measurement.value, summarySource.previous_measurement.unit, summarySource.previous_measurement.qualitative_value)
+                    ? formatMeasurementValue(summarySource.previous_measurement.canonical_value, summarySource.previous_measurement.canonical_unit, summarySource.previous_measurement.qualitative_value)
                     : "—"}
                 </strong>
                 <small>
@@ -538,11 +538,11 @@ export default function MarkerChart() {
                 <span>Reference range</span>
                 <strong>
                   {formatReferenceRange(
-                    summarySource.latest_measurement.reference_low,
-                    summarySource.latest_measurement.reference_high,
+                    summarySource.latest_measurement.canonical_reference_low,
+                    summarySource.latest_measurement.canonical_reference_high,
                   )}
                 </strong>
-                <small>{getDisplayUnit(summarySource.latest_measurement.unit) ?? "No unit recorded"}</small>
+                <small>{getDisplayUnit(summarySource.latest_measurement.canonical_unit) ?? "No unit recorded"}</small>
               </div>
             </div>
 
@@ -611,12 +611,27 @@ export default function MarkerChart() {
                         .reverse()
                         .map((measurement) => {
                           const filename = measurement.lab_file_filename || `File ${measurement.lab_file_id}`;
+                          const originalValue = getOriginalMeasurementValue(measurement);
+                          const originalUnit = getOriginalMeasurementUnit(measurement);
+                          const showOriginalValue = measurement.qualitative_value == null
+                            && hasRescaledMeasurementValue(measurement);
 
                           return (
                             <tr key={measurement.id}>
                               <td>{formatDate(measurement.measured_at)}</td>
-                              <td>{formatMeasurementValue(getOriginalMeasurementValue(measurement), getOriginalMeasurementUnit(measurement), measurement.qualitative_value)}</td>
-                              <td>{formatReferenceRange(getOriginalMeasurementReferenceLow(measurement), getOriginalMeasurementReferenceHigh(measurement))}</td>
+                              <td>
+                                <StackedMeasurementValue
+                                  primary={formatMeasurementValue(
+                                    measurement.canonical_value,
+                                    measurement.canonical_unit,
+                                    measurement.qualitative_value,
+                                  )}
+                                  secondary={showOriginalValue
+                                    ? formatMeasurementValue(originalValue, originalUnit, measurement.qualitative_value)
+                                    : undefined}
+                                />
+                              </td>
+                              <td>{formatReferenceRange(measurement.canonical_reference_low, measurement.canonical_reference_high)}</td>
                               <td>
                                 <div className="history-source-cell">
                                   <Link

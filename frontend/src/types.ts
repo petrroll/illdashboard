@@ -19,13 +19,12 @@ export interface Measurement {
   lab_file_source_tag?: string | null;
   marker_name: string;
   canonical_unit?: string | null;
-  value: number | null;
+  canonical_value: number | null;
   original_value?: number | null;
   qualitative_value: string | null;
-  unit: string | null;
   original_unit?: string | null;
-  reference_low: number | null;
-  reference_high: number | null;
+  canonical_reference_low: number | null;
+  canonical_reference_high: number | null;
   original_reference_low?: number | null;
   original_reference_high?: number | null;
   measured_at: string | null;
@@ -88,8 +87,12 @@ export interface ExplainResponse {
   explanation: string;
 }
 
-export interface NormalizeMarkersResponse {
-  updated: number;
+export interface RescalingRule {
+  id: number;
+  original_unit: string;
+  canonical_unit: string;
+  scale_factor: number | null;
+  marker_name: string | null;
 }
 
 export interface SearchSnippet {

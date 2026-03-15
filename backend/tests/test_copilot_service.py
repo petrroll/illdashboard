@@ -356,44 +356,17 @@ async def test_normalize_marker_names_splits_large_batches():
 
 
 @pytest.mark.asyncio
-async def test_normalize_numeric_measurements_splits_large_batches():
+async def test_choose_canonical_units_splits_large_batches():
     responses = [
         json.dumps(
             {
-                "Marker 1": {
-                    "canonical_unit": "cells/µL",
-                    "observations": {
-                        "0": {
-                            "normalized_value": 380,
-                            "normalized_reference_low": None,
-                            "normalized_reference_high": None,
-                        }
-                    },
-                },
-                "Marker 2": {
-                    "canonical_unit": "mmol/L",
-                    "observations": {
-                        "1": {
-                            "normalized_value": 4.2,
-                            "normalized_reference_low": 3.5,
-                            "normalized_reference_high": 5.1,
-                        }
-                    },
-                },
+                "Marker 1": {"canonical_unit": "10^9/L"},
+                "Marker 2": {"canonical_unit": "mmol/L"},
             }
         ),
         json.dumps(
             {
-                "Marker 3": {
-                    "canonical_unit": "g/L",
-                    "observations": {
-                        "2": {
-                            "normalized_value": 156,
-                            "normalized_reference_low": 135,
-                            "normalized_reference_high": 175,
-                        }
-                    },
-                }
+                "Marker 3": {"canonical_unit": "g/L"}
             }
         ),
     ]
@@ -427,12 +400,72 @@ async def test_normalize_numeric_measurements_splits_large_batches():
         "UNIT_NORMALIZATION_CONCURRENCY",
         1,
     ), patch("illdashboard.copilot_service._ask", new=AsyncMock(side_effect=responses)) as ask_mock:
-        result = await copilot_service.normalize_numeric_measurements(marker_groups)
+        result = await copilot_service.choose_canonical_units(marker_groups)
 
-    assert result["Marker 1"]["canonical_unit"] == "cells/µL"
-    assert result["Marker 1"]["observations"]["0"]["normalized_value"] == 380
-    assert result["Marker 2"]["canonical_unit"] == "mmol/L"
-    assert result["Marker 3"]["observations"]["2"]["normalized_reference_high"] == 175
+    assert result["Marker 1"] == "10^9/L"
+    assert result["Marker 2"] == "mmol/L"
+    assert result["Marker 3"] == "g/L"
+    assert ask_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_infer_rescaling_factors_splits_large_batches():
+    responses = [
+        json.dumps(
+            {
+                "req-1": {"scale_factor": 0.001},
+                "req-2": {"scale_factor": 1},
+            }
+        ),
+        json.dumps(
+            {
+                "req-3": {"scale_factor": 10}
+            }
+        ),
+    ]
+
+    conversion_requests = [
+        {
+            "id": "req-1",
+            "marker_name": "Marker 1",
+            "original_unit": "cells/µL",
+            "canonical_unit": "10^9/L",
+            "example_value": 380,
+            "reference_low": None,
+            "reference_high": None,
+        },
+        {
+            "id": "req-2",
+            "marker_name": "Marker 2",
+            "original_unit": "mmol/l",
+            "canonical_unit": "mmol/L",
+            "example_value": 4.2,
+            "reference_low": 3.5,
+            "reference_high": 5.1,
+        },
+        {
+            "id": "req-3",
+            "marker_name": "Marker 3",
+            "original_unit": "g/dL",
+            "canonical_unit": "g/L",
+            "example_value": 15.6,
+            "reference_low": 13.5,
+            "reference_high": 17.5,
+        },
+    ]
+
+    with patch.object(copilot_service, "UNIT_NORMALIZATION_BATCH_SIZE", 2), patch.object(
+        copilot_service,
+        "UNIT_NORMALIZATION_CONCURRENCY",
+        1,
+    ), patch("illdashboard.copilot_service._ask", new=AsyncMock(side_effect=responses)) as ask_mock:
+        result = await copilot_service.infer_rescaling_factors(conversion_requests)
+
+    assert result == {
+        "req-1": 0.001,
+        "req-2": 1.0,
+        "req-3": 10.0,
+    }
     assert ask_mock.await_count == 2
 
 
@@ -509,24 +542,15 @@ async def test_normalize_marker_names_reuses_existing_alias_key_without_llm():
 
 
 @pytest.mark.asyncio
-async def test_normalize_numeric_measurements_prompt_mentions_count_conversion_example():
+async def test_choose_canonical_units_prompt_mentions_count_conversion_example():
     response = json.dumps(
         {
-            "Absolute CD4+ T-Helper Cell Count": {
-                "canonical_unit": "Zellen/µl",
-                "observations": {
-                    "0": {
-                        "normalized_value": 380,
-                        "normalized_reference_low": None,
-                        "normalized_reference_high": None,
-                    }
-                },
-            }
+            "Absolute CD4+ T-Helper Cell Count": {"canonical_unit": "10^9/L"}
         }
     )
 
     with patch("illdashboard.copilot_service._ask", new=AsyncMock(return_value=response)) as ask_mock:
-        result = await copilot_service.normalize_numeric_measurements(
+        result = await copilot_service.choose_canonical_units(
             [
                 {
                     "marker_name": "Absolute CD4+ T-Helper Cell Count",
@@ -534,8 +558,8 @@ async def test_normalize_numeric_measurements_prompt_mentions_count_conversion_e
                     "observations": [
                         {
                             "id": "0",
-                            "value": 0.38,
-                            "unit": "10^9/L",
+                            "value": 380,
+                            "unit": "Zellen/µl",
                             "reference_low": None,
                             "reference_high": None,
                         }
@@ -544,19 +568,21 @@ async def test_normalize_numeric_measurements_prompt_mentions_count_conversion_e
             ]
         )
 
-    assert result["Absolute CD4+ T-Helper Cell Count"]["canonical_unit"] == "Zellen/µl"
+    assert result["Absolute CD4+ T-Helper Cell Count"] == "10^9/L"
 
     assert ask_mock.await_args is not None
     system_prompt, user_prompt = ask_mock.await_args.args
-    assert "0.38 in 10^9/L is 380 in /µL" in system_prompt
+    assert "Prefer language-neutral, internationally recognizable units such as 10^9/L" in system_prompt
+    assert "prefer 10^9/L over Zellen/µl, cells/µL, tys./µl, or tis./ul" in system_prompt
+    assert "380 /µL, 380 cells/µL, and 0.38 10^9/L should canonicalize to 0.38 10^9/L" in system_prompt
     assert "Marker: Absolute CD4+ T-Helper Cell Count" in user_prompt
-    assert "id=0; value=0.38; unit=10^9/L" in user_prompt
+    assert "value=380; unit=Zellen/µl" in user_prompt
 
 
 @pytest.mark.asyncio
-async def test_normalize_numeric_measurements_skips_homogeneous_units_without_llm():
+async def test_choose_canonical_units_skips_homogeneous_units_without_llm():
     with patch("illdashboard.copilot_service._ask", new=AsyncMock()) as ask_mock:
-        result = await copilot_service.normalize_numeric_measurements(
+        result = await copilot_service.choose_canonical_units(
             [
                 {
                     "marker_name": "Sodium",
@@ -581,13 +607,37 @@ async def test_normalize_numeric_measurements_skips_homogeneous_units_without_ll
             ]
         )
 
-    assert result == {
-        "Sodium": {
-            "canonical_unit": "mmol/L",
-            "observations": {},
-        }
-    }
+    assert result == {"Sodium": "mmol/L"}
     ask_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_infer_rescaling_factors_prompt_mentions_count_conversion_example():
+    response = json.dumps({"zellen/ul=>10^9/l": {"scale_factor": 0.001}})
+
+    with patch("illdashboard.copilot_service._ask", new=AsyncMock(return_value=response)) as ask_mock:
+        result = await copilot_service.infer_rescaling_factors(
+            [
+                {
+                    "id": "zellen/ul=>10^9/l",
+                    "marker_name": "Absolute CD4+ T-Helper Cell Count",
+                    "original_unit": "Zellen/µl",
+                    "canonical_unit": "10^9/L",
+                    "example_value": 380,
+                    "reference_low": 440,
+                    "reference_high": 2160,
+                }
+            ]
+        )
+
+    assert result == {"zellen/ul=>10^9/l": 0.001}
+
+    assert ask_mock.await_args is not None
+    system_prompt, user_prompt = ask_mock.await_args.args
+    assert "converting /µL to 10^9/L uses a factor of 0.001" in system_prompt
+    assert "id=zellen/ul=>10^9/l" in user_prompt
+    assert "original_unit=Zellen/µl" in user_prompt
+    assert "canonical_unit=10^9/L" in user_prompt
 
 
 @pytest.mark.asyncio

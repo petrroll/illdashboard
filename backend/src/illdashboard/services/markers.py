@@ -407,9 +407,9 @@ async def merge_measurement_types(source: MeasurementType, target: MeasurementTy
 
 
 def measurement_status(measurement: Measurement) -> str:
-    reference_low = measurement.reference_low
-    reference_high = measurement.reference_high
-    value = measurement.value
+    reference_low = measurement.canonical_reference_low
+    reference_high = measurement.canonical_reference_high
+    value = measurement.canonical_value
 
     if value is None:
         return "no_range"
@@ -424,9 +424,9 @@ def measurement_status(measurement: Measurement) -> str:
 
 
 def range_position(measurement: Measurement) -> float | None:
-    reference_low = measurement.reference_low
-    reference_high = measurement.reference_high
-    value = measurement.value
+    reference_low = measurement.canonical_reference_low
+    reference_high = measurement.canonical_reference_high
+    value = measurement.canonical_value
 
     if value is None or reference_low is None or reference_high is None or reference_high <= reference_low:
         return None
@@ -436,7 +436,7 @@ def range_position(measurement: Measurement) -> float | None:
 def build_marker_payload(measurements: list[Measurement]) -> dict:
     latest = measurements[-1]
     previous = measurements[-2] if len(measurements) > 1 else None
-    values = [measurement.value for measurement in measurements if measurement.value is not None]
+    values = [measurement.canonical_value for measurement in measurements if measurement.canonical_value is not None]
     return {
         "marker_name": latest.marker_name,
         "group_name": latest.group_name,

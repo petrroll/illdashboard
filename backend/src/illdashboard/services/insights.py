@@ -19,14 +19,14 @@ def marker_signature(measurements: list[Measurement]) -> str:
         "count": len(measurements),
         "latest": {
             "id": latest.id,
-            "value": latest.value,
+            "value": latest.canonical_value,
             "measured_at": latest.measured_at.isoformat() if latest.measured_at else None,
-            "reference_low": latest.reference_low,
-            "reference_high": latest.reference_high,
+            "reference_low": latest.canonical_reference_low,
+            "reference_high": latest.canonical_reference_high,
         },
         "previous": {
             "id": previous.id,
-            "value": previous.value,
+            "value": previous.canonical_value,
             "measured_at": previous.measured_at.isoformat() if previous and previous.measured_at else None,
         }
         if previous
@@ -39,10 +39,10 @@ def serialize_history_for_ai(measurements: list[Measurement]) -> list[dict]:
     return [
         {
             "date": measurement.measured_at.date().isoformat() if measurement.measured_at else "unknown date",
-            "value": measurement.value,
-            "unit": measurement.unit,
-            "reference_low": measurement.reference_low,
-            "reference_high": measurement.reference_high,
+            "value": measurement.canonical_value,
+            "unit": measurement.canonical_unit,
+            "reference_low": measurement.canonical_reference_low,
+            "reference_high": measurement.canonical_reference_high,
         }
         for measurement in measurements[-8:]
     ]
@@ -52,15 +52,15 @@ def fallback_marker_explanation(marker_name: str, measurements: list[Measurement
     latest = measurements[-1]
     previous = measurements[-2] if len(measurements) > 1 else None
     status = measurement_status(latest).replace("_", " ")
-    unit_suffix = f" {latest.unit}" if latest.unit else ""
+    unit_suffix = f" {latest.canonical_unit}" if latest.canonical_unit else ""
     parts = [
         f"## {marker_name}",
-        f"Latest value: **{latest.value:g}{unit_suffix}**. Status: **{status}**.",
+        f"Latest value: **{latest.canonical_value:g}{unit_suffix}**. Status: **{status}**.",
     ]
 
-    if latest.reference_low is not None and latest.reference_high is not None:
+    if latest.canonical_reference_low is not None and latest.canonical_reference_high is not None:
         parts.append(
-            f"Reference range from the report: **{latest.reference_low:g} to {latest.reference_high:g}{unit_suffix}**."
+            f"Reference range from the report: **{latest.canonical_reference_low:g} to {latest.canonical_reference_high:g}{unit_suffix}**."
         )
 
     if status == "low":
@@ -77,7 +77,7 @@ def fallback_marker_explanation(marker_name: str, measurements: list[Measurement
         )
 
     if previous is not None:
-        delta = latest.value - previous.value
+        delta = latest.canonical_value - previous.canonical_value
         direction = "up" if delta > 0 else "down" if delta < 0 else "unchanged"
         parts.append(
             f"Compared with the previous result, the marker is **{direction}** by **{abs(delta):g}{unit_suffix}**."

@@ -21,7 +21,6 @@ from illdashboard.schemas import (
 )
 from illdashboard.services import insights as insight_service
 from illdashboard.services import markers as marker_service
-from illdashboard.services import ocr as ocr_service
 from illdashboard.sparkline import generate_sparkline, get_cached_sparkline
 
 
@@ -209,16 +208,10 @@ async def measurement_sparkline(
         return Response(content=cached, media_type="image/png", headers={"Cache-Control": "no-store"})
 
     png_bytes = generate_sparkline(
-        values=[measurement.value for measurement in measurements],
-        ref_low=measurements[-1].reference_low,
-        ref_high=measurements[-1].reference_high,
+        values=[measurement.canonical_value for measurement in measurements],
+        ref_low=measurements[-1].canonical_reference_low,
+        ref_high=measurements[-1].canonical_reference_high,
         signature=signature,
         marker_name=marker_name,
     )
     return Response(content=png_bytes, media_type="image/png", headers={"Cache-Control": "no-store"})
-
-
-@router.post("/measurements/normalize", tags=["measurements"])
-async def normalize_existing_markers(db: AsyncSession = Depends(get_db)):
-    updated = await ocr_service.normalize_existing_measurements(db)
-    return {"updated": updated}

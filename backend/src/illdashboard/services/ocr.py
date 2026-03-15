@@ -20,8 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from illdashboard.config import settings
-from illdashboard.copilot_service import normalize_marker_names, normalize_numeric_measurements, normalize_source_name, ocr_extract
-from illdashboard.models import LabFile, LabFileTag, Measurement, MeasurementType
+from illdashboard.copilot_service import choose_canonical_units, infer_rescaling_factors, normalize_marker_names, normalize_source_name, ocr_extract
+from illdashboard.models import LabFile, LabFileTag, Measurement, MeasurementType, RescalingRule
 import illdashboard.services.search as search_service
 from illdashboard.services.markers import (
     backfill_measurement_type_aliases,
@@ -36,6 +36,7 @@ from illdashboard.services.markers import (
     normalize_source_tag_value,
     source_tag_value,
 )
+from illdashboard.services.rescaling import apply_scale_factor, load_rescaling_rules, normalize_unit_key, units_equivalent, upsert_rescaling_rule
 
 
 logger = logging.getLogger(__name__)
@@ -313,6 +314,8 @@ async def apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list
             for alias_name in (raw_name, deterministic_map[raw_name])
         ],
     )
+    await db.flush()
+    measurement_types = await _load_measurement_types_by_name(db, [canonical_map[raw] for raw in raw_names])
 
     parsed_measurements: list[dict] = []
     numeric_groups: dict[str, dict] = {}
@@ -367,9 +370,45 @@ async def apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list
         )
 
     try:
-        normalized_groups = await normalize_numeric_measurements(list(numeric_groups.values()))
+        canonical_units = await choose_canonical_units(list(numeric_groups.values()))
     except Exception:
-        normalized_groups = {}
+        canonical_units = {}
+
+    for canonical_name, measurement_type in measurement_types.items():
+        canonical_unit = canonical_units.get(canonical_name) or measurement_type.canonical_unit
+        if canonical_unit and measurement_type.canonical_unit != canonical_unit:
+            measurement_type.canonical_unit = canonical_unit
+
+    await db.flush()
+    measurement_types = await _load_measurement_types_by_name(db, [canonical_map[raw] for raw in raw_names])
+
+    conversion_requests: list[dict] = []
+    seen_request_ids: set[str] = set()
+    for parsed in parsed_measurements:
+        if parsed["value"] is None:
+            continue
+        canonical_unit = measurement_types[parsed["canonical_name"]].canonical_unit or parsed["original_unit"]
+        original_unit = parsed["original_unit"]
+        if original_unit is None or canonical_unit is None or units_equivalent(original_unit, canonical_unit):
+            continue
+
+        request_id = _rescaling_request_id(original_unit, canonical_unit)
+        if request_id in seen_request_ids:
+            continue
+        seen_request_ids.add(request_id)
+        conversion_requests.append(
+            {
+                "id": request_id,
+                "marker_name": parsed["canonical_name"],
+                "original_unit": original_unit,
+                "canonical_unit": canonical_unit,
+                "example_value": parsed["value"],
+                "reference_low": parsed["original_reference_low"],
+                "reference_high": parsed["original_reference_high"],
+            }
+        )
+
+    rule_map = await _resolve_rescaling_rule_map(db, conversion_requests, measurement_types)
 
     new_measurements: list[Measurement] = []
     for parsed in parsed_measurements:
@@ -387,30 +426,26 @@ async def apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list
         ref_low = parsed["original_reference_low"]
         ref_high = parsed["original_reference_high"]
 
-        normalized_group = normalized_groups.get(canonical_name, {})
-        normalized_observation = normalized_group.get("observations", {}).get(str(parsed["index"]), {})
-        canonical_unit = (
-            normalized_group.get("canonical_unit")
-            or measurement_types[canonical_name].canonical_unit
-            or parsed["original_unit"]
+        canonical_unit = measurement_types[canonical_name].canonical_unit or parsed["original_unit"]
+        original_unit = _prefer_canonical_unit_text(parsed["original_unit"], canonical_unit)
+        normalized_value, normalized_ref_low, normalized_ref_high = _apply_rescaling_rule(
+            value=value,
+            reference_low=ref_low,
+            reference_high=ref_high,
+            original_unit=original_unit,
+            canonical_unit=canonical_unit,
+            rule_map=rule_map,
         )
-        normalized_value = normalized_observation.get("normalized_value", value)
-        normalized_ref_low = normalized_observation.get("normalized_reference_low", ref_low)
-        normalized_ref_high = normalized_observation.get("normalized_reference_high", ref_high)
-
-        if value is not None and canonical_unit and measurement_types[canonical_name].canonical_unit != canonical_unit:
-            measurement_types[canonical_name].canonical_unit = canonical_unit
 
         model = Measurement(
             lab_file_id=lab.id,
             measurement_type=measurement_types[canonical_name],
-            value=normalized_value,
+            canonical_value=normalized_value,
             original_value=value,
             qualitative_value=qualitative_value,
-            unit=canonical_unit if value is not None else measurement.get("unit"),
-            original_unit=measurement.get("unit"),
-            reference_low=normalized_ref_low,
-            reference_high=normalized_ref_high,
+            original_unit=original_unit,
+            canonical_reference_low=normalized_ref_low,
+            canonical_reference_high=normalized_ref_high,
             original_reference_low=ref_low,
             original_reference_high=ref_high,
             measured_at=measured_at or lab.lab_date,
@@ -526,6 +561,109 @@ def _make_progress(*, lab: LabFile, index: int, total: int, status: str, error: 
         status=status,
         error=error,
     )
+
+
+async def _load_measurement_types_by_name(db: AsyncSession, names: list[str]) -> dict[str, MeasurementType]:
+    unique_names = list(dict.fromkeys(name for name in names if name))
+    if not unique_names:
+        return {}
+
+    result = await db.execute(
+        select(MeasurementType)
+        .where(MeasurementType.name.in_(unique_names))
+        .order_by(MeasurementType.id.asc())
+    )
+    return {measurement_type.name: measurement_type for measurement_type in result.scalars().all()}
+
+
+def _rescaling_request_id(original_unit: str, canonical_unit: str) -> str:
+    original_key = normalize_unit_key(original_unit) or original_unit.strip()
+    canonical_key = normalize_unit_key(canonical_unit) or canonical_unit.strip()
+    return f"{original_key}=>{canonical_key}"
+
+
+async def _resolve_rescaling_rule_map(
+    db: AsyncSession,
+    conversion_requests: list[dict],
+    measurement_types: dict[str, MeasurementType],
+) -> dict[tuple[str, str], RescalingRule]:
+    if not conversion_requests:
+        return {}
+
+    requested_pairs = [(request["original_unit"], request["canonical_unit"]) for request in conversion_requests]
+    rule_map = await load_rescaling_rules(db, requested_pairs)
+
+    missing_requests = []
+    for request in conversion_requests:
+        original_key = normalize_unit_key(request["original_unit"])
+        canonical_key = normalize_unit_key(request["canonical_unit"])
+        if original_key is None or canonical_key is None:
+            continue
+        if (original_key, canonical_key) not in rule_map:
+            missing_requests.append(request)
+
+    if missing_requests:
+        try:
+            inferred_factors = await infer_rescaling_factors(missing_requests)
+        except Exception:
+            inferred_factors = {}
+
+        for request in missing_requests:
+            scale_factor = inferred_factors.get(request["id"])
+            if scale_factor is None:
+                continue
+            await upsert_rescaling_rule(
+                db,
+                original_unit=request["original_unit"],
+                canonical_unit=request["canonical_unit"],
+                scale_factor=scale_factor,
+                measurement_type=measurement_types.get(request["marker_name"]),
+            )
+
+        await db.flush()
+        rule_map = await load_rescaling_rules(db, requested_pairs)
+
+    return rule_map
+
+
+def _apply_rescaling_rule(
+    *,
+    value: float | None,
+    reference_low: float | None,
+    reference_high: float | None,
+    original_unit: str | None,
+    canonical_unit: str | None,
+    rule_map: dict[tuple[str, str], RescalingRule],
+) -> tuple[float | None, float | None, float | None]:
+    if units_equivalent(original_unit, canonical_unit) or original_unit is None or canonical_unit is None:
+        return value, reference_low, reference_high
+
+    original_key = normalize_unit_key(original_unit)
+    canonical_key = normalize_unit_key(canonical_unit)
+    if original_key is None or canonical_key is None:
+        return value, reference_low, reference_high
+
+    rule = rule_map.get((original_key, canonical_key))
+    scale_factor = getattr(rule, "scale_factor", None)
+    if scale_factor is None:
+        logger.warning(
+            "No rescaling factor available for original_unit=%s canonical_unit=%s; keeping original numeric values",
+            original_unit,
+            canonical_unit,
+        )
+        return value, reference_low, reference_high
+
+    return (
+        apply_scale_factor(value, scale_factor),
+        apply_scale_factor(reference_low, scale_factor),
+        apply_scale_factor(reference_high, scale_factor),
+    )
+
+
+def _prefer_canonical_unit_text(original_unit: str | None, canonical_unit: str | None) -> str | None:
+    if canonical_unit is not None and units_equivalent(original_unit, canonical_unit):
+        return canonical_unit
+    return original_unit
 
 
 def _job_status_payload(job: OcrJobState) -> dict:
@@ -834,181 +972,3 @@ async def load_labs_for_ocr(
         return list(result.scalars().all())
 
     return []
-
-
-async def normalize_existing_measurements(db: AsyncSession) -> int:
-    await backfill_measurement_type_aliases(db)
-
-    result = await db.execute(select(MeasurementType).order_by(MeasurementType.id.asc()))
-    measurement_types = result.scalars().all()
-
-    deterministic_map = {
-        measurement_type.name: normalize_marker_name_deterministic(measurement_type.name)
-        for measurement_type in measurement_types
-    }
-    cleaned_names = list(dict.fromkeys(deterministic_map.values()))
-
-    try:
-        llm_map = await normalize_marker_names(
-            cleaned_names,
-            [measurement_type.name for measurement_type in measurement_types],
-        )
-    except Exception:
-        llm_map = {name: name for name in cleaned_names}
-
-    canonical_map = {
-        raw_name: llm_map.get(deterministic_map[raw_name], deterministic_map[raw_name])
-        for raw_name in deterministic_map
-    }
-    type_by_name = {measurement_type.name: measurement_type for measurement_type in measurement_types}
-    updated = 0
-
-    await ensure_measurement_types(db, list(canonical_map.values()))
-
-    for raw_name, canonical_name in canonical_map.items():
-        measurement_type = type_by_name[raw_name]
-        if canonical_name == raw_name:
-            expected_group = classify_marker_group(canonical_name)
-            if measurement_type.group_name != expected_group:
-                measurement_type.group_name = expected_group
-                updated += 1
-            continue
-
-        target = await get_measurement_type_by_name(db, canonical_name)
-        if target is None:
-            old_name = measurement_type.name
-            measurement_type.name = canonical_name
-            measurement_type.group_name = classify_marker_group(canonical_name)
-            await db.flush()
-            await ensure_measurement_type_aliases(db, [(old_name, measurement_type), (canonical_name, measurement_type)])
-            updated += 1
-            type_by_name[canonical_name] = measurement_type
-            continue
-
-        await ensure_measurement_type_aliases(db, [(raw_name, target), (canonical_name, target)])
-        await merge_measurement_types(measurement_type, target, db)
-        updated += 1
-
-    await backfill_measurement_type_aliases(db)
-
-    result = await db.execute(
-        select(MeasurementType)
-        .options(selectinload(MeasurementType.measurements))
-        .order_by(MeasurementType.id.asc())
-    )
-    measurement_types = result.scalars().all()
-    numeric_groups: list[dict] = []
-
-    for measurement_type in measurement_types:
-        observations: list[dict] = []
-        for measurement in measurement_type.measurements:
-            if measurement.qualitative_value is not None:
-                continue
-
-            original_value = measurement.original_value if measurement.original_value is not None else measurement.value
-            original_unit = measurement.original_unit if measurement.original_unit is not None else measurement.unit
-            original_reference_low = (
-                measurement.original_reference_low
-                if measurement.original_reference_low is not None
-                else measurement.reference_low
-            )
-            original_reference_high = (
-                measurement.original_reference_high
-                if measurement.original_reference_high is not None
-                else measurement.reference_high
-            )
-
-            if measurement.original_value != original_value:
-                measurement.original_value = original_value
-                updated += 1
-            if measurement.original_unit != original_unit:
-                measurement.original_unit = original_unit
-                updated += 1
-            if measurement.original_reference_low != original_reference_low:
-                measurement.original_reference_low = original_reference_low
-                updated += 1
-            if measurement.original_reference_high != original_reference_high:
-                measurement.original_reference_high = original_reference_high
-                updated += 1
-
-            if original_value is None:
-                continue
-
-            observations.append(
-                {
-                    "id": str(measurement.id),
-                    "value": original_value,
-                    "unit": original_unit,
-                    "reference_low": original_reference_low,
-                    "reference_high": original_reference_high,
-                }
-            )
-
-        if observations:
-            numeric_groups.append(
-                {
-                    "marker_name": measurement_type.name,
-                    "existing_canonical_unit": measurement_type.canonical_unit,
-                    "observations": observations,
-                }
-            )
-
-    try:
-        normalized_groups = await normalize_numeric_measurements(numeric_groups)
-    except Exception:
-        normalized_groups = {}
-
-    for measurement_type in measurement_types:
-        normalized_group = normalized_groups.get(measurement_type.name, {})
-        canonical_unit = (
-            normalized_group.get("canonical_unit")
-            or measurement_type.canonical_unit
-            or next(
-                (
-                    measurement.original_unit or measurement.unit
-                    for measurement in measurement_type.measurements
-                    if measurement.qualitative_value is None and (measurement.original_unit or measurement.unit)
-                ),
-                None,
-            )
-        )
-        if measurement_type.canonical_unit != canonical_unit:
-            measurement_type.canonical_unit = canonical_unit
-            updated += 1
-
-        for measurement in measurement_type.measurements:
-            if measurement.qualitative_value is not None:
-                continue
-
-            original_value = measurement.original_value if measurement.original_value is not None else measurement.value
-            original_reference_low = (
-                measurement.original_reference_low
-                if measurement.original_reference_low is not None
-                else measurement.reference_low
-            )
-            original_reference_high = (
-                measurement.original_reference_high
-                if measurement.original_reference_high is not None
-                else measurement.reference_high
-            )
-            normalized_observation = normalized_group.get("observations", {}).get(str(measurement.id), {})
-            normalized_value = normalized_observation.get("normalized_value", original_value)
-            normalized_reference_low = normalized_observation.get("normalized_reference_low", original_reference_low)
-            normalized_reference_high = normalized_observation.get("normalized_reference_high", original_reference_high)
-
-            if measurement.value != normalized_value:
-                measurement.value = normalized_value
-                updated += 1
-            if measurement.unit != canonical_unit:
-                measurement.unit = canonical_unit
-                updated += 1
-            if measurement.reference_low != normalized_reference_low:
-                measurement.reference_low = normalized_reference_low
-                updated += 1
-            if measurement.reference_high != normalized_reference_high:
-                measurement.reference_high = normalized_reference_high
-                updated += 1
-
-    await db.commit()
-    await search_service.rebuild_lab_search_index(db)
-    return updated

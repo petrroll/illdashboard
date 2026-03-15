@@ -23,6 +23,7 @@ from copilot.types import CopilotClientOptions, MessageOptions
 from illdashboard.config import settings
 from illdashboard.metrics import add_premium_requests
 from illdashboard.services.markers import normalize_marker_alias_key
+from illdashboard.services.rescaling import normalize_unit_key
 
 
 logger = logging.getLogger(__name__)
@@ -858,30 +859,55 @@ Do not include any commentary outside the JSON.\
 """
 
 
-UNIT_NORMALIZE_SYSTEM_PROMPT = """\
+UNIT_CANONICAL_SYSTEM_PROMPT = """\
 You are a medical lab unit normalization assistant. The user will give you one or more
 marker groups. Each group contains:
 1. One canonical marker name.
 2. An optional existing canonical unit already used in the database.
-3. One or more numeric observations from lab reports, each with an id, a reported value,
+3. One or more numeric observations from lab reports, each with a reported value,
      a reported unit, and optional reference bounds.
 
 For each marker group:
-- Reuse the existing canonical unit when one is provided, unless it is clearly wrong.
+- Reuse the existing canonical unit when one is provided, unless it is clearly wrong,
+    language-specific, or less universal than a standard scientific notation.
 - If no canonical unit exists yet, choose one concise canonical unit that is medically standard
     and consistent across that marker's observations.
-- Convert every numeric value and reference bound into the canonical unit when the conversion is
-    clear and exact.
-- Keep null reference bounds as null.
-- If the conversion is unclear, keep the original numbers unchanged and keep the reported unit as
-    the canonical unit for that marker group.
+- Prefer language-neutral, internationally recognizable units such as 10^9/L, 10^12/L,
+    g/L, mmol/L, µmol/L, U/L, ng/L, or % when appropriate.
+- Avoid language-specific or locale-specific unit labels when a universal equivalent exists,
+    for example prefer 10^9/L over Zellen/µl, cells/µL, tys./µl, or tis./ul.
 - Treat unit-only formatting differences as equivalent, such as mmol/l vs mmol/L.
-- Be careful with count units. For example, 0.38 in 10^9/L is 380 in /µL.
+- Be careful with count units. Prefer the more universal notation when equivalent count units are
+    mixed. For example, 380 /µL, 380 cells/µL, and 0.38 10^9/L should canonicalize to 0.38 10^9/L.
 
 Return ONLY valid JSON as an object keyed by marker name. Each value must be an object with:
 - "canonical_unit": string or null
-- "observations": object keyed by observation id, where each value contains
-    "normalized_value", "normalized_reference_low", and "normalized_reference_high".
+
+Do not include commentary outside the JSON.\
+"""
+
+
+UNIT_SCALE_SYSTEM_PROMPT = """\
+You are a medical lab unit conversion assistant. The user will give you one or more
+conversion requests. Each request contains:
+1. A request id.
+2. A marker name for clinical context.
+3. An original unit.
+4. A canonical target unit.
+5. One or more example numeric values and optional reference bounds.
+
+For each request:
+- Return a multiplicative scale factor that converts numbers in the original unit into the
+    canonical target unit.
+- The factor must satisfy: canonical_value = original_value * scale_factor.
+- Use a factor of 1 when the units are equivalent formatting variants.
+- If the conversion is unclear or not safely inferable as a simple multiplicative conversion,
+    return null.
+- Be careful with count units. For example, converting /µL to 10^9/L uses a factor of 0.001,
+    and converting 10^9/L to /µL uses a factor of 1000.
+
+Return ONLY valid JSON as an object keyed by request id. Each value must be an object with:
+- "scale_factor": number or null
 
 Do not include commentary outside the JSON.\
 """
@@ -905,26 +931,11 @@ def _coerce_normalized_number(value) -> float | None:
         return None
 
 
-def _normalize_unit_equivalence_key(unit: str | None) -> str | None:
-    if unit is None:
-        return None
-
-    normalized = unit.strip()
-    if not normalized:
-        return None
-
-    normalized = normalized.replace("μ", "µ")
-    normalized = re.sub(r"\s+", "", normalized)
-    normalized = normalized.casefold()
-    normalized = normalized.replace("µ", "u")
-    return normalized or None
-
-
 def _normalize_marker_lookup_key(name: str) -> str:
     return normalize_marker_alias_key(re.sub(r"\[[^\]]*\]", " ", name))
 
 
-def _default_numeric_normalization(group: dict) -> dict:
+def _default_canonical_unit(group: dict) -> str | None:
     canonical_unit = group.get("existing_canonical_unit") or next(
         (
             observation.get("unit")
@@ -935,25 +946,24 @@ def _default_numeric_normalization(group: dict) -> dict:
     )
     if isinstance(canonical_unit, str):
         canonical_unit = canonical_unit.strip() or None
-    return {
-        "canonical_unit": canonical_unit,
-        "observations": {},
-    }
+    return canonical_unit
 
 
 def _unit_key_likely_requires_llm(unit_key: str | None) -> bool:
     if unit_key is None:
         return False
-    return bool(re.search(r"(?:^|[^a-z])(?:10\^?\d+|x10\^?\d+)", unit_key))
+    if re.fullmatch(r"(?:10\^?\d+|x10\^?\d+)/l", unit_key):
+        return False
+    return bool(re.search(r"(?:cells?|zellen|tys|tis|/ul|/μl|/µl)", unit_key))
 
 
-def _can_skip_numeric_normalization(group: dict) -> bool:
+def _can_skip_canonical_unit_selection(group: dict) -> bool:
     observation_unit_keys = {
         unit_key
         for observation in group.get("observations", [])
-        if (unit_key := _normalize_unit_equivalence_key(observation.get("unit"))) is not None
+        if (unit_key := normalize_unit_key(observation.get("unit"))) is not None
     }
-    existing_unit_key = _normalize_unit_equivalence_key(group.get("existing_canonical_unit"))
+    existing_unit_key = normalize_unit_key(group.get("existing_canonical_unit"))
 
     if existing_unit_key is not None:
         return not observation_unit_keys or observation_unit_keys == {existing_unit_key}
@@ -1092,23 +1102,23 @@ async def normalize_source_name(
     return normalized_source or None
 
 
-async def normalize_numeric_measurements(marker_groups: list[dict]) -> dict[str, dict]:
-    """Use the LLM to choose canonical units and rescale numeric values by marker."""
+async def choose_canonical_units(marker_groups: list[dict]) -> dict[str, str | None]:
+    """Use the LLM to choose canonical units for numeric marker groups."""
     if not marker_groups:
         return {}
 
-    normalized: dict[str, dict] = {}
+    canonical_units: dict[str, str | None] = {}
     unresolved_groups: list[dict] = []
     for group in marker_groups:
-        if _can_skip_numeric_normalization(group):
-            normalized[group["marker_name"]] = _default_numeric_normalization(group)
+        if _can_skip_canonical_unit_selection(group):
+            canonical_units[group["marker_name"]] = _default_canonical_unit(group)
             continue
         unresolved_groups.append(group)
 
     if not unresolved_groups:
-        return normalized
+        return canonical_units
 
-    async def _normalize_batch(batch_groups: list[dict]) -> dict[str, dict]:
+    async def _normalize_batch(batch_groups: list[dict]) -> dict[str, str | None]:
         user_text = "MARKER groups to normalize:\n"
         for group in batch_groups:
             user_text += f"\n- Marker: {group['marker_name']}\n"
@@ -1116,7 +1126,6 @@ async def normalize_numeric_measurements(marker_groups: list[dict]) -> dict[str,
             user_text += "  Observations:\n"
             for observation in group.get("observations", []):
                 user_text += (
-                    f"  - id={observation['id']}; "
                     f"value={observation['value']}; "
                     f"unit={observation.get('unit') or '(none)'}; "
                     f"reference_low={observation.get('reference_low')}; "
@@ -1124,11 +1133,11 @@ async def normalize_numeric_measurements(marker_groups: list[dict]) -> dict[str,
                 )
 
         try:
-            payload = _parse_json_response(await _ask(UNIT_NORMALIZE_SYSTEM_PROMPT, user_text))
+            payload = _parse_json_response(await _ask(UNIT_CANONICAL_SYSTEM_PROMPT, user_text))
         except (json.JSONDecodeError, ValueError):
             payload = {}
 
-        normalized: dict[str, dict] = {}
+        normalized: dict[str, str | None] = {}
         for group in batch_groups:
             marker_name = group["marker_name"]
             group_payload = payload.get(marker_name) if isinstance(payload, dict) else None
@@ -1137,34 +1146,11 @@ async def normalize_numeric_measurements(marker_groups: list[dict]) -> dict[str,
 
             canonical_unit = group_payload.get("canonical_unit")
             if not isinstance(canonical_unit, str) or not canonical_unit.strip():
-                canonical_unit = group.get("existing_canonical_unit") or next(
-                    (
-                        observation.get("unit")
-                        for observation in group.get("observations", [])
-                        if observation.get("unit")
-                    ),
-                    None,
-                )
+                canonical_unit = _default_canonical_unit(group)
             else:
                 canonical_unit = canonical_unit.strip()
 
-            observation_payload = group_payload.get("observations")
-            normalized_observations: dict[str, dict[str, float | None]] = {}
-            if isinstance(observation_payload, dict):
-                for observation in group.get("observations", []):
-                    raw_result = observation_payload.get(observation["id"])
-                    if not isinstance(raw_result, dict):
-                        continue
-                    normalized_observations[observation["id"]] = {
-                        "normalized_value": _coerce_normalized_number(raw_result.get("normalized_value")),
-                        "normalized_reference_low": _coerce_normalized_number(raw_result.get("normalized_reference_low")),
-                        "normalized_reference_high": _coerce_normalized_number(raw_result.get("normalized_reference_high")),
-                    }
-
-            normalized[marker_name] = {
-                "canonical_unit": canonical_unit,
-                "observations": normalized_observations,
-            }
+            normalized[marker_name] = canonical_unit
 
         return normalized
 
@@ -1174,15 +1160,59 @@ async def normalize_numeric_measurements(marker_groups: list[dict]) -> dict[str,
     ]
     semaphore = asyncio.Semaphore(UNIT_NORMALIZATION_CONCURRENCY)
 
-    async def _run_batch(batch_groups: list[dict]) -> dict[str, dict]:
+    async def _run_batch(batch_groups: list[dict]) -> dict[str, str | None]:
         async with semaphore:
             return await _normalize_batch(batch_groups)
 
-    merged_mapping: dict[str, dict] = dict(normalized)
+    merged_mapping: dict[str, str | None] = dict(canonical_units)
     for batch_mapping in await asyncio.gather(*[_run_batch(batch) for batch in batches]):
         merged_mapping.update(batch_mapping)
 
     return merged_mapping
+
+
+async def infer_rescaling_factors(conversion_requests: list[dict]) -> dict[str, float | None]:
+    """Use the LLM to infer multiplicative scale factors for source/target unit pairs."""
+    if not conversion_requests:
+        return {}
+
+    batches = [
+        conversion_requests[index:index + UNIT_NORMALIZATION_BATCH_SIZE]
+        for index in range(0, len(conversion_requests), UNIT_NORMALIZATION_BATCH_SIZE)
+    ]
+    semaphore = asyncio.Semaphore(UNIT_NORMALIZATION_CONCURRENCY)
+
+    async def _run_batch(batch_requests: list[dict]) -> dict[str, float | None]:
+        user_text = "Conversion requests:\n"
+        for request in batch_requests:
+            user_text += (
+                f"\n- id={request['id']}; "
+                f"marker={request.get('marker_name') or '(unknown)'}; "
+                f"original_unit={request.get('original_unit') or '(none)'}; "
+                f"canonical_unit={request.get('canonical_unit') or '(none)'}; "
+                f"example_value={request.get('example_value')}; "
+                f"reference_low={request.get('reference_low')}; "
+                f"reference_high={request.get('reference_high')}\n"
+            )
+
+        try:
+            payload = _parse_json_response(await _ask(UNIT_SCALE_SYSTEM_PROMPT, user_text))
+        except (json.JSONDecodeError, ValueError):
+            payload = {}
+
+        result: dict[str, float | None] = {}
+        for request in batch_requests:
+            request_payload = payload.get(request["id"]) if isinstance(payload, dict) else None
+            if not isinstance(request_payload, dict):
+                result[request["id"]] = None
+                continue
+            result[request["id"]] = _coerce_normalized_number(request_payload.get("scale_factor"))
+        return result
+
+    merged: dict[str, float | None] = {}
+    for batch_mapping in await asyncio.gather(*[_run_batch(batch) for batch in batches]):
+        merged.update(batch_mapping)
+    return merged
 
 
 # ── Explanations ─────────────────────────────────────────────────────────────

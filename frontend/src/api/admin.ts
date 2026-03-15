@@ -18,8 +18,21 @@ export interface ResetDatabaseResult {
   deleted_sparklines: number;
 }
 
+export interface RescalingRule {
+  id: number;
+  original_unit: string;
+  canonical_unit: string;
+  scale_factor: number | null;
+  marker_name: string | null;
+}
+
 export async function fetchAdminStats() {
   const response = await apiClient.get<AdminStats>("/admin/stats");
+  return response.data;
+}
+
+export async function fetchRescalingRules() {
+  const response = await apiClient.get<RescalingRule[]>("/admin/rescaling-rules");
   return response.data;
 }
 

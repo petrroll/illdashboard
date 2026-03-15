@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from illdashboard.database import engine
-from illdashboard.models import Base, BiomarkerInsight
+from illdashboard.models import Base, BiomarkerInsight, RescalingRule
 from illdashboard.sparkline import SPARKLINE_CACHE_DIR
 
 
@@ -34,3 +35,12 @@ async def reset_database() -> int:
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
     return purge_sparkline_cache()
+
+
+async def list_rescaling_rules(db: AsyncSession) -> list[RescalingRule]:
+    result = await db.execute(
+        select(RescalingRule)
+        .options(selectinload(RescalingRule.measurement_type))
+        .order_by(RescalingRule.original_unit.asc(), RescalingRule.canonical_unit.asc())
+    )
+    return list(result.scalars().all())

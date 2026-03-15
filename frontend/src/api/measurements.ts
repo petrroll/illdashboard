@@ -4,7 +4,6 @@ import type {
   MarkerInsightResponse,
   MarkerOverviewGroup,
   Measurement,
-  NormalizeMarkersResponse,
 } from "../types";
 
 function buildTagQueryParams(tags: string[]) {
@@ -43,10 +42,5 @@ export async function fetchMarkerInsight(markerName: string) {
   const response = await apiClient.get<MarkerInsightResponse>("/measurements/insight", {
     params: { marker_name: markerName },
   });
-  return response.data;
-}
-
-export async function normalizeMarkers() {
-  const response = await apiClient.post<NormalizeMarkersResponse>("/measurements/normalize");
   return response.data;
 }

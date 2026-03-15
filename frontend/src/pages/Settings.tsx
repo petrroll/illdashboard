@@ -5,7 +5,7 @@ import {
   fetchMarkerNames,
   fetchMeasurements,
   fetchAdminStats,
-  normalizeMarkers,
+  fetchRescalingRules,
   purgeAllCaches,
   purgeExplanationCache,
   resetDatabase,
@@ -13,6 +13,7 @@ import {
 import type {
   LabFile,
   Measurement,
+  RescalingRule,
 } from "../types";
 import {
   formatDate,
@@ -27,7 +28,6 @@ import {
 } from "../utils/measurements";
 
 type SettingsAction =
-  | "normalize-markers"
   | "purge-explanations"
   | "purge-all"
   | "drop-db";
@@ -41,12 +41,6 @@ interface SettingsActionDefinition {
 }
 
 const settingsActions: SettingsActionDefinition[] = [
-  {
-    id: "normalize-markers",
-    label: "Normalize Markers & Units",
-    loadingLabel: "Normalizing…",
-    description: "Merge duplicate biomarker names, choose canonical units, and rescale stored numeric values.",
-  },
   {
     id: "purge-explanations",
     label: "Purge Explanations Cache",
@@ -70,13 +64,6 @@ const settingsActions: SettingsActionDefinition[] = [
 
 async function performSettingsAction(action: SettingsAction) {
   switch (action) {
-    case "normalize-markers": {
-      const response = await normalizeMarkers();
-      return {
-        message: `Normalized markers and units. Updated ${response.updated} rows.`,
-        shouldReload: true,
-      };
-    }
     case "purge-explanations": {
       const response = await purgeExplanationCache();
       return {
@@ -105,23 +92,26 @@ export default function Settings() {
   const [files, setFiles] = useState<LabFile[]>([]);
   const [markers, setMarkers] = useState<string[]>([]);
   const [recentMeasurements, setRecentMeasurements] = useState<Measurement[]>([]);
+  const [rescalingRules, setRescalingRules] = useState<RescalingRule[]>([]);
   const [copilotRequestCount, setCopilotRequestCount] = useState<number | null>(null);
   const [actionResult, setActionResult] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
   const [loading, setLoading] = useState<string | null>(null);
 
   const loadSettingsData = useCallback(async () => {
-    const [filesResponse, markersResponse, measurementsResponse, statsResponse] = await Promise.all([
+    const [filesResponse, markersResponse, measurementsResponse, statsResponse, rescalingRulesResponse] = await Promise.all([
       fetchFiles(),
       fetchMarkerNames(),
       fetchMeasurements(),
       fetchAdminStats(),
+      fetchRescalingRules(),
     ]);
 
     setFiles(filesResponse);
     setMarkers(markersResponse);
     setRecentMeasurements(measurementsResponse.slice(-10));
     setCopilotRequestCount(statsResponse.premium_requests_used);
+    setRescalingRules(rescalingRulesResponse);
   }, []);
 
   useEffect(() => {
@@ -144,6 +134,7 @@ export default function Settings() {
         setFiles([]);
         setMarkers([]);
         setRecentMeasurements([]);
+        setRescalingRules([]);
       } else if (result.shouldReload) {
         await loadSettingsData();
       }
@@ -245,6 +236,36 @@ export default function Settings() {
                   </tr>
                 );
               })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="card">
+        <h3 style={{ marginBottom: "0.75rem" }}>Rescaling Rules</h3>
+        {rescalingRules.length === 0 ? (
+          <p style={{ color: "var(--text-muted)" }}>
+            No persisted unit rescaling rules yet. They will appear here as unit pairs are learned.
+          </p>
+        ) : (
+          <table>
+            <thead>
+              <tr>
+                <th>Original Unit</th>
+                <th>Canonical Unit</th>
+                <th>Scale Factor</th>
+                <th>Marker</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rescalingRules.map((rule) => (
+                <tr key={rule.id}>
+                  <td>{rule.original_unit}</td>
+                  <td>{rule.canonical_unit}</td>
+                  <td>{rule.scale_factor == null ? "—" : rule.scale_factor}</td>
+                  <td>{rule.marker_name ?? "—"}</td>
+                </tr>
+              ))}
             </tbody>
           </table>
         )}

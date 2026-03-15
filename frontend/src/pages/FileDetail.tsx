@@ -12,9 +12,11 @@ import {
   setFileTags,
   type PageInfo,
 } from "../api";
+import StackedMeasurementValue from "../components/StackedMeasurementValue";
 import TagInput from "../components/TagInput";
 import type { LabFile, Measurement, ExplainRequest } from "../types";
 import {
+  areUnitsEquivalent,
   formatDate,
   formatDateTime,
   formatMeasurementValue,
@@ -25,6 +27,7 @@ import {
   getOriginalMeasurementReferenceLow,
   getOriginalMeasurementUnit,
   getOriginalMeasurementValue,
+  hasRescaledMeasurementValue,
 } from "../utils/measurements";
 
 export default function FileDetail() {
@@ -341,10 +344,18 @@ export default function FileDetail() {
                 </thead>
                 <tbody>
                   {filteredMeasurements.map((m) => {
+                    const canonicalValue = m.canonical_value;
+                    const canonicalUnit = m.canonical_unit;
+                    const canonicalReferenceLow = m.canonical_reference_low;
+                    const canonicalReferenceHigh = m.canonical_reference_high;
                     const originalValue = getOriginalMeasurementValue(m);
                     const originalUnit = getOriginalMeasurementUnit(m);
                     const originalReferenceLow = getOriginalMeasurementReferenceLow(m);
                     const originalReferenceHigh = getOriginalMeasurementReferenceHigh(m);
+                    const showOriginalValue = m.qualitative_value == null && hasRescaledMeasurementValue(m);
+                    const showOriginalReference = m.qualitative_value == null
+                      && (originalReferenceLow !== canonicalReferenceLow || originalReferenceHigh !== canonicalReferenceHigh);
+                    const showOriginalUnit = !areUnitsEquivalent(originalUnit, canonicalUnit);
 
                     return (
                       <tr key={m.id}>
@@ -358,11 +369,28 @@ export default function FileDetail() {
                           </label>
                         </td>
                         <td style={{ fontWeight: 500 }}>{m.marker_name}</td>
-                        <td className={getMeasurementValueClass({ value: originalValue, reference_low: originalReferenceLow, reference_high: originalReferenceHigh })} style={{ fontWeight: 600 }}>
-                          {formatMeasurementValue(originalValue, originalUnit, m.qualitative_value)}
+                        <td className={getMeasurementValueClass({ value: canonicalValue, reference_low: canonicalReferenceLow, reference_high: canonicalReferenceHigh })}>
+                          <StackedMeasurementValue
+                            primary={formatMeasurementValue(canonicalValue, canonicalUnit, m.qualitative_value)}
+                            secondary={showOriginalValue
+                              ? formatMeasurementValue(originalValue, originalUnit, m.qualitative_value)
+                              : undefined}
+                          />
                         </td>
-                        <td>{getDisplayUnit(originalUnit) ?? "—"}</td>
-                        <td>{formatReferenceRange(originalReferenceLow, originalReferenceHigh)}</td>
+                        <td>
+                          <StackedMeasurementValue
+                            primary={getDisplayUnit(canonicalUnit) ?? "—"}
+                            secondary={showOriginalUnit ? getDisplayUnit(originalUnit) ?? "—" : undefined}
+                          />
+                        </td>
+                        <td>
+                          <StackedMeasurementValue
+                            primary={formatReferenceRange(canonicalReferenceLow, canonicalReferenceHigh)}
+                            secondary={showOriginalReference
+                              ? formatReferenceRange(originalReferenceLow, originalReferenceHigh)
+                              : undefined}
+                          />
+                        </td>
                         <td>{formatDate(m.measured_at)}</td>
                         {hasPages && showPageColumn && (
                           <td>

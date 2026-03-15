@@ -46,13 +46,12 @@ class MeasurementOut(BaseModel):
     lab_file_source_tag: str | None = None
     marker_name: str
     canonical_unit: str | None = None
-    value: float | None = None
+    canonical_value: float | None = None
     original_value: float | None = None
     qualitative_value: str | None = None
-    unit: str | None = None
     original_unit: str | None = None
-    reference_low: float | None = None
-    reference_high: float | None = None
+    canonical_reference_low: float | None = None
+    canonical_reference_high: float | None = None
     original_reference_low: float | None = None
     original_reference_high: float | None = None
     measured_at: datetime | None = None
@@ -82,13 +81,12 @@ class MeasurementOut(BaseModel):
                 "lab_file_source_tag": source_tag,
                 "marker_name": measurement_type.name,
                 "canonical_unit": measurement_type.canonical_unit,
-                "value": data.value,
+                "canonical_value": data.canonical_value,
                 "original_value": data.original_value,
                 "qualitative_value": data.qualitative_value,
-                "unit": data.unit,
                 "original_unit": data.original_unit,
-                "reference_low": data.reference_low,
-                "reference_high": data.reference_high,
+                "canonical_reference_low": data.canonical_reference_low,
+                "canonical_reference_high": data.canonical_reference_high,
                 "original_reference_low": data.original_reference_low,
                 "original_reference_high": data.original_reference_high,
                 "measured_at": data.measured_at,
@@ -219,3 +217,28 @@ class SearchResultOut(BaseModel):
     tags: list[str] = Field(default_factory=list)
     marker_names: list[str] = Field(default_factory=list)
     snippets: list[SearchSnippet] = Field(default_factory=list)
+
+
+class RescalingRuleOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    original_unit: str
+    canonical_unit: str
+    scale_factor: float | None = None
+    marker_name: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_marker_name(cls, data: Any):
+        if isinstance(data, dict):
+            return data
+        if hasattr(data, "__table__"):
+            return {
+                "id": data.id,
+                "original_unit": data.original_unit,
+                "canonical_unit": data.canonical_unit,
+                "scale_factor": data.scale_factor,
+                "marker_name": getattr(getattr(data, "measurement_type", None), "name", None),
+            }
+        return data
