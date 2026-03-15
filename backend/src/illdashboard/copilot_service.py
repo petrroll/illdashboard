@@ -230,8 +230,60 @@ def _parse_json_response(raw: str) -> dict:
     return json.loads(raw.strip())
 
 
+async def _ask_json(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    attachments: list | None = None,
+    timeout: float = 120,
+    default: dict | None = None,
+) -> dict:
+    raw = await _ask(system_prompt, user_prompt, attachments=attachments, timeout=timeout)
+    try:
+        return _parse_json_response(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        if default is None:
+            raise
+        return default
+
+
 def _chunk_items(items: list, chunk_size: int) -> list[list]:
     return [items[index:index + chunk_size] for index in range(0, len(items), chunk_size)]
+
+
+async def _run_json_batches(
+    items: list,
+    *,
+    batch_size: int,
+    concurrency: int,
+    system_prompt: str,
+    build_user_text: Callable[[list], str],
+    parse_payload: Callable[[dict, list], dict],
+) -> list[dict]:
+    async def _run_batch(batch_items: list) -> dict:
+        payload = await _ask_json(system_prompt, build_user_text(batch_items), default={})
+        return parse_payload(payload, batch_items)
+
+    return await _run_batched_tasks(
+        items,
+        batch_size=batch_size,
+        concurrency=concurrency,
+        run_batch=_run_batch,
+    )
+
+
+def _build_marker_name_normalization_user_text(batch_names: list[str], existing_canonical: list[str]) -> str:
+    user_text = "EXISTING canonical marker names:\n"
+    if existing_canonical:
+        for name in existing_canonical:
+            user_text += f"- {name}\n"
+    else:
+        user_text += "(none yet)\n"
+
+    user_text += "\nNEW marker names to normalize:\n"
+    for name in batch_names:
+        user_text += f"- {name}\n"
+    return user_text
 
 
 def _build_marker_group_user_text(batch_groups: list[MarkerUnitGroup]) -> str:
@@ -248,6 +300,16 @@ def _build_marker_group_user_text(batch_groups: list[MarkerUnitGroup]) -> str:
                 f"reference_high={observation.reference_high}\n"
             )
     return user_text
+
+
+def _parse_marker_name_response(payload: dict, batch_names: list[str]) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for name in batch_names:
+        canonical_name = payload.get(name) if isinstance(payload, dict) else None
+        if not isinstance(canonical_name, str) or not canonical_name.strip():
+            canonical_name = name
+        normalized[name] = canonical_name.strip()
+    return normalized
 
 
 def _parse_canonical_unit_response(payload: dict, batch_groups: list[MarkerUnitGroup]) -> dict[str, str | None]:
@@ -515,13 +577,12 @@ async def _extract_structured_medical_data_from_attachments(
     if filename:
         prompt = f"Original filename: {filename}\n\n{prompt}"
 
-    raw = await _ask(
+    return await _ask_json(
         MEDICAL_OCR_SYSTEM_PROMPT,
         prompt,
         attachments=attachments,
         timeout=OCR_ASK_TIMEOUT,
     )
-    return _parse_json_response(raw)
 
 
 async def _extract_document_text_from_attachments(attachments: list[dict], *, filename: str | None = None) -> dict:
@@ -529,13 +590,12 @@ async def _extract_document_text_from_attachments(attachments: list[dict], *, fi
     if filename:
         prompt = f"Original filename: {filename}\n\n{prompt}"
 
-    raw = await _ask(
+    return await _ask_json(
         TEXT_OCR_SYSTEM_PROMPT,
         prompt,
         attachments=attachments,
         timeout=OCR_ASK_TIMEOUT,
     )
-    return _parse_json_response(raw)
 
 
 async def _generate_medical_summary(
@@ -549,11 +609,10 @@ async def _generate_medical_summary(
         "translated_text_english": (text_result or {}).get("translated_text_english"),
         "medical_extraction": medical_result,
     }
-    raw = await _ask(
+    parsed = await _ask_json(
         MEDICAL_SUMMARY_SYSTEM_PROMPT,
         json.dumps(user_payload, ensure_ascii=False, indent=2),
     )
-    parsed = _parse_json_response(raw)
     summary = parsed.get("summary_english")
     return summary.strip() if isinstance(summary, str) and summary.strip() else None
 
@@ -618,22 +677,31 @@ def _combine_ocr_outputs(medical_result: dict, text_result: dict | None, summary
     return combined
 
 
+@dataclass(frozen=True)
+class _ExtractionKind:
+    """Configuration for a type of file extraction (structured medical vs free-form text)."""
+
+    label: str
+    extract_fn: Callable[..., Awaitable[dict]]
+    merge_fn: Callable[[list[dict]], dict]
+    post_process_fn: Callable[[dict, int], dict] | None = None
+
+
 async def _pdf_batch_extract(
     pdf_path: str,
+    kind: _ExtractionKind,
     *,
     start_page: int,
     stop_page: int,
     dpi: int,
     filename: str | None = None,
-    extract_fn: Callable[..., Awaitable[dict]],
     render_cache: _PdfRenderCache | None = None,
 ) -> dict:
     temp_images: list[str] = []
     started_at = time.perf_counter()
-    batch_label = getattr(extract_fn, "__name__", "attachment_extract")
     logger.info(
-        "Starting PDF batch extract kind=%s path=%s filename=%s pages=%s-%s dpi=%s",
-        batch_label,
+        "PDF batch extract start kind=%s path=%s filename=%s pages=%s-%s dpi=%s",
+        kind.label,
         pdf_path,
         filename,
         start_page + 1,
@@ -650,10 +718,10 @@ async def _pdf_batch_extract(
                 stop_page=stop_page,
                 dpi=dpi,
             )
-        result = await extract_fn(attachments, filename=filename)
+        result = await kind.extract_fn(attachments, filename=filename)
         logger.info(
-            "Finished PDF batch extract kind=%s path=%s filename=%s pages=%s-%s dpi=%s duration=%.2fs",
-            batch_label,
+            "PDF batch extract done kind=%s path=%s filename=%s pages=%s-%s dpi=%s duration=%.2fs",
+            kind.label,
             pdf_path,
             filename,
             start_page + 1,
@@ -665,7 +733,7 @@ async def _pdf_batch_extract(
     except Exception:
         logger.exception(
             "PDF batch extract failed kind=%s path=%s filename=%s pages=%s-%s dpi=%s after %.2fs",
-            batch_label,
+            kind.label,
             pdf_path,
             filename,
             start_page + 1,
@@ -682,54 +750,21 @@ async def _pdf_batch_extract(
                 pass
 
 
-async def _extract_structured_medical_data_pdf_batch(
-    pdf_path: str,
-    *,
-    start_page: int,
-    stop_page: int,
-    dpi: int,
-    filename: str | None = None,
-    render_cache: _PdfRenderCache | None = None,
-) -> dict:
-    return await _pdf_batch_extract(
-        pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi,
-        filename=filename, extract_fn=_extract_structured_medical_data_from_attachments, render_cache=render_cache,
-    )
-
-
-async def _extract_document_text_from_pdf_batch(
-    pdf_path: str,
-    *,
-    start_page: int,
-    stop_page: int,
-    dpi: int,
-    filename: str | None = None,
-    render_cache: _PdfRenderCache | None = None,
-) -> dict:
-    return await _pdf_batch_extract(
-        pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi,
-        filename=filename, extract_fn=_extract_document_text_from_attachments, render_cache=render_cache,
-    )
-
-
 async def _pdf_range_with_retries(
     pdf_path: str,
+    kind: _ExtractionKind,
     *,
     start_page: int,
     stop_page: int,
     dpi: int = OCR_PDF_RENDER_DPI,
     filename: str | None = None,
-    batch_fn: Callable[..., Awaitable[dict]],
-    merge_fn: Callable[[list[dict]], dict],
-    post_process_fn: Callable[[dict, int], dict] | None = None,
-    label: str,
     render_cache: _PdfRenderCache | None = None,
 ) -> dict:
     page_count = stop_page - start_page
     started_at = time.perf_counter()
     logger.info(
         "%s range start path=%s filename=%s pages=%s-%s dpi=%s page_count=%s",
-        label,
+        kind.label,
         pdf_path,
         filename,
         start_page + 1,
@@ -741,7 +776,7 @@ async def _pdf_range_with_retries(
     async def _retry(**overrides) -> dict:
         logger.info(
             "%s retry scheduled path=%s filename=%s pages=%s-%s dpi=%s overrides=%s delay=%ss",
-            label,
+            kind.label,
             pdf_path,
             filename,
             start_page + 1,
@@ -755,18 +790,16 @@ async def _pdf_range_with_retries(
         kw.update(overrides)
         return await _pdf_range_with_retries(
             pdf_path,
+            kind,
             filename=filename,
-            batch_fn=batch_fn,
-            merge_fn=merge_fn,
-            post_process_fn=post_process_fn,
-            label=label,
             render_cache=render_cache,
             **kw,
         )
 
     try:
-        result = await batch_fn(
+        result = await _pdf_batch_extract(
             pdf_path,
+            kind,
             start_page=start_page,
             stop_page=stop_page,
             dpi=dpi,
@@ -775,7 +808,7 @@ async def _pdf_range_with_retries(
         )
         logger.info(
             "%s range success path=%s filename=%s pages=%s-%s dpi=%s duration=%.2fs",
-            label,
+            kind.label,
             pdf_path,
             filename,
             start_page + 1,
@@ -783,222 +816,111 @@ async def _pdf_range_with_retries(
             dpi,
             time.perf_counter() - started_at,
         )
-        return post_process_fn(result, start_page) if post_process_fn else result
+        return kind.post_process_fn(result, start_page) if kind.post_process_fn else result
     except Exception as exc:
         retry_reason = _retryable_pdf_error_reason(exc)
         if not _is_retryable_pdf_error(exc):
             logger.exception(
                 "%s extraction failed for %s (filename=%s, pages=%s-%s, dpi=%s)",
-                label, pdf_path, filename, start_page + 1, stop_page, dpi,
+                kind.label, pdf_path, filename, start_page + 1, stop_page, dpi,
             )
             raise
 
         if page_count > 1 and (_is_request_timeout_error(exc) or _is_rate_limited_error(exc)):
             logger.warning(
                 "%s batch request failed for %s (filename=%s, pages=%s-%s, dpi=%s, reason=%s); falling back to single-page retries",
-                label, pdf_path, filename, start_page + 1, stop_page, dpi, retry_reason,
+                kind.label, pdf_path, filename, start_page + 1, stop_page, dpi, retry_reason,
             )
             results = [await _retry(start_page=p, stop_page=p + 1) for p in range(start_page, stop_page)]
-            return merge_fn(results)
+            return kind.merge_fn(results)
 
         if page_count > 1:
             logger.warning(
                 "%s batch request failed for %s (filename=%s, pages=%s-%s, dpi=%s, reason=%s); splitting batch",
-                label, pdf_path, filename, start_page + 1, stop_page, dpi, retry_reason,
+                kind.label, pdf_path, filename, start_page + 1, stop_page, dpi, retry_reason,
             )
             midpoint = start_page + math.ceil(page_count / 2)
             left = await _retry(start_page=start_page, stop_page=midpoint)
             right = await _retry(start_page=midpoint, stop_page=stop_page)
-            return merge_fn([left, right])
+            return kind.merge_fn([left, right])
 
         smaller_dpi = max(OCR_PDF_MIN_RENDER_DPI, dpi - 24)
         if smaller_dpi != dpi:
             logger.warning(
                 "%s page request failed for %s (filename=%s, page=%s, dpi=%s, reason=%s); retrying at dpi=%s",
-                label, pdf_path, filename, start_page + 1, dpi, retry_reason, smaller_dpi,
+                kind.label, pdf_path, filename, start_page + 1, dpi, retry_reason, smaller_dpi,
             )
             return await _retry(dpi=smaller_dpi)
 
         logger.exception(
             "%s extraction failed at minimum DPI for %s (filename=%s, page=%s, dpi=%s)",
-            label, pdf_path, filename, start_page + 1, dpi,
+            kind.label, pdf_path, filename, start_page + 1, dpi,
         )
         raise
 
 
-async def _extract_structured_medical_data_pdf_range(pdf_path: str, **kwargs) -> dict:
-    return await _pdf_range_with_retries(
-        pdf_path,
-        batch_fn=_extract_structured_medical_data_pdf_batch,
-        merge_fn=_merge_structured_medical_results,
-        post_process_fn=_offset_result_page_numbers,
-        label="Structured medical PDF",
-        **kwargs,
-    )
-
-
-async def _extract_document_text_from_pdf_range(pdf_path: str, **kwargs) -> dict:
-    return await _pdf_range_with_retries(
-        pdf_path,
-        batch_fn=_extract_document_text_from_pdf_batch,
-        merge_fn=_merge_document_text_results,
-        label="OCR text",
-        **kwargs,
-    )
-
-
-async def _run_pdf_batches_parallel(
-    pdf_path: str,
-    *,
-    page_count: int,
-    filename: str | None,
-    range_fn: Callable[..., Awaitable[dict]],
-    merge_fn: Callable[[list[dict]], dict],
-    render_cache: _PdfRenderCache | None = None,
-) -> dict:
-    semaphore = asyncio.Semaphore(OCR_PDF_BATCH_CONCURRENCY)
-
-    async def _run_single_batch(start_page: int, stop_page: int) -> dict:
-        async with semaphore:
-            return await range_fn(
-                pdf_path,
-                start_page=start_page,
-                stop_page=stop_page,
-                filename=filename,
-                render_cache=render_cache,
-            )
-
-    tasks = [
-        asyncio.create_task(
-            _run_single_batch(start_page, min(start_page + OCR_PDF_BATCH_SIZE, page_count))
-        )
-        for start_page in range(0, page_count, OCR_PDF_BATCH_SIZE)
-    ]
-    return merge_fn(await asyncio.gather(*tasks))
-
-
-async def _extract_pdf_in_batches(
-    pdf_path: str,
-    *,
-    filename: str | None,
-    label: str,
-    range_fn: Callable[..., Awaitable[dict]],
-    merge_fn: Callable[[list[dict]], dict],
-    render_cache: _PdfRenderCache | None = None,
-) -> dict:
-    with fitz.open(pdf_path) as doc:
-        page_count = doc.page_count
-
-    started_at = time.perf_counter()
-    logger.info("%s start path=%s filename=%s page_count=%s", label, pdf_path, filename, page_count)
-    result = await _run_pdf_batches_parallel(
-        pdf_path,
-        page_count=page_count,
-        filename=filename,
-        range_fn=range_fn,
-        merge_fn=merge_fn,
-        render_cache=render_cache,
-    )
-    logger.info(
-        "%s finished path=%s filename=%s page_count=%s duration=%.2fs",
-        label,
-        pdf_path,
-        filename,
-        page_count,
-        time.perf_counter() - started_at,
-    )
-    return result
-
-
-async def _extract_structured_medical_data_from_pdf(
-    pdf_path: str,
-    *,
-    filename: str | None = None,
-    render_cache: _PdfRenderCache | None = None,
-) -> dict:
-    return await _extract_pdf_in_batches(
-        pdf_path,
-        filename=filename,
-        label="Structured medical PDF",
-        range_fn=_extract_structured_medical_data_pdf_range,
-        merge_fn=_merge_structured_medical_results,
-        render_cache=render_cache,
-    )
-
-
-async def _extract_document_text_from_pdf(
-    pdf_path: str,
-    *,
-    filename: str | None = None,
-    render_cache: _PdfRenderCache | None = None,
-) -> dict:
-    return await _extract_pdf_in_batches(
-        pdf_path,
-        filename=filename,
-        label="Document text PDF",
-        range_fn=_extract_document_text_from_pdf_range,
-        merge_fn=_merge_document_text_results,
-        render_cache=render_cache,
-    )
-
-
-async def _extract_file_with_optional_pdf_batches(
+async def _extract_file(
     file_path: str,
+    kind: _ExtractionKind,
     *,
-    filename: str | None,
-    label: str,
-    pdf_extract_fn: Callable[..., Awaitable[dict]],
-    attachment_extract_fn: Callable[..., Awaitable[dict]],
+    filename: str | None = None,
     render_cache: _PdfRenderCache | None = None,
 ) -> dict:
-    started_at = time.perf_counter()
-    logger.info("%s start path=%s filename=%s", label, file_path, filename)
+    """Extract data from a file using the given extraction kind.
 
-    if Path(file_path).suffix.lower() == ".pdf":
-        result = await pdf_extract_fn(file_path, filename=filename, render_cache=render_cache)
+    For PDFs, pages are processed in parallel batches with automatic retry
+    on failure (batch split, DPI reduction). For images, the file is sent
+    directly.
+    """
+    started_at = time.perf_counter()
+    logger.info("%s start path=%s filename=%s", kind.label, file_path, filename)
+
+    if Path(file_path).suffix.lower() != ".pdf":
+        result = await kind.extract_fn([{"type": "file", "path": file_path}], filename=filename)
     else:
-        result = await attachment_extract_fn([{"type": "file", "path": file_path}], filename=filename)
+        with fitz.open(file_path) as doc:
+            page_count = doc.page_count
+
+        semaphore = asyncio.Semaphore(OCR_PDF_BATCH_CONCURRENCY)
+
+        async def _run_range(start_page: int, stop_page: int) -> dict:
+            async with semaphore:
+                return await _pdf_range_with_retries(
+                    file_path,
+                    kind,
+                    start_page=start_page,
+                    stop_page=stop_page,
+                    filename=filename,
+                    render_cache=render_cache,
+                )
+
+        tasks = [
+            asyncio.create_task(
+                _run_range(s, min(s + OCR_PDF_BATCH_SIZE, page_count))
+            )
+            for s in range(0, page_count, OCR_PDF_BATCH_SIZE)
+        ]
+        result = kind.merge_fn(await asyncio.gather(*tasks))
 
     logger.info(
         "%s finished path=%s filename=%s duration=%.2fs",
-        label,
-        file_path,
-        filename,
-        time.perf_counter() - started_at,
+        kind.label, file_path, filename, time.perf_counter() - started_at,
     )
     return result
 
 
-async def _extract_structured_medical_data(
-    file_path: str,
-    *,
-    filename: str | None = None,
-    render_cache: _PdfRenderCache | None = None,
-) -> dict:
-    return await _extract_file_with_optional_pdf_batches(
-        file_path,
-        filename=filename,
-        label="Medical extraction",
-        pdf_extract_fn=_extract_structured_medical_data_from_pdf,
-        attachment_extract_fn=_extract_structured_medical_data_from_attachments,
-        render_cache=render_cache,
-    )
+_MEDICAL_EXTRACTION = _ExtractionKind(
+    label="Structured medical",
+    extract_fn=_extract_structured_medical_data_from_attachments,
+    merge_fn=_merge_structured_medical_results,
+    post_process_fn=_offset_result_page_numbers,
+)
 
-
-async def _extract_document_text(
-    file_path: str,
-    *,
-    filename: str | None = None,
-    render_cache: _PdfRenderCache | None = None,
-) -> dict:
-    return await _extract_file_with_optional_pdf_batches(
-        file_path,
-        filename=filename,
-        label="Document text extraction",
-        pdf_extract_fn=_extract_document_text_from_pdf,
-        attachment_extract_fn=_extract_document_text_from_attachments,
-        render_cache=render_cache,
-    )
+_TEXT_EXTRACTION = _ExtractionKind(
+    label="Document text",
+    extract_fn=_extract_document_text_from_attachments,
+    merge_fn=_merge_document_text_results,
+)
 
 
 async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
@@ -1007,23 +929,22 @@ async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
     For images, sends the file directly. For PDFs, converts each page
     to a PNG image first so the vision model can read the content.
 
-    Args:
-        file_path: Absolute path to the uploaded file (PDF or image).
-
     Returns:
-        Parsed JSON dict with structured medical data plus OCR text and summary when available.
+        Parsed JSON dict with structured medical data plus OCR text and summary.
     """
     started_at = time.perf_counter()
     logger.info("OCR pipeline start path=%s filename=%s", file_path, filename)
     render_cache = _PdfRenderCache(file_path) if Path(file_path).suffix.lower() == ".pdf" else None
 
-    # Keep structured extraction separate from free-form OCR + translation.
-    # They are intentionally distinct steps even when they share rendered page batches.
+    # NOTE: Keep structured extraction and free-form OCR + translation as separate
+    # steps. Do not merge them. They are intentionally distinct even when they share
+    # rendered page images: the structured prompt targets measurement data, while the
+    # text prompt captures full document content and translation.
     medical_task = asyncio.create_task(
-        _extract_structured_medical_data(file_path, filename=filename, render_cache=render_cache)
+        _extract_file(file_path, _MEDICAL_EXTRACTION, filename=filename, render_cache=render_cache)
     )
     text_task = asyncio.create_task(
-        _extract_document_text(file_path, filename=filename, render_cache=render_cache)
+        _extract_file(file_path, _TEXT_EXTRACTION, filename=filename, render_cache=render_cache)
     )
 
     try:
@@ -1322,41 +1243,17 @@ async def normalize_marker_names(new_names: list[str], existing_canonical: list[
             representative_names.append(new_name)
         names_by_key[normalized_key].append(new_name)
 
-    async def _normalize_batch(batch_names: list[str]) -> dict[str, str]:
-        user_text = "EXISTING canonical marker names:\n"
-        if existing_canonical:
-            for n in existing_canonical:
-                user_text += f"- {n}\n"
-        else:
-            user_text += "(none yet)\n"
-        user_text += "\nNEW marker names to normalize:\n"
-        for n in batch_names:
-            user_text += f"- {n}\n"
-
-        raw = await _ask(NORMALIZE_SYSTEM_PROMPT, user_text)
-
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1]
-        if raw.endswith("```"):
-            raw = raw.rsplit("```", 1)[0]
-
-        try:
-            mapping = json.loads(raw.strip())
-        except (json.JSONDecodeError, ValueError):
-            mapping = {n: n for n in batch_names}
-
-        for n in batch_names:
-            if n not in mapping:
-                mapping[n] = n
-        return mapping
-
     merged_mapping: dict[str, str] = dict(direct_mapping)
-    for batch_mapping in await _run_batched_tasks(
+    for batch_mapping in await _run_json_batches(
         representative_names,
         batch_size=MARKER_NORMALIZATION_BATCH_SIZE,
         concurrency=MARKER_NORMALIZATION_CONCURRENCY,
-        run_batch=_normalize_batch,
+        system_prompt=NORMALIZE_SYSTEM_PROMPT,
+        build_user_text=lambda batch_names: _build_marker_name_normalization_user_text(
+            batch_names,
+            existing_canonical,
+        ),
+        parse_payload=_parse_marker_name_response,
     ):
         for representative_name, canonical_name in batch_mapping.items():
             normalized_key = _normalize_marker_lookup_key(representative_name) or representative_name
@@ -1385,12 +1282,7 @@ async def normalize_source_name(
     user_text += f"\nOCR-detected source: {source_name or '(none)'}\n"
     user_text += f"Original filename: {filename or '(none)'}\n"
 
-    raw = await _ask(SOURCE_NORMALIZE_SYSTEM_PROMPT, user_text)
-
-    try:
-        payload = _parse_json_response(raw)
-    except (json.JSONDecodeError, ValueError):
-        return None
+    payload = await _ask_json(SOURCE_NORMALIZE_SYSTEM_PROMPT, user_text, default={})
 
     normalized_source = payload.get("source")
     if normalized_source is None:
@@ -1418,21 +1310,14 @@ async def choose_canonical_units(marker_groups: list[MarkerUnitGroup]) -> dict[s
     if not unresolved_groups:
         return canonical_units
 
-    async def _normalize_batch(batch_groups: list[MarkerUnitGroup]) -> dict[str, str | None]:
-        user_text = _build_marker_group_user_text(batch_groups)
-
-        try:
-            payload = _parse_json_response(await _ask(UNIT_CANONICAL_SYSTEM_PROMPT, user_text))
-        except (json.JSONDecodeError, ValueError):
-            payload = {}
-        return _parse_canonical_unit_response(payload, batch_groups)
-
     merged_mapping: dict[str, str | None] = dict(canonical_units)
-    for batch_mapping in await _run_batched_tasks(
+    for batch_mapping in await _run_json_batches(
         unresolved_groups,
         batch_size=UNIT_NORMALIZATION_BATCH_SIZE,
         concurrency=UNIT_NORMALIZATION_CONCURRENCY,
-        run_batch=_normalize_batch,
+        system_prompt=UNIT_CANONICAL_SYSTEM_PROMPT,
+        build_user_text=_build_marker_group_user_text,
+        parse_payload=_parse_canonical_unit_response,
     ):
         merged_mapping.update(batch_mapping)
 
@@ -1444,21 +1329,14 @@ async def infer_rescaling_factors(conversion_requests: list[UnitConversionReques
     if not conversion_requests:
         return {}
 
-    async def _run_batch(batch_requests: list[UnitConversionRequest]) -> dict[str, float | None]:
-        user_text = _build_conversion_request_user_text(batch_requests)
-
-        try:
-            payload = _parse_json_response(await _ask(UNIT_SCALE_SYSTEM_PROMPT, user_text))
-        except (json.JSONDecodeError, ValueError):
-            payload = {}
-        return _parse_scale_factor_response(payload, batch_requests)
-
     merged: dict[str, float | None] = {}
-    for batch_mapping in await _run_batched_tasks(
+    for batch_mapping in await _run_json_batches(
         conversion_requests,
         batch_size=UNIT_NORMALIZATION_BATCH_SIZE,
         concurrency=UNIT_NORMALIZATION_CONCURRENCY,
-        run_batch=_run_batch,
+        system_prompt=UNIT_SCALE_SYSTEM_PROMPT,
+        build_user_text=_build_conversion_request_user_text,
+        parse_payload=_parse_scale_factor_response,
     ):
         merged.update(batch_mapping)
     return merged
@@ -1471,24 +1349,18 @@ async def normalize_qualitative_values(
     """Use the LLM to map raw qualitative values to canonical labels."""
     if not requests:
         return {}
-    unresolved_requests = list(requests)
-
-    async def _normalize_batch(batch_requests: list[QualitativeNormalizationRequest]) -> dict[str, tuple[str | None, bool | None]]:
-        user_text = _build_qualitative_request_user_text(batch_requests, existing_canonical)
-
-        try:
-            payload = _parse_json_response(await _ask(QUALITATIVE_NORMALIZATION_SYSTEM_PROMPT, user_text))
-        except (json.JSONDecodeError, ValueError):
-            payload = {}
-
-        return _parse_qualitative_response(payload, batch_requests)
 
     merged_mapping: dict[str, tuple[str | None, bool | None]] = {}
-    for batch_mapping in await _run_batched_tasks(
-        unresolved_requests,
+    for batch_mapping in await _run_json_batches(
+        requests,
         batch_size=QUALITATIVE_NORMALIZATION_BATCH_SIZE,
         concurrency=QUALITATIVE_NORMALIZATION_CONCURRENCY,
-        run_batch=_normalize_batch,
+        system_prompt=QUALITATIVE_NORMALIZATION_SYSTEM_PROMPT,
+        build_user_text=lambda batch_requests: _build_qualitative_request_user_text(
+            batch_requests,
+            existing_canonical,
+        ),
+        parse_payload=_parse_qualitative_response,
     ):
         merged_mapping.update(batch_mapping)
     return merged_mapping

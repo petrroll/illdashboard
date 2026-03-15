@@ -57,10 +57,19 @@ def _no_retry_delay():
         yield
 
 
+def _medical_calls(mock) -> list:
+    """Filter batch mock calls to only those for medical extraction."""
+    return [
+        args for args in mock.await_args_list
+        if args.args[1] is copilot_service._MEDICAL_EXTRACTION
+    ]
+
+
 @pytest.mark.asyncio
 async def test_extract_structured_medical_data_from_pdf_splits_oversized_batches_and_preserves_page_numbers():
     async def fake_batch(
         pdf_path: str,
+        kind: copilot_service._ExtractionKind,
         *,
         start_page: int,
         stop_page: int,
@@ -68,6 +77,8 @@ async def test_extract_structured_medical_data_from_pdf_splits_oversized_batches
         filename: str | None = None,
         render_cache=None,
     ):
+        if kind is copilot_service._TEXT_EXTRACTION:
+            return {"raw_text": "text", "translated_text_english": "text"}
         if stop_page - start_page > 1:
             raise Exception("CAPIError: 413 failed to parse request")
         return {
@@ -87,12 +98,9 @@ async def test_extract_structured_medical_data_from_pdf_splits_oversized_batches
         }
 
     with patch("illdashboard.copilot_service.fitz.open", return_value=DummyDoc(page_count=4)), patch(
-        "illdashboard.copilot_service._extract_structured_medical_data_pdf_batch",
+        "illdashboard.copilot_service._pdf_batch_extract",
         new=AsyncMock(side_effect=fake_batch),
-    ) as batch_mock, patch(
-        "illdashboard.copilot_service._extract_document_text",
-        new=AsyncMock(return_value={"raw_text": "text", "translated_text_english": "text"}),
-    ), patch("illdashboard.copilot_service._generate_medical_summary", new=AsyncMock(return_value=None)):
+    ) as batch_mock, patch("illdashboard.copilot_service._generate_medical_summary", new=AsyncMock(return_value=None)):
         result = await copilot_service.ocr_extract("/tmp/report.pdf")
 
     assert result["lab_date"] == "2025-09-05"
@@ -107,7 +115,7 @@ async def test_extract_structured_medical_data_from_pdf_splits_oversized_batches
     observed_calls = sorted(
         [
             (args.args[0], args.kwargs["start_page"], args.kwargs["stop_page"], args.kwargs["dpi"], args.kwargs["filename"])
-            for args in batch_mock.await_args_list
+            for args in _medical_calls(batch_mock)
         ],
         key=lambda item: (item[1], item[2], item[3]),
     )
@@ -125,6 +133,7 @@ async def test_extract_structured_medical_data_from_pdf_splits_oversized_batches
 async def test_extract_structured_medical_data_from_pdf_splits_timed_out_batches_and_preserves_page_numbers():
     async def fake_batch(
         pdf_path: str,
+        kind: copilot_service._ExtractionKind,
         *,
         start_page: int,
         stop_page: int,
@@ -132,6 +141,8 @@ async def test_extract_structured_medical_data_from_pdf_splits_timed_out_batches
         filename: str | None = None,
         render_cache=None,
     ):
+        if kind is copilot_service._TEXT_EXTRACTION:
+            return {"raw_text": "text", "translated_text_english": "text"}
         if stop_page - start_page > 1:
             raise TimeoutError("Timeout after 120s waiting for session.idle")
         return {
@@ -151,12 +162,9 @@ async def test_extract_structured_medical_data_from_pdf_splits_timed_out_batches
         }
 
     with patch("illdashboard.copilot_service.fitz.open", return_value=DummyDoc(page_count=2)), patch(
-        "illdashboard.copilot_service._extract_structured_medical_data_pdf_batch",
+        "illdashboard.copilot_service._pdf_batch_extract",
         new=AsyncMock(side_effect=fake_batch),
-    ) as batch_mock, patch(
-        "illdashboard.copilot_service._extract_document_text",
-        new=AsyncMock(return_value={"raw_text": "text", "translated_text_english": "text"}),
-    ), patch("illdashboard.copilot_service._generate_medical_summary", new=AsyncMock(return_value=None)):
+    ) as batch_mock, patch("illdashboard.copilot_service._generate_medical_summary", new=AsyncMock(return_value=None)):
         result = await copilot_service.ocr_extract("/tmp/report.pdf")
 
     assert result["lab_date"] == "2025-09-05"
@@ -166,10 +174,11 @@ async def test_extract_structured_medical_data_from_pdf_splits_timed_out_batches
         "Marker 1",
         "Marker 2",
     ]
-    assert batch_mock.await_args_list == [
-        call("/tmp/report.pdf", start_page=0, stop_page=2, dpi=144, filename=None, render_cache=ANY),
-        call("/tmp/report.pdf", start_page=0, stop_page=1, dpi=144, filename=None, render_cache=ANY),
-        call("/tmp/report.pdf", start_page=1, stop_page=2, dpi=144, filename=None, render_cache=ANY),
+    medical = _medical_calls(batch_mock)
+    assert [(c.args[0], c.kwargs["start_page"], c.kwargs["stop_page"], c.kwargs["dpi"], c.kwargs["filename"]) for c in medical] == [
+        ("/tmp/report.pdf", 0, 2, 144, None),
+        ("/tmp/report.pdf", 0, 1, 144, None),
+        ("/tmp/report.pdf", 1, 2, 144, None),
     ]
 
 
@@ -177,6 +186,7 @@ async def test_extract_structured_medical_data_from_pdf_splits_timed_out_batches
 async def test_extract_structured_medical_data_from_pdf_falls_back_to_single_pages_after_429():
     async def fake_batch(
         pdf_path: str,
+        kind: copilot_service._ExtractionKind,
         *,
         start_page: int,
         stop_page: int,
@@ -184,6 +194,8 @@ async def test_extract_structured_medical_data_from_pdf_falls_back_to_single_pag
         filename: str | None = None,
         render_cache=None,
     ):
+        if kind is copilot_service._TEXT_EXTRACTION:
+            return {"raw_text": "text", "translated_text_english": "text"}
         if stop_page - start_page > 1:
             raise RuntimeError("429 Too Many Requests")
         return {
@@ -203,21 +215,19 @@ async def test_extract_structured_medical_data_from_pdf_falls_back_to_single_pag
         }
 
     with patch("illdashboard.copilot_service.fitz.open", return_value=DummyDoc(page_count=2)), patch(
-        "illdashboard.copilot_service._extract_structured_medical_data_pdf_batch",
+        "illdashboard.copilot_service._pdf_batch_extract",
         new=AsyncMock(side_effect=fake_batch),
-    ) as batch_mock, patch(
-        "illdashboard.copilot_service._extract_document_text",
-        new=AsyncMock(return_value={"raw_text": "text", "translated_text_english": "text"}),
-    ), patch("illdashboard.copilot_service._generate_medical_summary", new=AsyncMock(return_value=None)):
+    ) as batch_mock, patch("illdashboard.copilot_service._generate_medical_summary", new=AsyncMock(return_value=None)):
         result = await copilot_service.ocr_extract("/tmp/report.pdf")
 
     assert result["lab_date"] == "2025-09-05"
     assert result["source"] == "synlab"
     assert [measurement["page_number"] for measurement in result["measurements"]] == [1, 2]
-    assert batch_mock.await_args_list == [
-        call("/tmp/report.pdf", start_page=0, stop_page=2, dpi=144, filename=None, render_cache=ANY),
-        call("/tmp/report.pdf", start_page=0, stop_page=1, dpi=144, filename=None, render_cache=ANY),
-        call("/tmp/report.pdf", start_page=1, stop_page=2, dpi=144, filename=None, render_cache=ANY),
+    medical = _medical_calls(batch_mock)
+    assert [(c.args[0], c.kwargs["start_page"], c.kwargs["stop_page"], c.kwargs["dpi"], c.kwargs["filename"]) for c in medical] == [
+        ("/tmp/report.pdf", 0, 2, 144, None),
+        ("/tmp/report.pdf", 0, 1, 144, None),
+        ("/tmp/report.pdf", 1, 2, 144, None),
     ]
 
 
@@ -225,6 +235,7 @@ async def test_extract_structured_medical_data_from_pdf_falls_back_to_single_pag
 async def test_extract_structured_medical_data_from_pdf_retries_single_page_at_lower_dpi_after_413():
     async def fake_batch(
         pdf_path: str,
+        kind: copilot_service._ExtractionKind,
         *,
         start_page: int,
         stop_page: int,
@@ -232,6 +243,8 @@ async def test_extract_structured_medical_data_from_pdf_retries_single_page_at_l
         filename: str | None = None,
         render_cache=None,
     ):
+        if kind is copilot_service._TEXT_EXTRACTION:
+            return {"raw_text": "Sodium 141 mmol/l", "translated_text_english": "Sodium 141 mmol/l"}
         if dpi == copilot_service.OCR_PDF_RENDER_DPI:
             raise Exception("CAPIError: 413 failed to parse request")
         return {
@@ -251,12 +264,9 @@ async def test_extract_structured_medical_data_from_pdf_retries_single_page_at_l
         }
 
     with patch("illdashboard.copilot_service.fitz.open", return_value=DummyDoc(page_count=1)), patch(
-        "illdashboard.copilot_service._extract_structured_medical_data_pdf_batch",
+        "illdashboard.copilot_service._pdf_batch_extract",
         new=AsyncMock(side_effect=fake_batch),
-    ) as batch_mock, patch(
-        "illdashboard.copilot_service._extract_document_text",
-        new=AsyncMock(return_value={"raw_text": "Sodium 141 mmol/l", "translated_text_english": "Sodium 141 mmol/l"}),
-    ), patch("illdashboard.copilot_service._generate_medical_summary", new=AsyncMock(return_value=None)):
+    ) as batch_mock, patch("illdashboard.copilot_service._generate_medical_summary", new=AsyncMock(return_value=None)):
         result = await copilot_service.ocr_extract("/tmp/report.pdf")
 
     assert result == {
@@ -276,20 +286,22 @@ async def test_extract_structured_medical_data_from_pdf_retries_single_page_at_l
             }
         ],
     }
-    assert batch_mock.await_args_list == [
-        call("/tmp/report.pdf", start_page=0, stop_page=1, dpi=144, filename=None, render_cache=ANY),
-        call("/tmp/report.pdf", start_page=0, stop_page=1, dpi=120, filename=None, render_cache=ANY),
+    medical = _medical_calls(batch_mock)
+    assert [(c.args[0], c.kwargs["start_page"], c.kwargs["stop_page"], c.kwargs["dpi"], c.kwargs["filename"]) for c in medical] == [
+        ("/tmp/report.pdf", 0, 1, 144, None),
+        ("/tmp/report.pdf", 0, 1, 120, None),
     ]
 
 
 @pytest.mark.asyncio
-async def test_extract_structured_medical_data_from_pdf_processes_page_batches_in_parallel():
+async def test_extract_file_processes_page_batches_in_parallel():
     first_batch_started = asyncio.Event()
     allow_first_batch_finish = asyncio.Event()
     second_batch_started = asyncio.Event()
 
     async def fake_batch(
         pdf_path: str,
+        kind: copilot_service._ExtractionKind,
         *,
         start_page: int,
         stop_page: int,
@@ -326,10 +338,10 @@ async def test_extract_structured_medical_data_from_pdf_processes_page_batches_i
         "OCR_PDF_BATCH_CONCURRENCY",
         2,
     ), patch(
-        "illdashboard.copilot_service._extract_structured_medical_data_pdf_batch",
+        "illdashboard.copilot_service._pdf_batch_extract",
         new=AsyncMock(side_effect=fake_batch),
     ):
-        result = await copilot_service._extract_structured_medical_data_from_pdf("/tmp/report.pdf")
+        result = await copilot_service._extract_file("/tmp/report.pdf", copilot_service._MEDICAL_EXTRACTION)
 
     assert second_batch_started.is_set()
     assert [measurement["page_number"] for measurement in result["measurements"]] == [1, 3]
@@ -761,14 +773,15 @@ async def test_normalize_qualitative_values_prompt_mentions_boolean_context():
 
 
 @pytest.mark.asyncio
-async def test_extract_structured_medical_data_pdf_range_logs_context_on_non_retryable_failure():
+async def test_pdf_range_with_retries_logs_context_on_non_retryable_failure():
     with patch(
-        "illdashboard.copilot_service._extract_structured_medical_data_pdf_batch",
+        "illdashboard.copilot_service._pdf_batch_extract",
         new=AsyncMock(side_effect=RuntimeError("boom")),
     ), patch("illdashboard.copilot_service.logger") as logger_mock:
         with pytest.raises(RuntimeError, match="boom"):
-            await copilot_service._extract_structured_medical_data_pdf_range(
+            await copilot_service._pdf_range_with_retries(
                 "/tmp/2023-2-immunology.pdf",
+                copilot_service._MEDICAL_EXTRACTION,
                 start_page=0,
                 stop_page=2,
                 dpi=144,
@@ -777,7 +790,7 @@ async def test_extract_structured_medical_data_pdf_range_logs_context_on_non_ret
 
     logger_mock.exception.assert_called_once_with(
         "%s extraction failed for %s (filename=%s, pages=%s-%s, dpi=%s)",
-        "Structured medical PDF",
+        "Structured medical",
         "/tmp/2023-2-immunology.pdf",
         "2023-2-immunology.pdf",
         1,

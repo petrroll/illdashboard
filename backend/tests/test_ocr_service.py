@@ -24,7 +24,8 @@ async def test_stream_ocr_for_labs_logs_file_context_on_extraction_failure():
 
     assert any('"status": "error"' in event for event in events)
     logger_mock.exception.assert_called_once_with(
-        "OCR extraction failed for file id=%s filename=%r path=%r",
+        "%sOCR extraction failed file_id=%s filename=%r path=%r",
+        "",
         7,
         "2023-2-immunology.pdf",
         "2023-2-immunology.pdf",
