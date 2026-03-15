@@ -7,8 +7,9 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from illdashboard import config
 from illdashboard.main import preload_uploaded_files
-from illdashboard.models import Base, LabFile
+from illdashboard.models import Base, LabFile, MarkerTag, Measurement, MeasurementType
 
 
 @pytest.mark.asyncio
@@ -163,6 +164,12 @@ async def _upload_pdf(client):
 
 def _parse_ndjson(text: str) -> list[dict]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def _open_current_test_db():
+    engine = create_async_engine(config.settings.DATABASE_URL, echo=False)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    return engine, session_factory
 
 
 @pytest.mark.asyncio
@@ -332,6 +339,112 @@ async def test_measurement_overview_groups_magnesium_as_electrolyte(client):
     assert len(overview) == 1
     assert overview[0]["group_name"] == "Electrolytes"
     assert [item["marker_name"] for item in overview[0]["markers"]] == ["Magnesium"]
+
+
+@pytest.mark.asyncio
+async def test_measurements_persist_with_measurement_type_references(client):
+    file_id = await _upload_pdf(client)
+
+    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+        resp = await client.post(f"/api/files/{file_id}/ocr")
+        assert resp.status_code == 200
+
+    engine, session_factory = _open_current_test_db()
+    try:
+        async with session_factory() as session:
+            measurements_result = await session.execute(select(Measurement).order_by(Measurement.id.asc()))
+            measurements = measurements_result.scalars().all()
+            assert len(measurements) == 2
+            assert all(measurement.measurement_type_id is not None for measurement in measurements)
+
+            types_result = await session.execute(select(MeasurementType).order_by(MeasurementType.name.asc()))
+            measurement_types = types_result.scalars().all()
+            assert [measurement_type.name for measurement_type in measurement_types] == ["Potassium", "Sodium"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_normalize_existing_markers_merges_measurement_types_and_tags(client):
+    first_file_id = await _upload_pdf(client)
+    second_file_id = await _upload_pdf(client)
+
+    na_result = {
+        "lab_date": "2025-09-05",
+        "measurements": [
+            {
+                "marker_name": "Na",
+                "value": 140,
+                "unit": "mmol/l",
+                "reference_low": 136,
+                "reference_high": 145,
+                "measured_at": "2025-09-05",
+            }
+        ],
+    }
+    sodium_result = {
+        "lab_date": "2025-09-06",
+        "measurements": [
+            {
+                "marker_name": "Sodium",
+                "value": 141,
+                "unit": "mmol/l",
+                "reference_low": 136,
+                "reference_high": 145,
+                "measured_at": "2025-09-06",
+            }
+        ],
+    }
+
+    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=na_result), patch(
+        "illdashboard.routes.normalize_marker_names",
+        new_callable=AsyncMock,
+        return_value={"Na": "Na"},
+    ):
+        resp = await client.post(f"/api/files/{first_file_id}/ocr")
+        assert resp.status_code == 200
+
+    tag_resp = await client.put("/api/markers/Na/tags", json={"tags": ["electrolyte"]})
+    assert tag_resp.status_code == 200
+    assert tag_resp.json() == ["electrolyte"]
+
+    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=sodium_result), patch(
+        "illdashboard.routes.normalize_marker_names",
+        new_callable=AsyncMock,
+        return_value={"Sodium": "Sodium"},
+    ):
+        resp = await client.post(f"/api/files/{second_file_id}/ocr")
+        assert resp.status_code == 200
+
+    with patch(
+        "illdashboard.routes.normalize_marker_names",
+        new_callable=AsyncMock,
+        return_value={"Na": "Sodium", "Sodium": "Sodium"},
+    ):
+        normalize_resp = await client.post("/api/measurements/normalize")
+
+    assert normalize_resp.status_code == 200
+    assert normalize_resp.json() == {"updated": 1}
+
+    engine, session_factory = _open_current_test_db()
+    try:
+        async with session_factory() as session:
+            types_result = await session.execute(select(MeasurementType).order_by(MeasurementType.name.asc()))
+            measurement_types = types_result.scalars().all()
+            assert [measurement_type.name for measurement_type in measurement_types] == ["Sodium"]
+
+            measurements_result = await session.execute(select(Measurement).order_by(Measurement.id.asc()))
+            measurements = measurements_result.scalars().all()
+            assert len(measurements) == 2
+            assert len({measurement.measurement_type_id for measurement in measurements}) == 1
+
+            tags_result = await session.execute(select(MarkerTag))
+            tags = tags_result.scalars().all()
+            assert len(tags) == 1
+            assert tags[0].tag == "electrolyte"
+            assert tags[0].measurement_type_id == measurements[0].measurement_type_id
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

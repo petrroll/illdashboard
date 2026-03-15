@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 # ── LabFile ──────────────────────────────────────────────────────────────────
 
@@ -15,6 +15,17 @@ class LabFileOut(BaseModel):
     uploaded_at: datetime
     ocr_raw: str | None = None
     lab_date: datetime | None = None
+    tags: list[str] = []
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_tags(cls, data):
+        """Convert LabFileTag ORM objects to plain strings."""
+        if hasattr(data, "__table__"):
+            raw = data.__dict__.get("tags", [])
+            data = {c.key: getattr(data, c.key) for c in data.__table__.columns}
+            data["tags"] = [t.tag for t in raw] if raw and hasattr(raw[0], "tag") else list(raw)
+        return data
 
 
 # ── Measurement ──────────────────────────────────────────────────────────────
@@ -33,6 +44,24 @@ class MeasurementOut(BaseModel):
     measured_at: datetime | None = None
     page_number: int | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_measurement_type(cls, data):
+        if hasattr(data, "measurement_type"):
+            measurement_type = data.measurement_type
+            return {
+                "id": data.id,
+                "lab_file_id": data.lab_file_id,
+                "marker_name": measurement_type.name,
+                "value": data.value,
+                "unit": data.unit,
+                "reference_low": data.reference_low,
+                "reference_high": data.reference_high,
+                "measured_at": data.measured_at,
+                "page_number": data.page_number,
+            }
+        return data
+
 
 class MarkerOverviewItem(BaseModel):
     marker_name: str
@@ -44,6 +73,7 @@ class MarkerOverviewItem(BaseModel):
     total_count: int = 1
     value_min: float | None = None
     value_max: float | None = None
+    tags: list[str] = []
 
 
 class MarkerOverviewGroup(BaseModel):
@@ -61,6 +91,7 @@ class MarkerDetailResponse(BaseModel):
     measurements: list[MeasurementOut]
     explanation: str | None = None
     explanation_cached: bool = False
+    tags: list[str] = []
 
 
 class MarkerInsightResponse(BaseModel):
@@ -104,3 +135,7 @@ class BatchOcrRequest(BaseModel):
 
 class ExplainResponse(BaseModel):
     explanation: str
+
+
+class TagsUpdate(BaseModel):
+    tags: list[str]

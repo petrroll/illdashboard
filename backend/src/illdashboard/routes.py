@@ -21,6 +21,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from illdashboard.config import settings
 
@@ -31,7 +32,14 @@ from illdashboard.copilot_service import (
     ocr_extract,
 )
 from illdashboard.database import get_db
-from illdashboard.models import BiomarkerInsight, LabFile, Measurement
+from illdashboard.models import (
+    BiomarkerInsight,
+    LabFile,
+    LabFileTag,
+    MarkerTag,
+    Measurement,
+    MeasurementType,
+)
 from illdashboard.sparkline import generate_sparkline, get_cached_sparkline
 from illdashboard.schemas import (
     BatchOcrRequest,
@@ -44,6 +52,7 @@ from illdashboard.schemas import (
     MeasurementOut,
     MarkerOverviewItem,
     MultiExplainRequest,
+    TagsUpdate,
 )
 
 router = APIRouter()
@@ -166,6 +175,113 @@ def _classify_marker_group(name: str) -> str:
     return "Other"
 
 
+async def _ensure_measurement_types(
+    db: AsyncSession,
+    names: list[str],
+) -> dict[str, MeasurementType]:
+    unique_names = list(dict.fromkeys(name for name in names if name))
+    if not unique_names:
+        return {}
+
+    result = await db.execute(
+        select(MeasurementType).where(MeasurementType.name.in_(unique_names))
+    )
+    by_name = {measurement_type.name: measurement_type for measurement_type in result.scalars().all()}
+
+    for name in unique_names:
+        if name in by_name:
+            measurement_type = by_name[name]
+            expected_group = _classify_marker_group(name)
+            if measurement_type.group_name != expected_group:
+                measurement_type.group_name = expected_group
+            continue
+
+        measurement_type = MeasurementType(
+            name=name,
+            group_name=_classify_marker_group(name),
+        )
+        db.add(measurement_type)
+        by_name[name] = measurement_type
+
+    await db.flush()
+    return by_name
+
+
+async def _get_measurement_type_by_name(
+    db: AsyncSession,
+    marker_name: str,
+) -> MeasurementType | None:
+    result = await db.execute(
+        select(MeasurementType).where(MeasurementType.name == marker_name)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _load_measurements_for_marker(
+    db: AsyncSession,
+    marker_name: str,
+) -> list[Measurement]:
+    result = await db.execute(
+        select(Measurement)
+        .join(Measurement.measurement_type)
+        .options(selectinload(Measurement.measurement_type))
+        .where(MeasurementType.name == marker_name)
+        .order_by(Measurement.measured_at.asc(), Measurement.id.asc())
+    )
+    return result.scalars().all()
+
+
+async def _merge_measurement_types(
+    source: MeasurementType,
+    target: MeasurementType,
+    db: AsyncSession,
+) -> None:
+    if source.id == target.id:
+        return
+
+    target.group_name = _classify_marker_group(target.name)
+
+    measurements_result = await db.execute(
+        select(Measurement).where(Measurement.measurement_type_id == source.id)
+    )
+    for measurement in measurements_result.scalars().all():
+        measurement.measurement_type_id = target.id
+
+    source_tags_result = await db.execute(
+        select(MarkerTag).where(MarkerTag.measurement_type_id == source.id)
+    )
+    source_tags = source_tags_result.scalars().all()
+
+    target_tags_result = await db.execute(
+        select(MarkerTag.tag).where(MarkerTag.measurement_type_id == target.id)
+    )
+    existing_target_tags = set(target_tags_result.scalars().all())
+
+    for tag in source_tags:
+        if tag.tag in existing_target_tags:
+            await db.delete(tag)
+            continue
+        tag.measurement_type_id = target.id
+        existing_target_tags.add(tag.tag)
+
+    source_insight_result = await db.execute(
+        select(BiomarkerInsight).where(BiomarkerInsight.measurement_type_id == source.id)
+    )
+    source_insight = source_insight_result.scalar_one_or_none()
+    if source_insight is not None:
+        target_insight_result = await db.execute(
+            select(BiomarkerInsight).where(BiomarkerInsight.measurement_type_id == target.id)
+        )
+        target_insight = target_insight_result.scalar_one_or_none()
+        if target_insight is None:
+            source_insight.measurement_type_id = target.id
+        else:
+            await db.delete(source_insight)
+
+    await db.delete(source)
+    await db.flush()
+
+
 def _measurement_status(measurement: Measurement) -> str:
     if measurement.reference_low is not None and measurement.value < measurement.reference_low:
         return "low"
@@ -257,7 +373,7 @@ def _build_marker_payload(measurements: list[Measurement]) -> dict:
     values = [m.value for m in measurements]
     return {
         "marker_name": latest.marker_name,
-        "group_name": _classify_marker_group(latest.marker_name),
+        "group_name": latest.group_name,
         "latest_measurement": latest,
         "previous_measurement": previous,
         "status": _measurement_status(latest),
@@ -269,13 +385,13 @@ def _build_marker_payload(measurements: list[Measurement]) -> dict:
 
 
 async def _get_cached_or_generated_insight(
-    marker_name: str,
+    measurement_type: MeasurementType,
     measurements: list[Measurement],
     db: AsyncSession,
 ) -> tuple[str, bool]:
     signature = _marker_signature(measurements)
     result = await db.execute(
-        select(BiomarkerInsight).where(BiomarkerInsight.marker_name == marker_name)
+        select(BiomarkerInsight).where(BiomarkerInsight.measurement_type_id == measurement_type.id)
     )
     cached_insight = result.scalar_one_or_none()
     if cached_insight and cached_insight.measurement_signature == signature:
@@ -283,15 +399,15 @@ async def _get_cached_or_generated_insight(
 
     try:
         explanation = await explain_marker_history(
-            marker_name,
+            measurement_type.name,
             _serialize_history_for_ai(measurements),
         )
     except Exception:
-        explanation = _fallback_marker_explanation(marker_name, measurements)
+        explanation = _fallback_marker_explanation(measurement_type.name, measurements)
 
     if cached_insight is None:
         cached_insight = BiomarkerInsight(
-            marker_name=marker_name,
+            measurement_type_id=measurement_type.id,
             measurement_signature=signature,
             summary_markdown=explanation,
         )
@@ -305,13 +421,13 @@ async def _get_cached_or_generated_insight(
 
 
 async def _get_cached_insight(
-    marker_name: str,
+    measurement_type: MeasurementType,
     measurements: list[Measurement],
     db: AsyncSession,
 ) -> tuple[str | None, bool]:
     signature = _marker_signature(measurements)
     result = await db.execute(
-        select(BiomarkerInsight).where(BiomarkerInsight.marker_name == marker_name)
+        select(BiomarkerInsight).where(BiomarkerInsight.measurement_type_id == measurement_type.id)
     )
     cached_insight = result.scalar_one_or_none()
     if cached_insight and cached_insight.measurement_signature == signature:
@@ -355,14 +471,24 @@ async def upload_file(
 
 
 @router.get("/files", response_model=list[LabFileOut], tags=["files"])
-async def list_files(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(LabFile).order_by(LabFile.uploaded_at.desc()))
-    return result.scalars().all()
+async def list_files(
+    tags: list[str] = Query(None, description="Filter files having ALL of these tags"),
+    db: AsyncSession = Depends(get_db),
+):
+    q = select(LabFile).options(selectinload(LabFile.tags)).order_by(LabFile.uploaded_at.desc())
+    if tags:
+        for tag in tags:
+            q = q.where(LabFile.id.in_(select(LabFileTag.lab_file_id).where(LabFileTag.tag == tag)))
+    result = await db.execute(q)
+    return result.scalars().unique().all()
 
 
 @router.get("/files/{file_id}", response_model=LabFileOut, tags=["files"])
 async def get_file(file_id: int, db: AsyncSession = Depends(get_db)):
-    lab = await db.get(LabFile, file_id)
+    result = await db.execute(
+        select(LabFile).options(selectinload(LabFile.tags)).where(LabFile.id == file_id)
+    )
+    lab = result.scalar_one_or_none()
     if not lab:
         raise HTTPException(404, "File not found")
     return lab
@@ -455,9 +581,14 @@ async def run_ocr(file_id: int, db: AsyncSession = Depends(get_db)):
 
     new_measurements = await _run_ocr_for_file(lab, db)
     await db.commit()
-    for meas in new_measurements:
-        await db.refresh(meas)
-    return new_measurements
+    measurement_ids = [measurement.id for measurement in new_measurements]
+    result = await db.execute(
+        select(Measurement)
+        .options(selectinload(Measurement.measurement_type))
+        .where(Measurement.id.in_(measurement_ids))
+        .order_by(Measurement.id.asc())
+    )
+    return result.scalars().all()
 
 
 async def _apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list[Measurement]:
@@ -480,7 +611,7 @@ async def _apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> lis
 
     # Step 2: LLM-based canonical mapping against existing DB names
     existing_result = await db.execute(
-        select(Measurement.marker_name).distinct()
+        select(MeasurementType.name).order_by(MeasurementType.name)
     )
     existing_canonical = existing_result.scalars().all()
 
@@ -491,6 +622,10 @@ async def _apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> lis
 
     # Combined mapping: raw OCR name → deterministic → LLM canonical
     canonical_map = {raw: llm_map.get(det_map[raw], det_map[raw]) for raw in raw_names}
+    measurement_types = await _ensure_measurement_types(
+        db,
+        [canonical_map[raw] for raw in raw_names],
+    )
 
     new_measurements: list[Measurement] = []
     for m in result.get("measurements", []):
@@ -514,9 +649,11 @@ async def _apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> lis
             except (ValueError, TypeError):
                 measured_at = lab.lab_date
 
+        canonical_name = canonical_map.get(m["marker_name"], m["marker_name"])
+
         meas = Measurement(
             lab_file_id=lab.id,
-            marker_name=canonical_map.get(m["marker_name"], m["marker_name"]),
+            measurement_type=measurement_types[canonical_name],
             value=value,
             unit=m.get("unit"),
             reference_low=ref_low,
@@ -527,6 +664,7 @@ async def _apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> lis
         db.add(meas)
         new_measurements.append(meas)
 
+    await db.flush()
     return new_measurements
 
 
@@ -547,7 +685,9 @@ async def _persist_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> l
     lab.ocr_raw = None
     await db.flush()
 
-    return await _apply_ocr_result(lab, result, db)
+    new_measurements = await _apply_ocr_result(lab, result, db)
+    await db.flush()
+    return new_measurements
 
 
 async def _run_ocr_for_file(lab: LabFile, db: AsyncSession) -> list[Measurement]:
@@ -668,9 +808,14 @@ async def list_measurements(
     db: AsyncSession = Depends(get_db),
 ):
     """List measurements, optionally filtered by marker name."""
-    q = select(Measurement).order_by(Measurement.measured_at.asc())
+    q = (
+        select(Measurement)
+        .join(Measurement.measurement_type)
+        .options(selectinload(Measurement.measurement_type))
+        .order_by(Measurement.measured_at.asc(), Measurement.id.asc())
+    )
     if marker_name:
-        q = q.where(Measurement.marker_name == marker_name)
+        q = q.where(MeasurementType.name == marker_name)
     result = await db.execute(q)
     return result.scalars().all()
 
@@ -680,10 +825,16 @@ async def list_measurements(
     response_model=list[MarkerOverviewGroup],
     tags=["measurements"],
 )
-async def measurement_overview(db: AsyncSession = Depends(get_db)):
+async def measurement_overview(
+    tags: list[str] = Query(None, description="Filter markers having ALL of these tags"),
+    db: AsyncSession = Depends(get_db),
+):
     """Return a grouped latest-value overview for each biomarker."""
     result = await db.execute(
-        select(Measurement).order_by(Measurement.marker_name.asc(), Measurement.measured_at.asc(), Measurement.id.asc())
+        select(Measurement)
+        .join(Measurement.measurement_type)
+        .options(selectinload(Measurement.measurement_type))
+        .order_by(MeasurementType.name.asc(), Measurement.measured_at.asc(), Measurement.id.asc())
     )
     measurements = result.scalars().all()
 
@@ -691,9 +842,25 @@ async def measurement_overview(db: AsyncSession = Depends(get_db)):
     for measurement in measurements:
         by_marker[measurement.marker_name].append(measurement)
 
+    # Load marker tags
+    tag_result = await db.execute(select(MarkerTag).options(selectinload(MarkerTag.measurement_type)))
+    all_marker_tags = tag_result.scalars().all()
+    marker_tag_map: dict[str, list[str]] = defaultdict(list)
+    for mt in all_marker_tags:
+        marker_tag_map[mt.marker_name].append(mt.tag)
+
+    # Apply tag filter (AND)
+    if tags:
+        tag_set = set(tags)
+        by_marker = {
+            name: ms for name, ms in by_marker.items()
+            if tag_set <= set(marker_tag_map.get(name, []))
+        }
+
     grouped_items: dict[str, list[MarkerOverviewItem]] = defaultdict(list)
     for marker_name in sorted(by_marker):
         payload = _build_marker_payload(by_marker[marker_name])
+        payload["tags"] = marker_tag_map.get(marker_name, [])
         grouped_items[payload["group_name"]].append(MarkerOverviewItem(**payload))
 
     groups: list[MarkerOverviewGroup] = []
@@ -712,7 +879,7 @@ async def measurement_overview(db: AsyncSession = Depends(get_db)):
 @router.get("/measurements/markers", response_model=list[str], tags=["measurements"])
 async def list_marker_names(db: AsyncSession = Depends(get_db)):
     """Return distinct marker names."""
-    result = await db.execute(select(Measurement.marker_name).distinct().order_by(Measurement.marker_name))
+    result = await db.execute(select(MeasurementType.name).order_by(MeasurementType.name))
     return result.scalars().all()
 
 
@@ -726,27 +893,33 @@ async def measurement_detail(
     db: AsyncSession = Depends(get_db),
 ):
     """Return one biomarker history with a cached explanation."""
-    result = await db.execute(
-        select(Measurement)
-        .where(Measurement.marker_name == marker_name)
-        .order_by(Measurement.measured_at.asc(), Measurement.id.asc())
-    )
-    measurements = result.scalars().all()
+    measurement_type = await _get_measurement_type_by_name(db, marker_name)
+    if measurement_type is None:
+        raise HTTPException(404, "Marker not found")
+
+    measurements = await _load_measurements_for_marker(db, marker_name)
     if not measurements:
         raise HTTPException(404, "Marker not found")
 
     payload = _build_marker_payload(measurements)
     explanation, explanation_cached = await _get_cached_insight(
-        marker_name,
+        measurement_type,
         measurements,
         db,
     )
+
+    # Load marker tags
+    tag_result = await db.execute(
+        select(MarkerTag.tag).where(MarkerTag.measurement_type_id == measurement_type.id)
+    )
+    marker_tags = tag_result.scalars().all()
 
     return MarkerDetailResponse(
         **payload,
         measurements=measurements,
         explanation=explanation,
         explanation_cached=explanation_cached,
+        tags=marker_tags,
     )
 
 
@@ -760,17 +933,16 @@ async def measurement_insight(
     db: AsyncSession = Depends(get_db),
 ):
     """Return a cached or freshly generated explanation for one biomarker."""
-    result = await db.execute(
-        select(Measurement)
-        .where(Measurement.marker_name == marker_name)
-        .order_by(Measurement.measured_at.asc(), Measurement.id.asc())
-    )
-    measurements = result.scalars().all()
+    measurement_type = await _get_measurement_type_by_name(db, marker_name)
+    if measurement_type is None:
+        raise HTTPException(404, "Marker not found")
+
+    measurements = await _load_measurements_for_marker(db, marker_name)
     if not measurements:
         raise HTTPException(404, "Marker not found")
 
     explanation, explanation_cached = await _get_cached_or_generated_insight(
-        marker_name,
+        measurement_type,
         measurements,
         db,
     )
@@ -784,7 +956,11 @@ async def measurement_insight(
 @router.get("/files/{file_id}/measurements", response_model=list[MeasurementOut], tags=["measurements"])
 async def file_measurements(file_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
-        select(Measurement).where(Measurement.lab_file_id == file_id).order_by(Measurement.marker_name)
+        select(Measurement)
+        .join(Measurement.measurement_type)
+        .options(selectinload(Measurement.measurement_type))
+        .where(Measurement.lab_file_id == file_id)
+        .order_by(MeasurementType.name.asc(), Measurement.id.asc())
     )
     return result.scalars().all()
 
@@ -798,12 +974,7 @@ async def measurement_sparkline(
     db: AsyncSession = Depends(get_db),
 ):
     """Return a tiny sparkline PNG for a biomarker's value history."""
-    result = await db.execute(
-        select(Measurement)
-        .where(Measurement.marker_name == marker_name)
-        .order_by(Measurement.measured_at.asc(), Measurement.id.asc())
-    )
-    measurements = result.scalars().all()
+    measurements = await _load_measurements_for_marker(db, marker_name)
     if not measurements:
         raise HTTPException(404, "Marker not found")
 
@@ -856,30 +1027,47 @@ async def explain_multi(req: MultiExplainRequest):
 @router.post("/measurements/normalize", tags=["measurements"])
 async def normalize_existing_markers(db: AsyncSession = Depends(get_db)):
     """Apply deterministic + LLM normalization to all existing marker names in the DB."""
-    result = await db.execute(select(Measurement))
-    all_measurements = result.scalars().all()
+    result = await db.execute(select(MeasurementType).order_by(MeasurementType.id.asc()))
+    measurement_types = result.scalars().all()
 
     # Step 1: deterministic cleanup
     det_map: dict[str, str] = {}
-    for meas in all_measurements:
-        if meas.marker_name not in det_map:
-            det_map[meas.marker_name] = _normalize_marker_name_deterministic(meas.marker_name)
+    for measurement_type in measurement_types:
+        det_map[measurement_type.name] = _normalize_marker_name_deterministic(measurement_type.name)
     cleaned_names = list(dict.fromkeys(det_map.values()))
 
     # Step 2: LLM-based canonical mapping (all cleaned names against themselves)
     try:
-        llm_map = await normalize_marker_names(cleaned_names, [])
+        llm_map = await normalize_marker_names(cleaned_names, [measurement_type.name for measurement_type in measurement_types])
     except Exception:
         llm_map = {n: n for n in cleaned_names}
 
     canonical_map = {raw: llm_map.get(det_map[raw], det_map[raw]) for raw in det_map}
-
+    type_by_name = {measurement_type.name: measurement_type for measurement_type in measurement_types}
     updated = 0
-    for meas in all_measurements:
-        canonical = canonical_map.get(meas.marker_name, meas.marker_name)
-        if canonical != meas.marker_name:
-            meas.marker_name = canonical
+
+    await _ensure_measurement_types(db, list(canonical_map.values()))
+
+    for raw_name, canonical_name in canonical_map.items():
+        measurement_type = type_by_name[raw_name]
+        if canonical_name == raw_name:
+            expected_group = _classify_marker_group(canonical_name)
+            if measurement_type.group_name != expected_group:
+                measurement_type.group_name = expected_group
+                updated += 1
+            continue
+
+        target = await _get_measurement_type_by_name(db, canonical_name)
+        if target is None:
+            measurement_type.name = canonical_name
+            measurement_type.group_name = _classify_marker_group(canonical_name)
             updated += 1
+            type_by_name[canonical_name] = measurement_type
+            continue
+
+        await _merge_measurement_types(measurement_type, target, db)
+        updated += 1
+
     await db.commit()
     return {"updated": updated}
 
@@ -922,20 +1110,17 @@ async def set_file_tags(file_id: int, body: TagsUpdate, db: AsyncSession = Depen
 @router.put("/markers/{marker_name:path}/tags", response_model=list[str], tags=["tags"])
 async def set_marker_tags(marker_name: str, body: TagsUpdate, db: AsyncSession = Depends(get_db)):
     """Replace all tags for a marker type."""
-    # Verify marker exists
-    result = await db.execute(
-        select(Measurement.marker_name).where(Measurement.marker_name == marker_name).limit(1)
-    )
-    if not result.scalar_one_or_none():
+    measurement_type = await _get_measurement_type_by_name(db, marker_name)
+    if measurement_type is None:
         raise HTTPException(404, "Marker not found")
     # Remove existing
-    existing = await db.execute(select(MarkerTag).where(MarkerTag.marker_name == marker_name))
+    existing = await db.execute(select(MarkerTag).where(MarkerTag.measurement_type_id == measurement_type.id))
     for t in existing.scalars().all():
         await db.delete(t)
     # Add new
     unique_tags = list(dict.fromkeys(body.tags))
     for tag in unique_tags:
-        db.add(MarkerTag(marker_name=marker_name, tag=tag))
+        db.add(MarkerTag(measurement_type_id=measurement_type.id, tag=tag))
     await db.commit()
     return unique_tags
 

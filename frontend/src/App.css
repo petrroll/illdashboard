@@ -951,3 +951,128 @@ input[type="checkbox"] {
 .recharts-label {
   fill: var(--text-muted);
 }
+
+/* ── Tag components ──────────────────────────────────────────────────────── */
+
+.tag-input-wrapper,
+.tag-filter-wrapper {
+  position: relative;
+}
+
+.tag-input-box {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  padding: 0.35rem 0.5rem;
+  background: var(--card-bg);
+  border: 1px solid #303c4d;
+  border-radius: 6px;
+  align-items: center;
+  min-height: 2rem;
+}
+
+.tag-input-box:focus-within {
+  border-color: var(--accent);
+}
+
+.tag-input-field {
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  outline: none;
+  padding: 0.15rem 0;
+  min-width: 80px;
+  flex: 1;
+  font-size: 0.85rem;
+}
+
+.tag-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 12px;
+  font-size: 0.78rem;
+  font-weight: 500;
+  background: #253040;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.tag-pill button {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.9rem;
+  padding: 0 0.1rem;
+  line-height: 1;
+  opacity: 0.7;
+}
+
+.tag-pill button:hover {
+  opacity: 1;
+}
+
+.tag-pill-filter {
+  background: #1c3a2e;
+  color: #12c78e;
+}
+
+.tag-suggestions {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  margin: 0.25rem 0 0;
+  padding: 0.25rem 0;
+  list-style: none;
+  background: var(--card-bg);
+  border: 1px solid #303c4d;
+  border-radius: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.tag-suggestions li {
+  padding: 0.35rem 0.75rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--text-primary);
+}
+
+.tag-suggestions li:hover,
+.tag-suggestions li.highlighted {
+  background: #253040;
+}
+
+/* Inline tag display (read-only pills) */
+.tag-list {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.2rem;
+}
+
+.tag-list .tag-pill {
+  cursor: default;
+}
+
+/* Tag filter bar in search areas */
+.tag-filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.tag-filter-bar > label {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.tag-filter-bar .tag-filter-wrapper {
+  flex: 1;
+}

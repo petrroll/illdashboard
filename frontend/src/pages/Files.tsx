@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import api from "../api";
+import api, { fetchFileTags, setFileTags } from "../api";
+import TagInput from "../components/TagInput";
+import TagFilter from "../components/TagFilter";
 import type { LabFile } from "../types";
 
 interface OcrProgress {
@@ -48,11 +50,24 @@ export default function Files() {
   // Maps file_id -> current processing status
   const [fileProgress, setFileProgress] = useState<Map<number, OcrProgress>>(new Map());
   const inputRef = useRef<HTMLInputElement>(null);
+  const [allFileTags, setAllFileTags] = useState<string[]>([]);
+  const [filterTags, setFilterTags] = useState<string[]>([]);
+  const [editingTagsFileId, setEditingTagsFileId] = useState<number | null>(null);
 
-  const load = () => api.get<LabFile[]>("/files").then((r) => setFiles(r.data));
+  const load = () => {
+    const params = new URLSearchParams();
+    for (const t of filterTags) params.append("tags", t);
+    api.get<LabFile[]>("/files", { params }).then((r) => setFiles(r.data));
+  };
+
+  const loadAllTags = () => fetchFileTags().then(setAllFileTags);
 
   useEffect(() => {
     load();
+  }, [filterTags]);
+
+  useEffect(() => {
+    loadAllTags();
   }, []);
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -191,9 +206,26 @@ export default function Files() {
         </div>
       )}
 
+      {/* Tag filter */}
+      {allFileTags.length > 0 && (
+        <div className="tag-filter-bar">
+          <label>Filter by tags:</label>
+          <TagFilter
+            selected={filterTags}
+            allTags={allFileTags}
+            onChange={setFilterTags}
+            label="Select tags to filter…"
+          />
+        </div>
+      )}
+
       {/* File list */}
       {files.length === 0 ? (
-        <p style={{ color: "var(--text-muted)" }}>No files uploaded yet.</p>
+        <p style={{ color: "var(--text-muted)" }}>
+          {filterTags.length > 0
+            ? "No files match the selected tags."
+            : "No files uploaded yet."}
+        </p>
       ) : (
         <table>
           <thead>
@@ -207,6 +239,7 @@ export default function Files() {
               </th>
               <th>Filename</th>
               <th>Type</th>
+              <th>Tags</th>
               <th>Lab Date</th>
               <th>Uploaded</th>
               <th>OCR</th>
@@ -227,6 +260,37 @@ export default function Files() {
                   <Link to={`/files/${f.id}`}>{f.filename}</Link>
                 </td>
                 <td>{f.mime_type}</td>
+                <td style={{ minWidth: "160px" }}>
+                  {editingTagsFileId === f.id ? (
+                    <TagInput
+                      tags={f.tags}
+                      allTags={allFileTags}
+                      onChange={async (newTags) => {
+                        const saved = await setFileTags(f.id, newTags);
+                        setFiles((prev) =>
+                          prev.map((file) =>
+                            file.id === f.id ? { ...file, tags: saved } : file,
+                          ),
+                        );
+                        loadAllTags();
+                      }}
+                      placeholder="Add tag…"
+                    />
+                  ) : (
+                    <div
+                      className="tag-list"
+                      onClick={() => setEditingTagsFileId(f.id)}
+                      style={{ cursor: "pointer", minHeight: "1.5rem" }}
+                      title="Click to edit tags"
+                    >
+                      {f.tags.length > 0
+                        ? f.tags.map((t) => (
+                            <span key={t} className="tag-pill">{t}</span>
+                          ))
+                        : <span style={{ color: "var(--text-muted)", fontSize: "0.8rem" }}>+ tag</span>}
+                    </div>
+                  )}
+                </td>
                 <td>
                   {f.lab_date
                     ? new Date(f.lab_date).toLocaleDateString()

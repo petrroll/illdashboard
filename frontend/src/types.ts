@@ -6,6 +6,7 @@ export interface LabFile {
   uploaded_at: string;
   ocr_raw: string | null;
   lab_date: string | null;
+  tags: string[];
 }
 
 export interface Measurement {
@@ -30,6 +31,7 @@ export interface MarkerOverviewItem {
   total_count: number;
   value_min: number | null;
   value_max: number | null;
+  tags: string[];
 }
 
 export interface MarkerOverviewGroup {
@@ -47,6 +49,7 @@ export interface MarkerDetailResponse {
   measurements: Measurement[];
   explanation: string | null;
   explanation_cached: boolean;
+  tags: string[];
 }
 
 export interface MarkerInsightResponse {
@@ -65,4 +68,8 @@ export interface ExplainRequest {
 
 export interface ExplainResponse {
   explanation: string;
+}
+
+export interface NormalizeMarkersResponse {
+  updated: number;
 }

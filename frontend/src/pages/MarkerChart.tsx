@@ -13,7 +13,9 @@ import {
 } from "recharts";
 import ReactMarkdown from "react-markdown";
 import { Link } from "react-router-dom";
-import api from "../api";
+import api, { fetchMarkerTags, setMarkerTags } from "../api";
+import TagInput from "../components/TagInput";
+import TagFilter from "../components/TagFilter";
 import type {
   MarkerDetailResponse,
   MarkerOverviewGroup,
@@ -50,6 +52,8 @@ export default function MarkerChart() {
   const [listPaneWidth, setListPaneWidth] = useState(getStoredListPaneWidth);
   const deferredSearch = useDeferredValue(search.trim().toLowerCase());
   const markerBrowserRef = useRef<HTMLDivElement | null>(null);
+  const [allMarkerTags, setAllMarkerTags] = useState<string[]>([]);
+  const [filterTags, setFilterTags] = useState<string[]>([]);
 
   const clampListPaneWidth = (nextWidth: number) => {
     const browserWidth = markerBrowserRef.current?.clientWidth ?? window.innerWidth;
@@ -66,7 +70,11 @@ export default function MarkerChart() {
     const loadOverview = async () => {
       setLoadingOverview(true);
       try {
-        const response = await api.get<MarkerOverviewGroup[]>("/measurements/overview");
+        const params = new URLSearchParams();
+        for (const t of filterTags) params.append("tags", t);
+        const response = await api.get<MarkerOverviewGroup[]>("/measurements/overview", {
+          params,
+        });
         if (cancelled) return;
         setOverview(response.data);
 
@@ -84,6 +92,10 @@ export default function MarkerChart() {
     return () => {
       cancelled = true;
     };
+  }, [filterTags]);
+
+  useEffect(() => {
+    fetchMarkerTags().then(setAllMarkerTags);
   }, []);
 
   useEffect(() => {
@@ -154,8 +166,10 @@ export default function MarkerChart() {
     .map((group) => ({
       ...group,
       markers: group.markers.filter((marker) => {
-        if (!deferredSearch) return true;
-        return marker.marker_name.toLowerCase().includes(deferredSearch);
+        if (deferredSearch && !marker.marker_name.toLowerCase().includes(deferredSearch)) {
+          return false;
+        }
+        return true;
       }),
     }))
     .filter((group) => group.markers.length > 0);
@@ -300,6 +314,18 @@ export default function MarkerChart() {
           />
         </label>
 
+        {allMarkerTags.length > 0 && (
+          <div className="tag-filter-bar" style={{ margin: "0.5rem 0.75rem 0" }}>
+            <label>Tags:</label>
+            <TagFilter
+              selected={filterTags}
+              allTags={allMarkerTags}
+              onChange={setFilterTags}
+              label="Filter by marker tags…"
+            />
+          </div>
+        )}
+
         {loadingOverview ? (
           <div className="card-empty">
             <span className="spinner" /> Loading biomarkers…
@@ -341,7 +367,16 @@ export default function MarkerChart() {
                       >
                         <div className="marker-row-name">
                           <strong>{item.marker_name}</strong>
-                          <span>{formatDate(latest.measured_at)}</span>
+                          <span>
+                            {formatDate(latest.measured_at)}
+                            {item.tags.length > 0 && (
+                              <span className="tag-list" style={{ marginLeft: "0.3rem" }}>
+                                {item.tags.map((t) => (
+                                  <span key={t} className="tag-pill" style={{ fontSize: "0.7rem" }}>{t}</span>
+                                ))}
+                              </span>
+                            )}
+                          </span>
                         </div>
 
                         <div className="marker-row-value">
@@ -398,6 +433,28 @@ export default function MarkerChart() {
                 <p className="detail-latest-meta">
                   Latest result on {formatDate(summarySource.latest_measurement.measured_at)}
                 </p>
+                <div style={{ marginTop: "0.35rem" }}>
+                  <TagInput
+                    tags={detail?.tags ?? summarySource.tags}
+                    allTags={allMarkerTags}
+                    onChange={async (newTags) => {
+                      const saved = await setMarkerTags(summarySource.marker_name, newTags);
+                      if (detail) {
+                        setDetail({ ...detail, tags: saved });
+                      }
+                      setOverview((prev) =>
+                        prev.map((g) => ({
+                          ...g,
+                          markers: g.markers.map((m) =>
+                            m.marker_name === summarySource.marker_name ? { ...m, tags: saved } : m,
+                          ),
+                        })),
+                      );
+                      fetchMarkerTags().then(setAllMarkerTags);
+                    }}
+                    placeholder="Add marker tag…"
+                  />
+                </div>
               </div>
               <span className={`status-pill status-${summarySource.status}`}>
                 {summarySource.status === "in_range"

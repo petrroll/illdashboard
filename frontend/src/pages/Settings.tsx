@@ -1,7 +1,11 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import api from "../api";
-import type { LabFile, Measurement } from "../types";
+import type {
+  LabFile,
+  Measurement,
+  NormalizeMarkersResponse,
+} from "../types";
 
 export default function Settings() {
   const [files, setFiles] = useState<LabFile[]>([]);
@@ -13,12 +17,20 @@ export default function Settings() {
   const [confirming, setConfirming] = useState<string | null>(null);
   const [loading, setLoading] = useState<string | null>(null);
 
+  const loadSettingsData = async () => {
+    const [filesResponse, markersResponse, measurementsResponse] = await Promise.all([
+      api.get<LabFile[]>("/files"),
+      api.get<string[]>("/measurements/markers"),
+      api.get<Measurement[]>("/measurements"),
+    ]);
+
+    setFiles(filesResponse.data);
+    setMarkers(markersResponse.data);
+    setRecentMeasurements(measurementsResponse.data.slice(-10));
+  };
+
   useEffect(() => {
-    api.get<LabFile[]>("/files").then((r) => setFiles(r.data));
-    api.get<string[]>("/measurements/markers").then((r) => setMarkers(r.data));
-    api
-      .get<Measurement[]>("/measurements")
-      .then((r) => setRecentMeasurements(r.data.slice(-10)));
+    loadSettingsData();
   }, []);
 
   const handleAction = async (action: string) => {
@@ -30,7 +42,11 @@ export default function Settings() {
     setLoading(action);
     setActionResult(null);
     try {
-      if (action === "purge-explanations") {
+      if (action === "normalize-markers") {
+        const r = await api.post<NormalizeMarkersResponse>("/measurements/normalize");
+        setActionResult(`Normalized markers. Updated ${r.data.updated} marker definitions.`);
+        await loadSettingsData();
+      } else if (action === "purge-explanations") {
         const r = await api.delete("/admin/cache/explanations");
         setActionResult(`Purged ${r.data.deleted_explanations} cached explanations.`);
       } else if (action === "purge-all") {
@@ -78,6 +94,22 @@ export default function Settings() {
       <div className="card" style={{ marginBottom: "1.5rem" }}>
         <h3 style={{ marginBottom: "0.75rem" }}>Maintenance</h3>
         <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+            <button
+              className="btn btn-outline"
+              disabled={loading !== null}
+              onClick={() => handleAction("normalize-markers")}
+            >
+              {loading === "normalize-markers"
+                ? "Normalizing…"
+                : confirming === "normalize-markers"
+                ? "Click again to confirm"
+                : "Normalize Marker Names"}
+            </button>
+            <span style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>
+              Merge duplicate biomarker names into their canonical marker definitions.
+            </span>
+          </div>
           <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
             <button
               className="btn btn-outline"
