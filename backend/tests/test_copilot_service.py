@@ -191,3 +191,19 @@ async def test_ask_adds_observed_usage_even_when_send_fails():
 
     add_mock.assert_called_once_with(1.0)
     session.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_normalize_marker_names_prompt_prefers_english_for_czech_labels():
+    response = '{"Leukocyty": "White Blood Cell (WBC) Count"}'
+
+    with patch("illdashboard.copilot_service._ask", new=AsyncMock(return_value=response)) as ask_mock:
+        result = await copilot_service.normalize_marker_names(["Leukocyty"], ["Hemoglobin"])
+
+    assert result == {"Leukocyty": "White Blood Cell (WBC) Count"}
+    assert ask_mock.await_count == 1
+
+    system_prompt, user_prompt = ask_mock.await_args.args
+    assert "including Czech, prefer the English canonical medical name" in system_prompt
+    assert '"Lymfocyty -abs.počet": "Absolute Lymphocyte Count"' in system_prompt
+    assert "NEW marker names to normalize:\n- Leukocyty\n" in user_prompt

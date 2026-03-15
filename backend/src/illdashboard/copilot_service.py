@@ -337,12 +337,14 @@ For each new marker name, decide:
 spacing, abbreviation, or punctuation), map it to that existing canonical name.
 - If it is genuinely new (no match in the existing list), return a cleaned-up, \
 standard English canonical lab marker name when you can translate it confidently.
+- If the source label is in another language, including Czech, prefer the English \
+canonical medical name instead of preserving the source-language wording.
 - Prefer concise English medical names such as \"White Blood Cell (WBC) Count\" \
 or \"Platelet Count\" over local-language labels.
 
 Return ONLY valid JSON: a mapping object where keys are the original new names \
 and values are the canonical names.
-Example: {"Lymfocyty -abs.počet": "Lymfocyty - abs.počet", "Hemoglobin": "Hemoglobin"}
+Example: {"Lymfocyty -abs.počet": "Absolute Lymphocyte Count", "Hemoglobin": "Hemoglobin"}
 Do not include any commentary outside the JSON.\
 """
 
