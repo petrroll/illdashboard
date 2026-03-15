@@ -5,6 +5,9 @@ export interface LabFile {
   mime_type: string;
   uploaded_at: string;
   ocr_raw: string | null;
+  ocr_text_raw: string | null;
+  ocr_text_english: string | null;
+  ocr_summary_english: string | null;
   lab_date: string | null;
   tags: string[];
 }
@@ -80,4 +83,19 @@ export interface ExplainResponse {
 
 export interface NormalizeMarkersResponse {
   updated: number;
+}
+
+export interface SearchSnippet {
+  source: string;
+  text: string;
+}
+
+export interface SearchResult {
+  file_id: number;
+  filename: string;
+  uploaded_at: string;
+  lab_date: string | null;
+  tags: string[];
+  marker_names: string[];
+  snippets: SearchSnippet[];
 }

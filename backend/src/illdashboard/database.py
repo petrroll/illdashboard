@@ -22,6 +22,26 @@ async def _sqlite_measurements_columns(conn: AsyncConnection) -> dict[str, dict[
     return {row[1]: {"name": row[1], "notnull": row[3]} for row in result.fetchall()}
 
 
+async def _sqlite_table_columns(conn: AsyncConnection, table_name: str) -> dict[str, dict[str, int | str]]:
+    result = await conn.exec_driver_sql(f"PRAGMA table_info({table_name})")
+    return {row[1]: {"name": row[1], "notnull": row[3]} for row in result.fetchall()}
+
+
+async def _upgrade_sqlite_lab_files_table(conn: AsyncConnection) -> None:
+    columns = await _sqlite_table_columns(conn, "lab_files")
+    if not columns:
+        return
+
+    if "ocr_text_raw" not in columns:
+        await conn.exec_driver_sql("ALTER TABLE lab_files ADD COLUMN ocr_text_raw TEXT")
+
+    if "ocr_text_english" not in columns:
+        await conn.exec_driver_sql("ALTER TABLE lab_files ADD COLUMN ocr_text_english TEXT")
+
+    if "ocr_summary_english" not in columns:
+        await conn.exec_driver_sql("ALTER TABLE lab_files ADD COLUMN ocr_summary_english TEXT")
+
+
 async def _upgrade_sqlite_measurements_table(conn: AsyncConnection) -> None:
     columns = await _sqlite_measurements_columns(conn)
     if not columns:
@@ -87,6 +107,7 @@ async def _upgrade_sqlite_measurements_table(conn: AsyncConnection) -> None:
 async def upgrade_database_schema(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         if conn.dialect.name == "sqlite":
+            await _upgrade_sqlite_lab_files_table(conn)
             await _upgrade_sqlite_measurements_table(conn)
 
 

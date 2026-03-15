@@ -128,6 +128,9 @@ async def test_upload_same_file_twice_returns_existing_record(client):
 
 OCR_RESULT = {
     "lab_date": "2025-09-05",
+    "raw_text": "Sodium 140 mmol/l\nPotassium 4.2 mmol/l",
+    "translated_text_english": "Sodium 140 mmol/l\nPotassium 4.2 mmol/l",
+    "summary_english": "This report shows sodium and potassium within the stated reference ranges. No abnormal electrolyte finding is visible in the extracted results.",
     "measurements": [
         {"marker_name": "Sodium", "value": 140, "unit": "mmol/l", "reference_low": 136, "reference_high": 145, "measured_at": "2025-09-05"},
         {"marker_name": "Potassium", "value": 4.2, "unit": "mmol/l", "reference_low": 3.5, "reference_high": 5.1, "measured_at": "2025-09-05"},
@@ -136,6 +139,9 @@ OCR_RESULT = {
 
 MAGNESIUM_RESULT = {
     "lab_date": "2025-09-05",
+    "raw_text": "Magnesium 0.85 mmol/l",
+    "translated_text_english": "Magnesium 0.85 mmol/l",
+    "summary_english": "This report contains a magnesium result in the expected range.",
     "measurements": [
         {"marker_name": "Magnesium", "value": 0.85, "unit": "mmol/l", "reference_low": 0.7, "reference_high": 1.0, "measured_at": "2025-09-05"},
     ],
@@ -143,6 +149,9 @@ MAGNESIUM_RESULT = {
 
 OVERVIEW_RESULT = {
     "lab_date": "2025-09-05",
+    "raw_text": "Platelet Count 148 10^9/L\nHemoglobin 156 g/L",
+    "translated_text_english": "Platelet Count 148 10^9/L\nHemoglobin 156 g/L",
+    "summary_english": "Platelet count is slightly below the stated reference range while hemoglobin is within range.",
     "measurements": [
         {
             "marker_name": "Platelet Count",
@@ -165,6 +174,9 @@ OVERVIEW_RESULT = {
 
 OVERVIEW_UPDATED_RESULT = {
     "lab_date": "2025-10-05",
+    "raw_text": "Platelet Count 179 10^9/L\nHemoglobin 154 g/L",
+    "translated_text_english": "Platelet Count 179 10^9/L\nHemoglobin 154 g/L",
+    "summary_english": "Platelet count and hemoglobin are both within the stated reference ranges on this follow-up.",
     "measurements": [
         {
             "marker_name": "Platelet Count",
@@ -356,6 +368,106 @@ async def test_ocr_adds_normalized_source_tag_and_preserves_existing_tags(client
     detail_resp = await client.get(f"/api/files/{file_id}")
     assert detail_resp.status_code == 200
     assert detail_resp.json()["tags"] == ["fasting", "source:jaeger"]
+
+
+@pytest.mark.asyncio
+async def test_ocr_persists_raw_and_translated_text_for_non_lab_documents(client):
+    file_id = await _upload_pdf(client, filename="admin-note.pdf")
+
+    non_lab_result = {
+        "lab_date": None,
+        "source": None,
+        "raw_text": "Vystavena faktura za administrativni poplatek.",
+        "translated_text_english": "Invoice issued for an administrative fee.",
+        "summary_english": "This document is an administrative invoice rather than a lab report.",
+        "measurements": [],
+    }
+
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=non_lab_result):
+        resp = await client.post(f"/api/files/{file_id}/ocr")
+
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+    detail_resp = await client.get(f"/api/files/{file_id}")
+    assert detail_resp.status_code == 200
+    body = detail_resp.json()
+    assert body["ocr_text_raw"] == "Vystavena faktura za administrativni poplatek."
+    assert body["ocr_text_english"] == "Invoice issued for an administrative fee."
+    assert body["ocr_summary_english"] == "This document is an administrative invoice rather than a lab report."
+
+
+@pytest.mark.asyncio
+async def test_search_finds_files_by_translated_text_tags_and_measurements(client):
+    lab_file_id = await _upload_pdf(client, filename="iron-panel.pdf")
+    note_file_id = await _upload_pdf(client, filename="admin-note.pdf")
+
+    ferritin_result = {
+        "lab_date": "2025-09-05",
+        "source": None,
+        "raw_text": "Feritin 414 ug/l\nPacient nalacno.",
+        "translated_text_english": "Ferritin 414 ug/l\nPatient fasting.",
+        "summary_english": "This fasting lab report shows an elevated ferritin result.",
+        "measurements": [
+            {
+                "marker_name": "Ferritin",
+                "value": 414,
+                "unit": "ug/l",
+                "reference_low": 30,
+                "reference_high": 400,
+                "measured_at": "2025-09-05",
+            }
+        ],
+    }
+    note_result = {
+        "lab_date": None,
+        "source": None,
+        "raw_text": "Doporuceni k administrativni kontrole.",
+        "translated_text_english": "Recommendation for an administrative review.",
+        "summary_english": "This document contains an administrative follow-up recommendation.",
+        "measurements": [],
+    }
+
+    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, side_effect=[ferritin_result, note_result]):
+        first_resp = await client.post(f"/api/files/{lab_file_id}/ocr")
+        second_resp = await client.post(f"/api/files/{note_file_id}/ocr")
+
+    assert first_resp.status_code == 200
+    assert second_resp.status_code == 200
+
+    fasting_tag_resp = await client.put(f"/api/files/{lab_file_id}/tags", json={"tags": ["fasting", "iron"]})
+    assert fasting_tag_resp.status_code == 200
+
+    ferritin_search = await client.get("/api/search", params={"q": "ferritin"})
+    assert ferritin_search.status_code == 200
+    ferritin_body = ferritin_search.json()
+    assert len(ferritin_body) == 1
+    assert ferritin_body[0]["file_id"] == lab_file_id
+    assert ferritin_body[0]["marker_names"] == ["Ferritin"]
+    snippet_sources = [s["source"] for s in ferritin_body[0]["snippets"]]
+    assert any(s in {"summary", "translated_text", "measurements"} for s in snippet_sources)
+
+    summary_search = await client.get("/api/search", params={"q": "elevated ferritin"})
+    assert summary_search.status_code == 200
+    summary_body = summary_search.json()
+    assert len(summary_body) == 1
+    assert summary_body[0]["file_id"] == lab_file_id
+    assert any(s["source"] == "summary" for s in summary_body[0]["snippets"])
+
+    translated_search = await client.get("/api/search", params={"q": "administrative"})
+    assert translated_search.status_code == 200
+    translated_body = translated_search.json()
+    assert len(translated_body) == 1
+    assert translated_body[0]["file_id"] == note_file_id
+    translated_sources = [s["source"] for s in translated_body[0]["snippets"]]
+    assert any(s in {"summary", "translated_text"} for s in translated_sources)
+
+    tagged_search = await client.get("/api/search", params=[("q", "patient"), ("tags", "fasting")])
+    assert tagged_search.status_code == 200
+    tagged_body = tagged_search.json()
+    assert len(tagged_body) == 1
+    assert tagged_body[0]["file_id"] == lab_file_id
+    assert tagged_body[0]["tags"] == ["fasting", "iron"]
 
 
 @pytest.mark.asyncio

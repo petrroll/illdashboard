@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from illdashboard.database import create_database_engine, get_db
 from illdashboard.models import Base
+from illdashboard.services.search import ensure_search_schema
 
 
 @pytest.fixture
@@ -20,6 +21,10 @@ async def client(tmp_path):
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as session:
+        await ensure_search_schema(session)
+        await session.commit()
 
     async def _get_db():
         async with session_factory() as session:

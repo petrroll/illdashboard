@@ -240,6 +240,38 @@ export default function FileDetail() {
         )}
       </div>
 
+      {file.ocr_summary_english && (
+        <section className="card ocr-summary-card">
+          <div className="ocr-summary-eyebrow">English summary</div>
+          <p>{file.ocr_summary_english}</p>
+        </section>
+      )}
+
+      {(file.ocr_text_english || file.ocr_text_raw) && (
+        <details className="card ocr-text-details">
+          <summary>
+            <span>Extracted document text</span>
+            <span className="ocr-text-details-hint">English and Czech/original OCR text</span>
+          </summary>
+
+          <div className="ocr-text-grid">
+            {file.ocr_text_english && (
+              <section className="ocr-text-card ocr-text-card-muted">
+                <h3>English OCR Text</h3>
+                <pre>{file.ocr_text_english}</pre>
+              </section>
+            )}
+
+            {file.ocr_text_raw && (
+              <section className="ocr-text-card ocr-text-card-muted">
+                <h3>Raw OCR Text</h3>
+                <pre>{file.ocr_text_raw}</pre>
+              </section>
+            )}
+          </div>
+        </details>
+      )}
+
       {/* Side-by-side: document preview + measurements */}
       <div className="file-detail-split">
         {/* Document preview */}

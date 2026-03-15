@@ -16,6 +16,7 @@ from illdashboard.copilot_service import shutdown_client
 from illdashboard.api import router
 from illdashboard.database import async_session, engine, upgrade_database_schema
 from illdashboard.models import Base, LabFile
+import illdashboard.services.search as search_service
 
 
 PRELOADABLE_MIME_TYPES = {
@@ -112,11 +113,18 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await upgrade_database_schema(engine)
+    # Create FTS5 virtual table for search (not handled by SQLAlchemy metadata)
+    async with async_session() as session:
+        await search_service.ensure_search_schema(session)
+        await session.commit()
     # Ensure upload directory exists
     Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
     preloaded_files = await preload_uploaded_files()
     if preloaded_files:
         logger.info("Preloaded %s uploaded files from disk", preloaded_files)
+    async with async_session() as session:
+        await search_service.rebuild_lab_search_index(session)
+        await session.commit()
     yield
     # Shutdown Copilot SDK client
     await shutdown_client()

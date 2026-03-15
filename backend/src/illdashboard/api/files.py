@@ -22,6 +22,7 @@ from illdashboard.database import get_db
 from illdashboard.models import LabFile, LabFileTag, Measurement
 from illdashboard.schemas import BatchOcrRequest, LabFileOut, MeasurementOut
 from illdashboard.services import ocr as ocr_service
+from illdashboard.services import search as search_service
 
 
 router = APIRouter(prefix="")
@@ -157,6 +158,7 @@ async def delete_file(file_id: int, db: AsyncSession = Depends(get_db)):
     file_path = Path(settings.UPLOAD_DIR) / lab.filepath
     if file_path.exists():
         os.remove(file_path)
+    await search_service.remove_lab_search_document(lab.id, db)
     await db.delete(lab)
     await db.commit()
     return {"ok": True}

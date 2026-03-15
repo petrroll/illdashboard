@@ -4,12 +4,14 @@ Uses the official Copilot SDK (github-copilot-sdk) which manages the
 copilot CLI subprocess, authentication, and model communication.
 """
 
+import asyncio
 import json
 import logging
 import math
 import os
 import tempfile
 from pathlib import Path
+from typing import cast
 
 import fitz  # PyMuPDF
 from copilot import CopilotClient, PermissionHandler
@@ -140,19 +142,21 @@ def _retryable_pdf_error_reason(exc: Exception) -> str:
 
 # ── OCR ──────────────────────────────────────────────────────────────────────
 
-OCR_SYSTEM_PROMPT = """\
-You are a medical lab report OCR assistant. The user will provide an image or \
-PDF of a lab report as a file attachment. Your job is to:
+MEDICAL_OCR_SYSTEM_PROMPT = """\
+You are a medical lab report extraction assistant. The user will provide an image or \
+PDF of a document. Your job is to:
 
 1. Identify every measured lab marker (e.g. Hemoglobin, WBC, Glucose…).
     This includes qualitative serology and immunology markers reported as positive/negative/reactive/not detected.
 2. Identify the lab/report source when possible (for example Synlab, Jaeger, Unilabs).
 3. For each marker return a JSON array of objects with keys:
     "marker_name", "value" (number for numeric results, string for qualitative results), "unit", "reference_low" (numeric or null),
-   "reference_high" (numeric or null), "measured_at" (ISO date string or null),
-   "page_number" (integer, 1-indexed – which page/image the value appears on).
+    "reference_high" (numeric or null), "measured_at" (ISO date string or null),
+    "page_number" (integer, 1-indexed – which page/image the value appears on).
 4. Also return "lab_date" (ISO date string or null) for the report date.
 5. Also return "source" as a short raw source/provider name string, or null if unclear.
+
+If the document is not a lab report, return an empty "measurements" array instead of inventing measurements.
 
 CRITICAL rules for values:
 - Use a JSON number in "value" when the report shows a numeric result.
@@ -176,6 +180,43 @@ If there is only one page/image, set "page_number" to 1 for all measurements.
 Use the provided original filename as an additional hint for the source only when it helps.
 
 Return ONLY valid JSON: {"lab_date": "...", "source": "...", "measurements": [...]}.
+Do not include any commentary outside the JSON.\
+"""
+
+
+TEXT_OCR_SYSTEM_PROMPT = """\
+You are a document OCR assistant. The user will provide an image or PDF of a document.
+
+Your job is to:
+1. Transcribe ALL visible text into "raw_text" in the original document language.
+2. Translate the full document text into English in "translated_text_english".
+
+Rules:
+- Always include all visible text, even when the document is administrative or not medical.
+- Preserve the document order of the text.
+- If the document is already in English, "translated_text_english" may match "raw_text".
+
+Return ONLY valid JSON: {"raw_text": "...", "translated_text_english": "..."}.
+Do not include any commentary outside the JSON.\
+"""
+
+
+MEDICAL_SUMMARY_SYSTEM_PROMPT = """\
+You are a medical summarization assistant.
+
+The user will provide:
+1. Structured medical extraction from a lab or related document.
+2. English-translated document text when available.
+3. The original filename.
+
+Your job is to write a short factual English summary in 2-4 sentences.
+- Focus on the medical meaning of the extracted content when measurements are present.
+- Mention notable abnormal or clearly important findings when they are visible.
+- If there are no measurements, summarize what kind of document it appears to be.
+- Do not repeat the entire OCR text.
+- Do not add generic cautions or boilerplate.
+
+Return ONLY valid JSON: {"summary_english": "..."}.
 Do not include any commentary outside the JSON.\
 """
 
@@ -208,11 +249,44 @@ async def _ocr_extract_from_attachments(attachments: list[dict], *, filename: st
         prompt = f"Original filename: {filename}\n\n{prompt}"
 
     raw = await _ask(
-        OCR_SYSTEM_PROMPT,
+        MEDICAL_OCR_SYSTEM_PROMPT,
         prompt,
         attachments=attachments,
     )
     return _parse_json_response(raw)
+
+
+async def _extract_document_text_from_attachments(attachments: list[dict], *, filename: str | None = None) -> dict:
+    prompt = "Transcribe all visible text from the attached document and translate it to English."
+    if filename:
+        prompt = f"Original filename: {filename}\n\n{prompt}"
+
+    raw = await _ask(
+        TEXT_OCR_SYSTEM_PROMPT,
+        prompt,
+        attachments=attachments,
+    )
+    return _parse_json_response(raw)
+
+
+async def _generate_medical_summary(
+    medical_result: dict,
+    text_result: dict | None,
+    *,
+    filename: str | None = None,
+) -> str | None:
+    user_payload = {
+        "filename": filename,
+        "translated_text_english": (text_result or {}).get("translated_text_english"),
+        "medical_extraction": medical_result,
+    }
+    raw = await _ask(
+        MEDICAL_SUMMARY_SYSTEM_PROMPT,
+        json.dumps(user_payload, ensure_ascii=False, indent=2),
+    )
+    parsed = _parse_json_response(raw)
+    summary = parsed.get("summary_english")
+    return summary.strip() if isinstance(summary, str) and summary.strip() else None
 
 
 def _offset_result_page_numbers(result: dict, page_offset: int) -> dict:
@@ -245,6 +319,36 @@ def _merge_ocr_results(results: list[dict]) -> dict:
     return merged
 
 
+def _merge_document_text_results(results: list[dict]) -> dict:
+    raw_text_parts = [str(result.get("raw_text", "")).strip() for result in results if result.get("raw_text")]
+    translated_parts = [
+        str(result.get("translated_text_english", "")).strip()
+        for result in results
+        if result.get("translated_text_english")
+    ]
+    merged: dict[str, str] = {}
+    if raw_text_parts:
+        merged["raw_text"] = "\n\n".join(part for part in raw_text_parts if part)
+    if translated_parts:
+        merged["translated_text_english"] = "\n\n".join(part for part in translated_parts if part)
+    return merged
+
+
+def _combine_ocr_outputs(medical_result: dict, text_result: dict | None, summary_english: str | None) -> dict:
+    combined = {
+        "lab_date": medical_result.get("lab_date"),
+        "source": medical_result.get("source"),
+        "measurements": medical_result.get("measurements", []),
+    }
+    if text_result and text_result.get("raw_text"):
+        combined["raw_text"] = text_result["raw_text"]
+    if text_result and text_result.get("translated_text_english"):
+        combined["translated_text_english"] = text_result["translated_text_english"]
+    if summary_english:
+        combined["summary_english"] = summary_english
+    return combined
+
+
 async def _ocr_extract_pdf_batch(
     pdf_path: str,
     *,
@@ -258,6 +362,27 @@ async def _ocr_extract_pdf_batch(
         temp_images = _pdf_to_images(pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi)
         attachments = [{"type": "file", "path": path} for path in temp_images]
         return await _ocr_extract_from_attachments(attachments, filename=filename)
+    finally:
+        for path in temp_images:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+async def _extract_document_text_pdf_batch(
+    pdf_path: str,
+    *,
+    start_page: int,
+    stop_page: int,
+    dpi: int,
+    filename: str | None = None,
+) -> dict:
+    temp_images: list[str] = []
+    try:
+        temp_images = _pdf_to_images(pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi)
+        attachments = [{"type": "file", "path": path} for path in temp_images]
+        return await _extract_document_text_from_attachments(attachments, filename=filename)
     finally:
         for path in temp_images:
             try:
@@ -376,6 +501,116 @@ async def _ocr_extract_pdf_range(
         raise
 
 
+async def _extract_document_text_pdf_range(
+    pdf_path: str,
+    *,
+    start_page: int,
+    stop_page: int,
+    dpi: int = OCR_PDF_RENDER_DPI,
+    filename: str | None = None,
+) -> dict:
+    page_count = stop_page - start_page
+
+    try:
+        return await _extract_document_text_pdf_batch(
+            pdf_path,
+            start_page=start_page,
+            stop_page=stop_page,
+            dpi=dpi,
+            filename=filename,
+        )
+    except Exception as exc:
+        retry_reason = _retryable_pdf_error_reason(exc)
+        if not _is_retryable_pdf_error(exc):
+            logger.exception(
+                "OCR text extraction failed for %s (filename=%s, pages=%s-%s, dpi=%s)",
+                pdf_path,
+                filename,
+                start_page + 1,
+                stop_page,
+                dpi,
+            )
+            raise
+
+        if page_count > 1 and (_is_request_timeout_error(exc) or _is_rate_limited_error(exc)):
+            logger.warning(
+                "OCR text batch request failed for %s (filename=%s, pages=%s-%s, dpi=%s, reason=%s); falling back to single-page retries",
+                pdf_path,
+                filename,
+                start_page + 1,
+                stop_page,
+                dpi,
+                retry_reason,
+            )
+            results: list[dict] = []
+            for page_index in range(start_page, stop_page):
+                results.append(
+                    await _extract_document_text_pdf_range(
+                        pdf_path,
+                        start_page=page_index,
+                        stop_page=page_index + 1,
+                        dpi=dpi,
+                        filename=filename,
+                    )
+                )
+            return _merge_document_text_results(results)
+
+        if page_count > 1:
+            logger.warning(
+                "OCR text batch request failed for %s (filename=%s, pages=%s-%s, dpi=%s, reason=%s); splitting batch",
+                pdf_path,
+                filename,
+                start_page + 1,
+                stop_page,
+                dpi,
+                retry_reason,
+            )
+            midpoint = start_page + math.ceil(page_count / 2)
+            left = await _extract_document_text_pdf_range(
+                pdf_path,
+                start_page=start_page,
+                stop_page=midpoint,
+                dpi=dpi,
+                filename=filename,
+            )
+            right = await _extract_document_text_pdf_range(
+                pdf_path,
+                start_page=midpoint,
+                stop_page=stop_page,
+                dpi=dpi,
+                filename=filename,
+            )
+            return _merge_document_text_results([left, right])
+
+        smaller_dpi = max(OCR_PDF_MIN_RENDER_DPI, dpi - 24)
+        if smaller_dpi != dpi:
+            logger.warning(
+                "OCR text page request failed for %s (filename=%s, page=%s, dpi=%s, reason=%s); retrying at dpi=%s",
+                pdf_path,
+                filename,
+                start_page + 1,
+                dpi,
+                retry_reason,
+                smaller_dpi,
+            )
+            return await _extract_document_text_pdf_range(
+                pdf_path,
+                start_page=start_page,
+                stop_page=stop_page,
+                dpi=smaller_dpi,
+                filename=filename,
+            )
+
+        logger.exception(
+            "OCR text extraction failed at minimum DPI for %s (filename=%s, page=%s, dpi=%s)",
+            pdf_path,
+            filename,
+            start_page + 1,
+            dpi,
+        )
+        raise
+
+
 async def _ocr_extract_pdf(pdf_path: str, *, filename: str | None = None) -> dict:
     with fitz.open(pdf_path) as doc:
         page_count = doc.page_count
@@ -395,6 +630,41 @@ async def _ocr_extract_pdf(pdf_path: str, *, filename: str | None = None) -> dic
     return _merge_ocr_results(results)
 
 
+async def _extract_document_text_pdf(pdf_path: str, *, filename: str | None = None) -> dict:
+    with fitz.open(pdf_path) as doc:
+        page_count = doc.page_count
+
+    results: list[dict] = []
+    for start_page in range(0, page_count, OCR_PDF_BATCH_SIZE):
+        stop_page = min(start_page + OCR_PDF_BATCH_SIZE, page_count)
+        results.append(
+            await _extract_document_text_pdf_range(
+                pdf_path,
+                start_page=start_page,
+                stop_page=stop_page,
+                filename=filename,
+            )
+        )
+
+    return _merge_document_text_results(results)
+
+
+async def _extract_medical_data(file_path: str, *, filename: str | None = None) -> dict:
+    if Path(file_path).suffix.lower() == ".pdf":
+        return await _ocr_extract_pdf(file_path, filename=filename)
+
+    attachments = [{"type": "file", "path": file_path}]
+    return await _ocr_extract_from_attachments(attachments, filename=filename)
+
+
+async def _extract_document_text(file_path: str, *, filename: str | None = None) -> dict:
+    if Path(file_path).suffix.lower() == ".pdf":
+        return await _extract_document_text_pdf(file_path, filename=filename)
+
+    attachments = [{"type": "file", "path": file_path}]
+    return await _extract_document_text_from_attachments(attachments, filename=filename)
+
+
 async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
     """Send a lab file to Copilot SDK for OCR extraction.
 
@@ -405,13 +675,48 @@ async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
         file_path: Absolute path to the uploaded file (PDF or image).
 
     Returns:
-        Parsed JSON dict with ``lab_date``, optional ``source``, and ``measurements`` list.
+        Parsed JSON dict with structured medical data plus OCR text and summary when available.
     """
-    if Path(file_path).suffix.lower() == ".pdf":
-        return await _ocr_extract_pdf(file_path, filename=filename)
+    medical_task = asyncio.create_task(_extract_medical_data(file_path, filename=filename))
+    text_task = asyncio.create_task(_extract_document_text(file_path, filename=filename))
 
-    attachments = [{"type": "file", "path": file_path}]
-    return await _ocr_extract_from_attachments(attachments, filename=filename)
+    medical_result_or_error, text_result = await asyncio.gather(
+        medical_task,
+        text_task,
+        return_exceptions=True,
+    )
+
+    if isinstance(medical_result_or_error, BaseException):
+        raise medical_result_or_error
+
+    medical_result = cast(dict, medical_result_or_error)
+
+    usable_text_result: dict | None
+    if isinstance(text_result, BaseException):
+        logger.exception(
+            "Document text extraction failed for %s (filename=%s)",
+            file_path,
+            filename,
+        )
+        usable_text_result = None
+    else:
+        usable_text_result = cast(dict, text_result)
+
+    summary_english: str | None = None
+    try:
+        summary_english = await _generate_medical_summary(
+            medical_result,
+            usable_text_result,
+            filename=filename,
+        )
+    except Exception:
+        logger.exception(
+            "Medical summary generation failed for %s (filename=%s)",
+            file_path,
+            filename,
+        )
+
+    return _combine_ocr_outputs(medical_result, usable_text_result, summary_english)
 
 
 # ── Marker name normalization ─────────────────────────────────────────────────

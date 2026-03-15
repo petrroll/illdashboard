@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from illdashboard.config import settings
 from illdashboard.copilot_service import normalize_marker_names, normalize_source_name, ocr_extract
 from illdashboard.models import LabFile, LabFileTag, Measurement, MeasurementType
+import illdashboard.services.search as search_service
 from illdashboard.services.markers import (
     build_source_tag,
     classify_marker_group,
@@ -138,6 +139,17 @@ def normalize_marker_name_deterministic(name: str) -> str:
     return name.strip()
 
 
+def normalize_document_text(raw) -> str | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized.strip()
+
+
 async def normalize_lab_source(lab: LabFile, result: dict, db: AsyncSession) -> str | None:
     existing_source_result = await db.execute(
         select(LabFileTag.tag).where(LabFileTag.tag.like("source:%")).distinct().order_by(LabFileTag.tag)
@@ -180,6 +192,13 @@ async def sync_lab_source_tag(lab: LabFile, source_value: str | None, db: AsyncS
 
 async def apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list[Measurement]:
     lab.ocr_raw = json.dumps(result)
+    lab.ocr_text_raw = normalize_document_text(result.get("raw_text"))
+    lab.ocr_text_english = normalize_document_text(result.get("translated_text_english") or result.get("translated_text"))
+    if lab.ocr_text_english is None:
+        lab.ocr_text_english = lab.ocr_text_raw
+    lab.ocr_summary_english = normalize_document_text(result.get("summary_english"))
+    if lab.ocr_summary_english is None:
+        lab.ocr_summary_english = lab.ocr_text_english
     if result.get("lab_date"):
         try:
             lab.lab_date = datetime.fromisoformat(result["lab_date"])
@@ -256,10 +275,14 @@ async def persist_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> li
     for measurement in existing.scalars().all():
         await db.delete(measurement)
     lab.ocr_raw = None
+    lab.ocr_text_raw = None
+    lab.ocr_text_english = None
+    lab.ocr_summary_english = None
     await db.flush()
 
     new_measurements = await apply_ocr_result(lab, result, db)
     await db.flush()
+    await search_service.refresh_lab_search_document(lab.id, db)
     return new_measurements
 
 
@@ -414,4 +437,5 @@ async def normalize_existing_measurements(db: AsyncSession) -> int:
         updated += 1
 
     await db.commit()
+    await search_service.rebuild_lab_search_index(db)
     return updated

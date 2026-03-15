@@ -15,6 +15,9 @@ class LabFileOut(BaseModel):
     mime_type: str
     uploaded_at: datetime
     ocr_raw: str | None = None
+    ocr_text_raw: str | None = None
+    ocr_text_english: str | None = None
+    ocr_summary_english: str | None = None
     lab_date: datetime | None = None
     tags: list[str] = Field(default_factory=list)
 
@@ -166,3 +169,18 @@ class ExplainResponse(BaseModel):
 
 class TagsUpdate(BaseModel):
     tags: list[str]
+
+
+class SearchSnippet(BaseModel):
+    source: str
+    text: str
+
+
+class SearchResultOut(BaseModel):
+    file_id: int
+    filename: str
+    uploaded_at: datetime
+    lab_date: datetime | None = None
+    tags: list[str] = Field(default_factory=list)
+    marker_names: list[str] = Field(default_factory=list)
+    snippets: list[SearchSnippet] = Field(default_factory=list)

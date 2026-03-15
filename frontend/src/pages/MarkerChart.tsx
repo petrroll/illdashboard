@@ -12,7 +12,7 @@ import {
   ResponsiveContainer,
 } from "recharts";
 import ReactMarkdown from "react-markdown";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   fetchMarkerDetail,
   fetchMarkerInsight,
@@ -56,8 +56,10 @@ function getStoredListPaneWidth() {
 }
 
 export default function MarkerChart() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requestedMarker = searchParams.get("marker") ?? "";
   const [overview, setOverview] = useState<MarkerOverviewGroup[]>([]);
-  const [selectedMarker, setSelectedMarker] = useState("");
+  const [selectedMarker, setSelectedMarker] = useState(requestedMarker);
   const [detail, setDetail] = useState<MarkerDetailResponse | null>(null);
   const [loadingOverview, setLoadingOverview] = useState(true);
   const [loadingDetail, setLoadingDetail] = useState(false);
@@ -91,7 +93,7 @@ export default function MarkerChart() {
         setOverview(response);
 
         const firstMarker = response[0]?.markers[0]?.marker_name ?? "";
-        setSelectedMarker((current) => current || firstMarker);
+        setSelectedMarker((current) => current || requestedMarker || firstMarker);
       } finally {
         if (!cancelled) {
           setLoadingOverview(false);
@@ -104,7 +106,14 @@ export default function MarkerChart() {
     return () => {
       cancelled = true;
     };
-  }, [filterTags]);
+  }, [filterTags, requestedMarker]);
+
+  useEffect(() => {
+    if (!requestedMarker || requestedMarker === selectedMarker) {
+      return;
+    }
+    setSelectedMarker(requestedMarker);
+  }, [requestedMarker, selectedMarker]);
 
   useEffect(() => {
     fetchMarkerTags().then(setAllMarkerTags);
@@ -230,6 +239,9 @@ export default function MarkerChart() {
   const selectMarker = (markerName: string) => {
     startTransition(() => {
       setSelectedMarker(markerName);
+      const nextParams = new URLSearchParams(searchParams);
+      nextParams.set("marker", markerName);
+      setSearchParams(nextParams, { replace: true });
     });
   };
 

@@ -11,6 +11,7 @@ from illdashboard.database import get_db
 from illdashboard.models import LabFile, LabFileTag, MarkerTag, Measurement, MeasurementType
 from illdashboard.schemas import TagsUpdate
 from illdashboard.services import markers as marker_service
+from illdashboard.services import search as search_service
 
 
 router = APIRouter(prefix="")
@@ -65,6 +66,8 @@ async def set_file_tags(file_id: int, body: TagsUpdate, db: AsyncSession = Depen
     unique_tags = marker_service.normalize_unique_tags(body.tags)
     for tag in unique_tags:
         db.add(LabFileTag(lab_file_id=file_id, tag=tag))
+    await db.flush()
+    await search_service.refresh_lab_search_document(file_id, db)
     await db.commit()
     return unique_tags
 

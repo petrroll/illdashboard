@@ -25,6 +25,9 @@ class LabFile(Base):
     mime_type: Mapped[str] = mapped_column(String, nullable=False)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     ocr_raw: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ocr_text_raw: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ocr_text_english: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ocr_summary_english: Mapped[str | None] = mapped_column(Text, nullable=True)
     lab_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     measurements: Mapped[list[Measurement]] = relationship(

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   batchProcessFiles,
@@ -14,6 +14,8 @@ import TagInput from "../components/TagInput";
 import TagFilter from "../components/TagFilter";
 import type { LabFile } from "../types";
 import { formatDate } from "../utils/measurements";
+
+type SortField = "lab_date" | "uploaded_at";
 
 interface OcrSummary {
   latest: OcrProgress;
@@ -43,6 +45,8 @@ export default function Files() {
   const [allFileTags, setAllFileTags] = useState<string[]>([]);
   const [filterTags, setFilterTags] = useState<string[]>([]);
   const [editingTagsFileId, setEditingTagsFileId] = useState<number | null>(null);
+  const [sortField, setSortField] = useState<SortField>("lab_date");
+  const [searchQuery, setSearchQuery] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
   const loadFiles = useCallback(async () => {
@@ -155,6 +159,30 @@ export default function Files() {
   const allFilesSelected = files.length > 0 && selected.size === files.length;
   const ocrSummary = summarizeOcrProgress(fileProgress);
 
+  const sortedFiles = useMemo(() => {
+    const query = searchQuery.toLowerCase();
+    const filtered = query
+      ? files.filter((f) => f.filename.toLowerCase().includes(query))
+      : files;
+
+    return [...filtered].sort((a, b) => {
+      const aVal = a[sortField];
+      const bVal = b[sortField];
+      if (!aVal && !bVal) return 0;
+      if (!aVal) return 1;
+      if (!bVal) return -1;
+      return bVal.localeCompare(aVal);
+    });
+  }, [files, sortField, searchQuery]);
+
+  const getYear = (file: LabFile) => {
+    const val = file[sortField];
+    return val ? new Date(val).getFullYear() : null;
+  };
+
+  const sortLabel = (field: SortField) =>
+    field === "lab_date" ? "Lab Date" : "Uploaded";
+
   const renderOcrStatus = (file: LabFile) => {
     const progress = fileProgress.get(file.id);
 
@@ -256,17 +284,31 @@ export default function Files() {
         </div>
       )}
 
-      {allFileTags.length > 0 && (
-        <div className="tag-filter-bar">
-          <label>Filter by tags:</label>
-          <TagFilter
-            selected={filterTags}
-            allTags={allFileTags}
-            onChange={setFilterTags}
-            label="Select tags to filter…"
+      <div className="file-toolbar">
+        <div className="file-toolbar-search">
+          <input
+            type="text"
+            className="file-toolbar-input"
+            placeholder="Search files…"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
           />
+          {allFileTags.length > 0 && (
+            <TagFilter
+              selected={filterTags}
+              allTags={allFileTags}
+              onChange={setFilterTags}
+              label="Filter by tag…"
+            />
+          )}
         </div>
-      )}
+        <button
+          className="btn btn-outline btn-sm"
+          onClick={() => setSortField((f) => (f === "lab_date" ? "uploaded_at" : "lab_date"))}
+        >
+          Sort: {sortLabel(sortField)} ▼
+        </button>
+      </div>
 
       {files.length === 0 ? (
         <p style={{ color: "var(--text-muted)" }}>
@@ -274,6 +316,8 @@ export default function Files() {
             ? "No files match the selected tags."
             : "No files uploaded yet."}
         </p>
+      ) : sortedFiles.length === 0 ? (
+        <p style={{ color: "var(--text-muted)" }}>No files match your search.</p>
       ) : (
         <table>
           <thead>
@@ -291,8 +335,31 @@ export default function Files() {
             </tr>
           </thead>
           <tbody>
-            {files.map((file) => (
-              <tr key={file.id}>
+            {sortedFiles.map((file, index) => {
+              const year = getYear(file);
+              const prevYear = index > 0 ? getYear(sortedFiles[index - 1]) : undefined;
+              const showYearHeader = year !== prevYear;
+
+              return (
+                <Fragment key={file.id}>
+                  {showYearHeader && (
+                    <tr>
+                      <td
+                        colSpan={8}
+                        style={{
+                          fontWeight: 700,
+                          fontSize: "0.85rem",
+                          padding: "0.6rem 0.5rem 0.3rem",
+                          color: "var(--text-muted)",
+                          borderBottom: "1px solid var(--border)",
+                          background: "transparent",
+                        }}
+                      >
+                        {year ?? "Unknown date"}
+                      </td>
+                    </tr>
+                  )}
+                  <tr>
                 <td>
                   <input
                     type="checkbox"
@@ -350,7 +417,9 @@ export default function Files() {
                   </button>
                 </td>
               </tr>
-            ))}
+                </Fragment>
+              );
+            })}
           </tbody>
         </table>
       )}

@@ -5,10 +5,12 @@ import Settings from "./pages/Settings";
 import Files from "./pages/Files";
 import FileDetail from "./pages/FileDetail";
 import MarkerChart from "./pages/MarkerChart";
+import Search from "./pages/Search";
 import "./App.css";
 
 const navigationItems = [
   { to: "/charts", label: "Biomarkers" },
+  { to: "/search", label: "Search" },
   { to: "/files", label: "Lab Files" },
   { to: "/settings", label: "Settings" },
 ];
@@ -47,6 +49,7 @@ function App() {
             <Route path="/files" element={<Files />} />
             <Route path="/files/:id" element={<FileDetail />} />
             <Route path="/charts" element={<MarkerChart />} />
+            <Route path="/search" element={<Search />} />
             <Route path="/settings" element={<Settings />} />
           </Routes>
         </main>
