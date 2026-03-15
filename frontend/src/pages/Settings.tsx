@@ -1,10 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import api from "../api";
+import {
+  fetchFiles,
+  fetchMarkerNames,
+  fetchMeasurements,
+  normalizeMarkers,
+  purgeAllCaches,
+  purgeExplanationCache,
+  resetDatabase,
+} from "../api";
 import type {
   LabFile,
   Measurement,
-  NormalizeMarkersResponse,
 } from "../types";
 import {
   formatDate,
@@ -58,28 +65,28 @@ const settingsActions: SettingsActionDefinition[] = [
 async function performSettingsAction(action: SettingsAction) {
   switch (action) {
     case "normalize-markers": {
-      const response = await api.post<NormalizeMarkersResponse>("/measurements/normalize");
+      const response = await normalizeMarkers();
       return {
-        message: `Normalized markers. Updated ${response.data.updated} marker definitions.`,
+        message: `Normalized markers. Updated ${response.updated} marker definitions.`,
         shouldReload: true,
       };
     }
     case "purge-explanations": {
-      const response = await api.delete("/admin/cache/explanations");
+      const response = await purgeExplanationCache();
       return {
-        message: `Purged ${response.data.deleted_explanations} cached explanations.`,
+        message: `Purged ${response.deleted_explanations} cached explanations.`,
         shouldReload: false,
       };
     }
     case "purge-all": {
-      const response = await api.delete("/admin/cache/all");
+      const response = await purgeAllCaches();
       return {
-        message: `Purged ${response.data.deleted_explanations} explanations and ${response.data.deleted_sparklines} sparklines.`,
+        message: `Purged ${response.deleted_explanations} explanations and ${response.deleted_sparklines} sparklines.`,
         shouldReload: false,
       };
     }
     case "drop-db": {
-      await api.delete("/admin/database");
+      await resetDatabase();
       return {
         message: "Database has been reset. All data removed.",
         shouldReload: false,
@@ -100,14 +107,14 @@ export default function Settings() {
 
   const loadSettingsData = useCallback(async () => {
     const [filesResponse, markersResponse, measurementsResponse] = await Promise.all([
-      api.get<LabFile[]>("/files"),
-      api.get<string[]>("/measurements/markers"),
-      api.get<Measurement[]>("/measurements"),
+      fetchFiles(),
+      fetchMarkerNames(),
+      fetchMeasurements(),
     ]);
 
-    setFiles(filesResponse.data);
-    setMarkers(markersResponse.data);
-    setRecentMeasurements(measurementsResponse.data.slice(-10));
+    setFiles(filesResponse);
+    setMarkers(markersResponse);
+    setRecentMeasurements(measurementsResponse.slice(-10));
   }, []);
 
   useEffect(() => {

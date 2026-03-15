@@ -11,9 +11,9 @@ from sqlalchemy import select
 
 from illdashboard.config import settings
 from illdashboard.copilot_service import shutdown_client
+from illdashboard.api import router
 from illdashboard.database import async_session, engine
 from illdashboard.models import Base, LabFile
-from illdashboard.routes import router
 
 
 PRELOADABLE_MIME_TYPES = {

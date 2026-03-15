@@ -13,13 +13,18 @@ import {
 } from "recharts";
 import ReactMarkdown from "react-markdown";
 import { Link } from "react-router-dom";
-import api, { fetchMarkerTags, setMarkerTags } from "../api";
+import {
+  fetchMarkerDetail,
+  fetchMarkerInsight,
+  fetchMarkerOverview,
+  fetchMarkerTags,
+  setMarkerTags,
+} from "../api";
 import TagInput from "../components/TagInput";
 import TagFilter from "../components/TagFilter";
 import type {
   MarkerDetailResponse,
   MarkerOverviewGroup,
-  MarkerInsightResponse,
   MarkerOverviewItem,
 } from "../types";
 import {
@@ -77,15 +82,11 @@ export default function MarkerChart() {
     const loadOverview = async () => {
       setLoadingOverview(true);
       try {
-        const params = new URLSearchParams();
-        for (const t of filterTags) params.append("tags", t);
-        const response = await api.get<MarkerOverviewGroup[]>("/measurements/overview", {
-          params,
-        });
+        const response = await fetchMarkerOverview(filterTags);
         if (cancelled) return;
-        setOverview(response.data);
+        setOverview(response);
 
-        const firstMarker = response.data[0]?.markers[0]?.marker_name ?? "";
+        const firstMarker = response[0]?.markers[0]?.marker_name ?? "";
         setSelectedMarker((current) => current || firstMarker);
       } finally {
         if (!cancelled) {
@@ -129,13 +130,11 @@ export default function MarkerChart() {
     const loadDetail = async () => {
       setLoadingDetail(true);
       try {
-        const response = await api.get<MarkerDetailResponse>("/measurements/detail", {
-          params: { marker_name: selectedMarker },
-        });
+        const response = await fetchMarkerDetail(selectedMarker);
         if (!cancelled) {
-          setDetail(response.data);
-          setInsight(response.data.explanation);
-          setInsightCached(response.data.explanation_cached);
+          setDetail(response);
+          setInsight(response.explanation);
+          setInsightCached(response.explanation_cached);
         }
       } finally {
         if (!cancelled) {
@@ -147,12 +146,10 @@ export default function MarkerChart() {
     const loadInsight = async () => {
       setLoadingInsight(true);
       try {
-        const response = await api.get<MarkerInsightResponse>("/measurements/insight", {
-          params: { marker_name: selectedMarker },
-        });
+        const response = await fetchMarkerInsight(selectedMarker);
         if (!cancelled) {
-          setInsight(response.data.explanation);
-          setInsightCached(response.data.explanation_cached);
+          setInsight(response.explanation);
+          setInsightCached(response.explanation_cached);
         }
       } finally {
         if (!cancelled) {

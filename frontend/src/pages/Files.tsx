@@ -1,74 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import api, { fetchFileTags, setFileTags } from "../api";
+import {
+  batchProcessFiles,
+  deleteFile,
+  fetchFiles,
+  fetchFileTags,
+  processUnprocessedFiles,
+  setFileTags,
+  type OcrProgress,
+  uploadFile,
+} from "../api";
 import TagInput from "../components/TagInput";
 import TagFilter from "../components/TagFilter";
 import type { LabFile } from "../types";
 import { formatDate } from "../utils/measurements";
 
-interface OcrProgress {
-  file_id: number;
-  filename: string;
-  index: number;
-  total: number;
-  status: "processing" | "done" | "error";
-  error?: string;
-}
-
 interface OcrSummary {
   latest: OcrProgress;
   completedCount: number;
   errorCount: number;
-}
-
-async function streamOcr(
-  url: string,
-  body: object | undefined,
-  onProgress: (progress: OcrProgress) => void,
-): Promise<void> {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-
-  if (!response.ok || !response.body) {
-    throw new Error("Stream request failed");
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-
-    for (const line of lines) {
-      if (!line.trim()) {
-        continue;
-      }
-
-      const message = JSON.parse(line);
-      if (message.type === "progress") {
-        onProgress(message as OcrProgress);
-      }
-    }
-  }
-}
-
-function buildTagQueryParams(tags: string[]) {
-  const params = new URLSearchParams();
-  for (const tag of tags) {
-    params.append("tags", tag);
-  }
-  return params;
 }
 
 function summarizeOcrProgress(progressByFile: Map<number, OcrProgress>): OcrSummary | null {
@@ -96,10 +46,7 @@ export default function Files() {
   const inputRef = useRef<HTMLInputElement>(null);
 
   const loadFiles = useCallback(async () => {
-    const response = await api.get<LabFile[]>("/files", {
-      params: buildTagQueryParams(filterTags),
-    });
-    setFiles(response.data);
+    setFiles(await fetchFiles(filterTags));
   }, [filterTags]);
 
   const loadAllTags = useCallback(async () => {
@@ -124,9 +71,7 @@ export default function Files() {
     setUploading(true);
     try {
       for (const file of Array.from(selectedFiles)) {
-        const form = new FormData();
-        form.append("file", file);
-        await api.post("/files/upload", form);
+        await uploadFile(file);
       }
 
       await Promise.all([loadFiles(), loadAllTags()]);
@@ -141,7 +86,7 @@ export default function Files() {
       return;
     }
 
-    await api.delete(`/files/${id}`);
+    await deleteFile(id);
     await Promise.all([loadFiles(), loadAllTags()]);
   };
 
@@ -167,12 +112,12 @@ export default function Files() {
   };
 
   const runStreamingOcr = useCallback(
-    async (url: string, body: object | undefined) => {
+    async (request: (onProgress: (progress: OcrProgress) => void) => Promise<void>) => {
       setProcessing(true);
       setFileProgress(new Map());
 
       try {
-        await streamOcr(url, body, (progress) => {
+        await request((progress) => {
           setFileProgress((previousProgress) => {
             const nextProgress = new Map(previousProgress);
             nextProgress.set(progress.file_id, progress);
@@ -193,7 +138,7 @@ export default function Files() {
   );
 
   const handleProcessUnprocessed = () => {
-    void runStreamingOcr("/api/files/ocr/unprocessed", undefined);
+    void runStreamingOcr(processUnprocessedFiles);
   };
 
   const handleReprocessSelected = async () => {
@@ -203,7 +148,7 @@ export default function Files() {
 
     const fileIds = Array.from(selected);
     setSelected(new Set());
-    await runStreamingOcr("/api/files/ocr/batch", { file_ids: fileIds });
+    await runStreamingOcr((onProgress) => batchProcessFiles(fileIds, onProgress));
   };
 
   const unprocessedCount = files.filter((file) => !file.ocr_raw).length;

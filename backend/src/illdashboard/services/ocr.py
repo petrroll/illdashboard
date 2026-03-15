@@ -9,7 +9,6 @@ import math
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -68,11 +67,10 @@ def normalize_marker_name_deterministic(name: str) -> str:
 
 
 async def apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list[Measurement]:
-    lab_record = cast(Any, lab)
-    lab_record.ocr_raw = json.dumps(result)
+    lab.ocr_raw = json.dumps(result)
     if result.get("lab_date"):
         try:
-            lab_record.lab_date = datetime.fromisoformat(result["lab_date"])
+            lab.lab_date = datetime.fromisoformat(result["lab_date"])
         except (ValueError, TypeError):
             pass
 
@@ -141,7 +139,7 @@ async def persist_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> li
     existing = await db.execute(select(Measurement).where(Measurement.lab_file_id == lab.id))
     for measurement in existing.scalars().all():
         await db.delete(measurement)
-    cast(Any, lab).ocr_raw = None
+    lab.ocr_raw = None
     await db.flush()
 
     new_measurements = await apply_ocr_result(lab, result, db)
@@ -245,7 +243,7 @@ async def normalize_existing_measurements(db: AsyncSession) -> int:
     measurement_types = result.scalars().all()
 
     deterministic_map = {
-        cast(str, measurement_type.name): normalize_marker_name_deterministic(cast(str, measurement_type.name))
+        measurement_type.name: normalize_marker_name_deterministic(measurement_type.name)
         for measurement_type in measurement_types
     }
     cleaned_names = list(dict.fromkeys(deterministic_map.values()))
@@ -253,7 +251,7 @@ async def normalize_existing_measurements(db: AsyncSession) -> int:
     try:
         llm_map = await normalize_marker_names(
             cleaned_names,
-            [cast(str, measurement_type.name) for measurement_type in measurement_types],
+            [measurement_type.name for measurement_type in measurement_types],
         )
     except Exception:
         llm_map = {name: name for name in cleaned_names}
@@ -262,7 +260,7 @@ async def normalize_existing_measurements(db: AsyncSession) -> int:
         raw_name: llm_map.get(deterministic_map[raw_name], deterministic_map[raw_name])
         for raw_name in deterministic_map
     }
-    type_by_name = {cast(str, measurement_type.name): measurement_type for measurement_type in measurement_types}
+    type_by_name = {measurement_type.name: measurement_type for measurement_type in measurement_types}
     updated = 0
 
     await ensure_measurement_types(db, list(canonical_map.values()))
@@ -271,16 +269,15 @@ async def normalize_existing_measurements(db: AsyncSession) -> int:
         measurement_type = type_by_name[raw_name]
         if canonical_name == raw_name:
             expected_group = classify_marker_group(canonical_name)
-            if cast(str, measurement_type.group_name) != expected_group:
-                cast(Any, measurement_type).group_name = expected_group
+            if measurement_type.group_name != expected_group:
+                measurement_type.group_name = expected_group
                 updated += 1
             continue
 
         target = await get_measurement_type_by_name(db, canonical_name)
         if target is None:
-            measurement_type_record = cast(Any, measurement_type)
-            measurement_type_record.name = canonical_name
-            measurement_type_record.group_name = classify_marker_group(canonical_name)
+            measurement_type.name = canonical_name
+            measurement_type.group_name = classify_marker_group(canonical_name)
             updated += 1
             type_by_name[canonical_name] = measurement_type
             continue

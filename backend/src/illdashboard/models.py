@@ -1,7 +1,13 @@
-import datetime
+from __future__ import annotations
 
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
-from sqlalchemy.orm import DeclarativeBase, relationship
+from datetime import datetime, timezone
+
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class Base(DeclarativeBase):
@@ -13,16 +19,22 @@ class LabFile(Base):
 
     __tablename__ = "lab_files"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    filename = Column(String, nullable=False)
-    filepath = Column(String, nullable=False)  # relative path under uploads/
-    mime_type = Column(String, nullable=False)
-    uploaded_at = Column(DateTime, default=datetime.datetime.utcnow)
-    ocr_raw = Column(Text, nullable=True)  # raw OCR text
-    lab_date = Column(DateTime, nullable=True)  # date of the lab report
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    filename: Mapped[str] = mapped_column(String, nullable=False)
+    filepath: Mapped[str] = mapped_column(String, nullable=False)
+    mime_type: Mapped[str] = mapped_column(String, nullable=False)
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    ocr_raw: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lab_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    measurements = relationship("Measurement", back_populates="lab_file", cascade="all, delete-orphan")
-    tags = relationship("LabFileTag", back_populates="lab_file", cascade="all, delete-orphan")
+    measurements: Mapped[list[Measurement]] = relationship(
+        back_populates="lab_file",
+        cascade="all, delete-orphan",
+    )
+    tags: Mapped[list[LabFileTag]] = relationship(
+        back_populates="lab_file",
+        cascade="all, delete-orphan",
+    )
 
 
 class MeasurementType(Base):
@@ -30,14 +42,16 @@ class MeasurementType(Base):
 
     __tablename__ = "measurement_types"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    name = Column(String, nullable=False, unique=True, index=True)
-    group_name = Column(String, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
+    group_name: Mapped[str] = mapped_column(String, nullable=False)
 
-    measurements = relationship("Measurement", back_populates="measurement_type")
-    tags = relationship("MarkerTag", back_populates="measurement_type", cascade="all, delete-orphan")
-    insight = relationship(
-        "BiomarkerInsight",
+    measurements: Mapped[list[Measurement]] = relationship(back_populates="measurement_type")
+    tags: Mapped[list[MarkerTag]] = relationship(
+        back_populates="measurement_type",
+        cascade="all, delete-orphan",
+    )
+    insight: Mapped[BiomarkerInsight | None] = relationship(
         back_populates="measurement_type",
         cascade="all, delete-orphan",
         uselist=False,
@@ -49,18 +63,22 @@ class Measurement(Base):
 
     __tablename__ = "measurements"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    lab_file_id = Column(Integer, ForeignKey("lab_files.id"), nullable=False)
-    measurement_type_id = Column(Integer, ForeignKey("measurement_types.id"), nullable=False, index=True)
-    value = Column(Float, nullable=False)
-    unit = Column(String, nullable=True)  # e.g. "g/dL"
-    reference_low = Column(Float, nullable=True)
-    reference_high = Column(Float, nullable=True)
-    measured_at = Column(DateTime, nullable=True)  # date/time of measurement
-    page_number = Column(Integer, nullable=True)  # 1-indexed page in source file
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    lab_file_id: Mapped[int] = mapped_column(ForeignKey("lab_files.id"), nullable=False)
+    measurement_type_id: Mapped[int] = mapped_column(
+        ForeignKey("measurement_types.id"),
+        nullable=False,
+        index=True,
+    )
+    value: Mapped[float] = mapped_column(Float, nullable=False)
+    unit: Mapped[str | None] = mapped_column(String, nullable=True)
+    reference_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reference_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    measured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    lab_file = relationship("LabFile", back_populates="measurements")
-    measurement_type = relationship("MeasurementType", back_populates="measurements")
+    lab_file: Mapped[LabFile] = relationship(back_populates="measurements")
+    measurement_type: Mapped[MeasurementType] = relationship(back_populates="measurements")
 
     @property
     def marker_name(self) -> str:
@@ -77,11 +95,14 @@ class LabFileTag(Base):
     __tablename__ = "lab_file_tags"
     __table_args__ = (UniqueConstraint("lab_file_id", "tag"),)
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    lab_file_id = Column(Integer, ForeignKey("lab_files.id", ondelete="CASCADE"), nullable=False)
-    tag = Column(String, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    lab_file_id: Mapped[int] = mapped_column(
+        ForeignKey("lab_files.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    tag: Mapped[str] = mapped_column(String, nullable=False)
 
-    lab_file = relationship("LabFile", back_populates="tags")
+    lab_file: Mapped[LabFile] = relationship(back_populates="tags")
 
 
 class MarkerTag(Base):
@@ -90,11 +111,15 @@ class MarkerTag(Base):
     __tablename__ = "marker_tags"
     __table_args__ = (UniqueConstraint("measurement_type_id", "tag"),)
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    measurement_type_id = Column(Integer, ForeignKey("measurement_types.id", ondelete="CASCADE"), nullable=False, index=True)
-    tag = Column(String, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    measurement_type_id: Mapped[int] = mapped_column(
+        ForeignKey("measurement_types.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    tag: Mapped[str] = mapped_column(String, nullable=False)
 
-    measurement_type = relationship("MeasurementType", back_populates="tags")
+    measurement_type: Mapped[MeasurementType] = relationship(back_populates="tags")
 
     @property
     def marker_name(self) -> str:
@@ -106,18 +131,22 @@ class BiomarkerInsight(Base):
 
     __tablename__ = "biomarker_insights"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    measurement_type_id = Column(
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    measurement_type_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("measurement_types.id", ondelete="CASCADE"),
         nullable=False,
         unique=True,
     )
-    measurement_signature = Column(String, nullable=False)
-    summary_markdown = Column(Text, nullable=False)
-    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    measurement_signature: Mapped[str] = mapped_column(String, nullable=False)
+    summary_markdown: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
 
-    measurement_type = relationship("MeasurementType", back_populates="insight")
+    measurement_type: Mapped[MeasurementType] = relationship(back_populates="insight")
 
     @property
     def marker_name(self) -> str:

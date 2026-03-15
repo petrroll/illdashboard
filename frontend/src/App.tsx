@@ -1,6 +1,6 @@
 import { BrowserRouter, Routes, Route, NavLink, Navigate } from "react-router-dom";
 import { useEffect, useState } from "react";
-import api from "./api";
+import { fetchMarkerNames } from "./api";
 import Settings from "./pages/Settings";
 import Files from "./pages/Files";
 import FileDetail from "./pages/FileDetail";
@@ -17,9 +17,8 @@ function HomeRedirect() {
   const [target, setTarget] = useState<string | null>(null);
 
   useEffect(() => {
-    api
-      .get<string[]>("/measurements/markers")
-      .then((r) => setTarget(r.data.length > 0 ? "/charts" : "/files"))
+    fetchMarkerNames()
+      .then((markerNames) => setTarget(markerNames.length > 0 ? "/charts" : "/files"))
       .catch(() => setTarget("/files"));
   }, []);
 

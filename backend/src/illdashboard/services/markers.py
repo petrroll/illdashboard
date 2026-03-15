@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import defaultdict
-from typing import Any, cast
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -80,7 +79,7 @@ async def load_stored_marker_tags(db: AsyncSession) -> dict[str, list[str]]:
     tag_result = await db.execute(select(MarkerTag).options(selectinload(MarkerTag.measurement_type)))
     marker_tag_map: dict[str, list[str]] = defaultdict(list)
     for marker_tag in tag_result.scalars().all():
-        marker_tag_map[cast(str, marker_tag.marker_name)].append(cast(str, marker_tag.tag))
+        marker_tag_map[marker_tag.marker_name].append(marker_tag.tag)
     return marker_tag_map
 
 
@@ -177,14 +176,14 @@ async def ensure_measurement_types(db: AsyncSession, names: list[str]) -> dict[s
         return {}
 
     result = await db.execute(select(MeasurementType).where(MeasurementType.name.in_(unique_names)))
-    by_name = {cast(str, measurement_type.name): measurement_type for measurement_type in result.scalars().all()}
+    by_name = {measurement_type.name: measurement_type for measurement_type in result.scalars().all()}
 
     for name in unique_names:
         if name in by_name:
             measurement_type = by_name[name]
             expected_group = classify_marker_group(name)
-            if cast(str, measurement_type.group_name) != expected_group:
-                cast(Any, measurement_type).group_name = expected_group
+            if measurement_type.group_name != expected_group:
+                measurement_type.group_name = expected_group
             continue
 
         measurement_type = MeasurementType(name=name, group_name=classify_marker_group(name))
@@ -212,10 +211,10 @@ async def load_measurements_for_marker(db: AsyncSession, marker_name: str) -> li
 
 
 async def merge_measurement_types(source: MeasurementType, target: MeasurementType, db: AsyncSession) -> None:
-    if cast(int, source.id) == cast(int, target.id):
+    if source.id == target.id:
         return
 
-    cast(Any, target).group_name = classify_marker_group(cast(str, target.name))
+    target.group_name = classify_marker_group(target.name)
 
     measurements_result = await db.execute(select(Measurement).where(Measurement.measurement_type_id == source.id))
     for measurement in measurements_result.scalars().all():
@@ -232,7 +231,7 @@ async def merge_measurement_types(source: MeasurementType, target: MeasurementTy
             await db.delete(tag)
             continue
         tag.measurement_type_id = target.id
-        existing_target_tags.add(cast(str, tag.tag))
+        existing_target_tags.add(tag.tag)
 
     source_insight_result = await db.execute(
         select(BiomarkerInsight).where(BiomarkerInsight.measurement_type_id == source.id)
@@ -253,9 +252,9 @@ async def merge_measurement_types(source: MeasurementType, target: MeasurementTy
 
 
 def measurement_status(measurement: Measurement) -> str:
-    reference_low = cast(float | None, measurement.reference_low)
-    reference_high = cast(float | None, measurement.reference_high)
-    value = cast(float, measurement.value)
+    reference_low = measurement.reference_low
+    reference_high = measurement.reference_high
+    value = measurement.value
 
     if reference_low is not None and value < reference_low:
         return "low"
@@ -267,9 +266,9 @@ def measurement_status(measurement: Measurement) -> str:
 
 
 def range_position(measurement: Measurement) -> float | None:
-    reference_low = cast(float | None, measurement.reference_low)
-    reference_high = cast(float | None, measurement.reference_high)
-    value = cast(float, measurement.value)
+    reference_low = measurement.reference_low
+    reference_high = measurement.reference_high
+    value = measurement.value
 
     if reference_low is None or reference_high is None or reference_high <= reference_low:
         return None
@@ -279,7 +278,7 @@ def range_position(measurement: Measurement) -> float | None:
 def build_marker_payload(measurements: list[Measurement]) -> dict:
     latest = measurements[-1]
     previous = measurements[-2] if len(measurements) > 1 else None
-    values = [cast(float, measurement.value) for measurement in measurements]
+    values = [measurement.value for measurement in measurements]
     return {
         "marker_name": latest.marker_name,
         "group_name": latest.group_name,

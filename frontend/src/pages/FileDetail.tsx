@@ -1,8 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
-import api from "../api";
-import type { LabFile, Measurement, ExplainRequest, ExplainResponse } from "../types";
+import {
+  explainMeasurement,
+  explainMeasurements,
+  fetchFile,
+  fetchFileMeasurements,
+  fetchFilePageInfo,
+  runFileOcr,
+  type PageInfo,
+} from "../api";
+import type { LabFile, Measurement, ExplainRequest } from "../types";
 import {
   formatDate,
   formatDateTime,
@@ -11,13 +19,9 @@ import {
   getMeasurementValueClass,
 } from "../utils/measurements";
 
-interface PageInfo {
-  page_count: number;
-  mime_type: string;
-}
-
 export default function FileDetail() {
   const { id } = useParams<{ id: string }>();
+  const fileId = id ?? null;
   const [file, setFile] = useState<LabFile | null>(null);
   const [measurements, setMeasurements] = useState<Measurement[]>([]);
   const [ocrRunning, setOcrRunning] = useState(false);
@@ -31,25 +35,24 @@ export default function FileDetail() {
   const highlightTimeoutRef = useRef<number | null>(null);
 
   const load = useCallback(async () => {
-    if (!id) {
+    if (!fileId) {
       return;
     }
 
     const [fileResponse, measurementsResponse] = await Promise.all([
-      api.get<LabFile>(`/files/${id}`),
-      api.get<Measurement[]>(`/files/${id}/measurements`),
+      fetchFile(fileId),
+      fetchFileMeasurements(fileId),
     ]);
 
-    setFile(fileResponse.data);
-    setMeasurements(measurementsResponse.data);
+    setFile(fileResponse);
+    setMeasurements(measurementsResponse);
 
     try {
-      const pageInfoResponse = await api.get<PageInfo>(`/files/${id}/pages`);
-      setPageInfo(pageInfoResponse.data);
+      setPageInfo(await fetchFilePageInfo(fileId));
     } catch {
       setPageInfo(null);
     }
-  }, [id]);
+  }, [fileId]);
 
   useEffect(() => {
     void load();
@@ -63,21 +66,25 @@ export default function FileDetail() {
     };
   }, []);
 
-  const requestExplanation = async (path: string, payload: object) => {
+  const requestExplanation = async (request: () => Promise<{ explanation: string }>) => {
     setExplaining(true);
     setExplanation(null);
     try {
-      const response = await api.post<ExplainResponse>(path, payload);
-      setExplanation(response.data.explanation);
+      const response = await request();
+      setExplanation(response.explanation);
     } finally {
       setExplaining(false);
     }
   };
 
   const runOcr = async () => {
+    if (!fileId) {
+      return;
+    }
+
     setOcrRunning(true);
     try {
-      await api.post(`/files/${id}/ocr`);
+      await runFileOcr(fileId);
       await load();
     } finally {
       setOcrRunning(false);
@@ -104,17 +111,17 @@ export default function FileDetail() {
         reference_high: m.reference_high,
       }));
     if (items.length === 0) return;
-    await requestExplanation("/explain/multi", { measurements: items });
+    await requestExplanation(() => explainMeasurements(items));
   };
 
   const explainSingle = async (m: Measurement) => {
-    await requestExplanation("/explain", {
+    await requestExplanation(() => explainMeasurement({
       marker_name: m.marker_name,
       value: m.value,
       unit: m.unit,
       reference_low: m.reference_low,
       reference_high: m.reference_high,
-    });
+    }));
   };
 
   const scrollToPage = useCallback((pageNum: number) => {
@@ -142,7 +149,7 @@ export default function FileDetail() {
     }
   }, []);
 
-  if (!id) return <p>File not found.</p>;
+  if (!fileId) return <p>File not found.</p>;
   if (!file) return <p>Loading…</p>;
 
   const hasPages = pageInfo && pageInfo.page_count > 0;
@@ -210,7 +217,7 @@ export default function FileDetail() {
                       <span className="file-preview-page-label">Page {pageNum}</span>
                     )}
                     <img
-                      src={`/api/files/${id}/pages/${pageNum}`}
+                      src={`/api/files/${fileId}/pages/${pageNum}`}
                       alt={`Page ${pageNum}`}
                       loading="lazy"
                     />

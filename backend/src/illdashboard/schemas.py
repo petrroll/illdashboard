@@ -1,12 +1,13 @@
 from datetime import datetime
+from typing import Any
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # ── LabFile ──────────────────────────────────────────────────────────────────
 
 
 class LabFileOut(BaseModel):
-    model_config = {"from_attributes": True}
+    model_config = ConfigDict(from_attributes=True)
 
     id: int
     filename: str
@@ -15,12 +16,14 @@ class LabFileOut(BaseModel):
     uploaded_at: datetime
     ocr_raw: str | None = None
     lab_date: datetime | None = None
-    tags: list[str] = []
+    tags: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
-    def _flatten_tags(cls, data):
+    def _flatten_tags(cls, data: Any):
         """Convert LabFileTag ORM objects to plain strings."""
+        if isinstance(data, dict):
+            return data
         if hasattr(data, "__table__"):
             raw = data.__dict__.get("tags", [])
             data = {c.key: getattr(data, c.key) for c in data.__table__.columns}
@@ -32,7 +35,7 @@ class LabFileOut(BaseModel):
 
 
 class MeasurementOut(BaseModel):
-    model_config = {"from_attributes": True}
+    model_config = ConfigDict(from_attributes=True)
 
     id: int
     lab_file_id: int
@@ -46,7 +49,9 @@ class MeasurementOut(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _flatten_measurement_type(cls, data):
+    def _flatten_measurement_type(cls, data: Any):
+        if isinstance(data, dict):
+            return data
         if hasattr(data, "measurement_type"):
             measurement_type = data.measurement_type
             return {
@@ -73,7 +78,7 @@ class MarkerOverviewItem(BaseModel):
     total_count: int = 1
     value_min: float | None = None
     value_max: float | None = None
-    tags: list[str] = []
+    tags: list[str] = Field(default_factory=list)
 
 
 class MarkerOverviewGroup(BaseModel):
@@ -91,7 +96,7 @@ class MarkerDetailResponse(BaseModel):
     measurements: list[MeasurementOut]
     explanation: str | None = None
     explanation_cached: bool = False
-    tags: list[str] = []
+    tags: list[str] = Field(default_factory=list)
 
 
 class MarkerInsightResponse(BaseModel):
