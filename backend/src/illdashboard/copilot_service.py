@@ -13,7 +13,6 @@ import tempfile
 import time
 from pathlib import Path
 from collections.abc import Awaitable, Callable
-from typing import cast
 
 import fitz  # PyMuPDF
 from copilot import CopilotClient, PermissionHandler
@@ -35,6 +34,9 @@ OCR_PDF_RENDER_DPI = 144
 OCR_PDF_MIN_RENDER_DPI = 96
 OCR_ASK_TIMEOUT = 180
 OCR_RETRY_DELAY = 3
+OCR_PDF_BATCH_CONCURRENCY = 4
+MARKER_NORMALIZATION_BATCH_SIZE = 40
+MARKER_NORMALIZATION_CONCURRENCY = 2
 
 
 async def _get_client() -> CopilotClient:
@@ -293,7 +295,9 @@ def _pdf_to_images(pdf_path: str, *, start_page: int = 0, stop_page: int | None 
     return paths
 
 
-async def _ocr_extract_from_attachments(attachments: list[dict], *, filename: str | None = None) -> dict:
+async def _extract_structured_medical_data_from_attachments(
+    attachments: list[dict], *, filename: str | None = None
+) -> dict:
     prompt = "Extract all lab values from the attached file, including qualitative serology and immunology results."
     if filename:
         prompt = f"Original filename: {filename}\n\n{prompt}"
@@ -360,7 +364,7 @@ def _offset_result_page_numbers(result: dict, page_offset: int) -> dict:
     }
 
 
-def _merge_ocr_results(results: list[dict]) -> dict:
+def _merge_structured_medical_results(results: list[dict]) -> dict:
     merged = {"lab_date": None, "source": None, "measurements": []}
     for result in results:
         if merged["lab_date"] is None and result.get("lab_date"):
@@ -457,7 +461,7 @@ async def _pdf_batch_extract(
                 pass
 
 
-async def _ocr_extract_pdf_batch(
+async def _extract_structured_medical_data_pdf_batch(
     pdf_path: str,
     *,
     start_page: int,
@@ -467,11 +471,11 @@ async def _ocr_extract_pdf_batch(
 ) -> dict:
     return await _pdf_batch_extract(
         pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi,
-        filename=filename, extract_fn=_ocr_extract_from_attachments,
+        filename=filename, extract_fn=_extract_structured_medical_data_from_attachments,
     )
 
 
-async def _extract_document_text_pdf_batch(
+async def _extract_document_text_from_pdf_batch(
     pdf_path: str,
     *,
     start_page: int,
@@ -596,72 +600,92 @@ async def _pdf_range_with_retries(
         raise
 
 
-async def _ocr_extract_pdf_range(pdf_path: str, **kwargs) -> dict:
+async def _extract_structured_medical_data_pdf_range(pdf_path: str, **kwargs) -> dict:
     return await _pdf_range_with_retries(
         pdf_path,
-        batch_fn=_ocr_extract_pdf_batch,
-        merge_fn=_merge_ocr_results,
+        batch_fn=_extract_structured_medical_data_pdf_batch,
+        merge_fn=_merge_structured_medical_results,
         post_process_fn=_offset_result_page_numbers,
-        label="OCR PDF",
+        label="Structured medical PDF",
         **kwargs,
     )
 
 
-async def _extract_document_text_pdf_range(pdf_path: str, **kwargs) -> dict:
+async def _extract_document_text_from_pdf_range(pdf_path: str, **kwargs) -> dict:
     return await _pdf_range_with_retries(
         pdf_path,
-        batch_fn=_extract_document_text_pdf_batch,
+        batch_fn=_extract_document_text_from_pdf_batch,
         merge_fn=_merge_document_text_results,
         label="OCR text",
         **kwargs,
     )
 
 
-async def _ocr_extract_pdf(pdf_path: str, *, filename: str | None = None) -> dict:
-    with fitz.open(pdf_path) as doc:
-        page_count = doc.page_count
+async def _run_pdf_batches_parallel(
+    pdf_path: str,
+    *,
+    page_count: int,
+    filename: str | None,
+    range_fn: Callable[..., Awaitable[dict]],
+    merge_fn: Callable[[list[dict]], dict],
+) -> dict:
+    semaphore = asyncio.Semaphore(OCR_PDF_BATCH_CONCURRENCY)
 
-    started_at = time.perf_counter()
-    logger.info("Structured OCR PDF start path=%s filename=%s page_count=%s", pdf_path, filename, page_count)
-    results: list[dict] = []
-    for start_page in range(0, page_count, OCR_PDF_BATCH_SIZE):
-        stop_page = min(start_page + OCR_PDF_BATCH_SIZE, page_count)
-        results.append(
-            await _ocr_extract_pdf_range(
+    async def _run_single_batch(start_page: int, stop_page: int) -> dict:
+        async with semaphore:
+            return await range_fn(
                 pdf_path,
                 start_page=start_page,
                 stop_page=stop_page,
                 filename=filename,
             )
+
+    tasks = [
+        asyncio.create_task(
+            _run_single_batch(start_page, min(start_page + OCR_PDF_BATCH_SIZE, page_count))
         )
+        for start_page in range(0, page_count, OCR_PDF_BATCH_SIZE)
+    ]
+    return merge_fn(await asyncio.gather(*tasks))
+
+
+async def _extract_structured_medical_data_from_pdf(pdf_path: str, *, filename: str | None = None) -> dict:
+    with fitz.open(pdf_path) as doc:
+        page_count = doc.page_count
+
+    started_at = time.perf_counter()
+    logger.info("Structured medical PDF start path=%s filename=%s page_count=%s", pdf_path, filename, page_count)
+    result = await _run_pdf_batches_parallel(
+        pdf_path,
+        page_count=page_count,
+        filename=filename,
+        range_fn=_extract_structured_medical_data_pdf_range,
+        merge_fn=_merge_structured_medical_results,
+    )
 
     logger.info(
-        "Structured OCR PDF finished path=%s filename=%s page_count=%s duration=%.2fs",
+        "Structured medical PDF finished path=%s filename=%s page_count=%s duration=%.2fs",
         pdf_path,
         filename,
         page_count,
         time.perf_counter() - started_at,
     )
-    return _merge_ocr_results(results)
+    return result
 
 
-async def _extract_document_text_pdf(pdf_path: str, *, filename: str | None = None) -> dict:
+async def _extract_document_text_from_pdf(pdf_path: str, *, filename: str | None = None) -> dict:
     with fitz.open(pdf_path) as doc:
         page_count = doc.page_count
 
     started_at = time.perf_counter()
     logger.info("Document text PDF start path=%s filename=%s page_count=%s", pdf_path, filename, page_count)
-    results: list[dict] = []
-    for start_page in range(0, page_count, OCR_PDF_BATCH_SIZE):
-        stop_page = min(start_page + OCR_PDF_BATCH_SIZE, page_count)
-        results.append(
-            await _extract_document_text_pdf_range(
-                pdf_path,
-                start_page=start_page,
-                stop_page=stop_page,
-                filename=filename,
-            )
-        )
+    result = await _run_pdf_batches_parallel(
+        pdf_path,
+        page_count=page_count,
+        filename=filename,
+        range_fn=_extract_document_text_from_pdf_range,
+        merge_fn=_merge_document_text_results,
+    )
 
     logger.info(
         "Document text PDF finished path=%s filename=%s page_count=%s duration=%.2fs",
@@ -670,19 +694,19 @@ async def _extract_document_text_pdf(pdf_path: str, *, filename: str | None = No
         page_count,
         time.perf_counter() - started_at,
     )
-    return _merge_document_text_results(results)
+    return result
 
 
-async def _extract_medical_data(file_path: str, *, filename: str | None = None) -> dict:
+async def _extract_structured_medical_data(file_path: str, *, filename: str | None = None) -> dict:
     started_at = time.perf_counter()
     logger.info("Medical extraction start path=%s filename=%s", file_path, filename)
     if Path(file_path).suffix.lower() == ".pdf":
-        result = await _ocr_extract_pdf(file_path, filename=filename)
+        result = await _extract_structured_medical_data_from_pdf(file_path, filename=filename)
         logger.info("Medical extraction finished path=%s filename=%s duration=%.2fs", file_path, filename, time.perf_counter() - started_at)
         return result
 
     attachments = [{"type": "file", "path": file_path}]
-    result = await _ocr_extract_from_attachments(attachments, filename=filename)
+    result = await _extract_structured_medical_data_from_attachments(attachments, filename=filename)
     logger.info("Medical extraction finished path=%s filename=%s duration=%.2fs", file_path, filename, time.perf_counter() - started_at)
     return result
 
@@ -691,7 +715,7 @@ async def _extract_document_text(file_path: str, *, filename: str | None = None)
     started_at = time.perf_counter()
     logger.info("Document text extraction start path=%s filename=%s", file_path, filename)
     if Path(file_path).suffix.lower() == ".pdf":
-        result = await _extract_document_text_pdf(file_path, filename=filename)
+        result = await _extract_document_text_from_pdf(file_path, filename=filename)
         logger.info("Document text extraction finished path=%s filename=%s duration=%.2fs", file_path, filename, time.perf_counter() - started_at)
         return result
 
@@ -715,10 +739,10 @@ async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
     """
     started_at = time.perf_counter()
     logger.info("OCR pipeline start path=%s filename=%s", file_path, filename)
-    medical_task = asyncio.create_task(_extract_medical_data(file_path, filename=filename))
+    medical_task = asyncio.create_task(_extract_structured_medical_data(file_path, filename=filename))
     text_task = asyncio.create_task(_extract_document_text(file_path, filename=filename))
 
-    medical_result_or_error, text_result = await asyncio.gather(
+    medical_result_or_error, text_result_or_error = await asyncio.gather(
         medical_task,
         text_task,
         return_exceptions=True,
@@ -734,10 +758,10 @@ async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
         )
         raise medical_result_or_error
 
-    medical_result = cast(dict, medical_result_or_error)
+    medical_result = medical_result_or_error
 
     usable_text_result: dict | None
-    if isinstance(text_result, BaseException):
+    if isinstance(text_result_or_error, BaseException):
         logger.exception(
             "Document text extraction failed for %s (filename=%s)",
             file_path,
@@ -745,7 +769,7 @@ async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
         )
         usable_text_result = None
     else:
-        usable_text_result = cast(dict, text_result)
+        usable_text_result = text_result_or_error
 
     summary_english: str | None = None
     try:
@@ -830,37 +854,50 @@ async def normalize_marker_names(new_names: list[str], existing_canonical: list[
     if not new_names:
         return {}
 
-    user_text = "EXISTING canonical marker names:\n"
-    if existing_canonical:
-        for n in existing_canonical:
+    async def _normalize_batch(batch_names: list[str]) -> dict[str, str]:
+        user_text = "EXISTING canonical marker names:\n"
+        if existing_canonical:
+            for n in existing_canonical:
+                user_text += f"- {n}\n"
+        else:
+            user_text += "(none yet)\n"
+        user_text += "\nNEW marker names to normalize:\n"
+        for n in batch_names:
             user_text += f"- {n}\n"
-    else:
-        user_text += "(none yet)\n"
-    user_text += "\nNEW marker names to normalize:\n"
-    for n in new_names:
-        user_text += f"- {n}\n"
 
-    raw = await _ask(NORMALIZE_SYSTEM_PROMPT, user_text)
+        raw = await _ask(NORMALIZE_SYSTEM_PROMPT, user_text)
 
-    # Strip markdown code fences if present
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[1]
-    if raw.endswith("```"):
-        raw = raw.rsplit("```", 1)[0]
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1]
+        if raw.endswith("```"):
+            raw = raw.rsplit("```", 1)[0]
 
-    try:
-        mapping = json.loads(raw.strip())
-    except (json.JSONDecodeError, ValueError):
-        # Fallback: return identity mapping
-        mapping = {n: n for n in new_names}
+        try:
+            mapping = json.loads(raw.strip())
+        except (json.JSONDecodeError, ValueError):
+            mapping = {n: n for n in batch_names}
 
-    # Ensure every new_name has an entry
-    for n in new_names:
-        if n not in mapping:
-            mapping[n] = n
+        for n in batch_names:
+            if n not in mapping:
+                mapping[n] = n
+        return mapping
 
-    return mapping
+    batches = [
+        new_names[index:index + MARKER_NORMALIZATION_BATCH_SIZE]
+        for index in range(0, len(new_names), MARKER_NORMALIZATION_BATCH_SIZE)
+    ]
+    semaphore = asyncio.Semaphore(MARKER_NORMALIZATION_CONCURRENCY)
+
+    async def _run_batch(batch_names: list[str]) -> dict[str, str]:
+        async with semaphore:
+            return await _normalize_batch(batch_names)
+
+    merged_mapping: dict[str, str] = {}
+    for batch_mapping in await asyncio.gather(*[_run_batch(batch) for batch in batches]):
+        merged_mapping.update(batch_mapping)
+
+    return merged_mapping
 
 
 async def normalize_source_name(
