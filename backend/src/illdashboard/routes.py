@@ -75,6 +75,65 @@ GROUP_ORDER = [
     "Immunity & Serology",
     "Other",
 ]
+SINGLE_MEASUREMENT_TAG = "singlemeasurement"
+MULTIPLE_MEASUREMENTS_TAG = "multiplemeasurements"
+
+
+def _normalize_unique_tags(tags: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for raw_tag in tags:
+        tag = raw_tag.strip()
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        normalized.append(tag)
+
+    return normalized
+
+
+def _marker_group_tag(group_name: str) -> str:
+    return f"group:{group_name}"
+
+
+def _derived_marker_tags(group_name: str, measurement_count: int) -> list[str]:
+    derived_tags = [_marker_group_tag(group_name)] if group_name else []
+    if measurement_count == 1:
+        derived_tags.append(SINGLE_MEASUREMENT_TAG)
+    elif measurement_count > 1:
+        derived_tags.append(MULTIPLE_MEASUREMENTS_TAG)
+    return derived_tags
+
+
+def _combine_marker_tags(
+    stored_tags: list[str],
+    group_name: str,
+    measurement_count: int,
+) -> list[str]:
+    return _normalize_unique_tags([
+        *stored_tags,
+        *_derived_marker_tags(group_name, measurement_count),
+    ])
+
+
+def _all_reserved_marker_tags(group_name: str | None = None) -> set[str]:
+    reserved_tags = {
+        SINGLE_MEASUREMENT_TAG,
+        MULTIPLE_MEASUREMENTS_TAG,
+        *(_marker_group_tag(group) for group in GROUP_ORDER),
+    }
+    if group_name:
+        reserved_tags.add(_marker_group_tag(group_name))
+    return reserved_tags
+
+
+async def _load_stored_marker_tags(db: AsyncSession) -> dict[str, list[str]]:
+    tag_result = await db.execute(select(MarkerTag).options(selectinload(MarkerTag.measurement_type)))
+    marker_tag_map: dict[str, list[str]] = defaultdict(list)
+    for marker_tag in tag_result.scalars().all():
+        marker_tag_map[marker_tag.marker_name].append(marker_tag.tag)
+    return marker_tag_map
 
 
 def _parse_numeric_value(raw) -> float | None:
@@ -842,12 +901,15 @@ async def measurement_overview(
     for measurement in measurements:
         by_marker[measurement.marker_name].append(measurement)
 
-    # Load marker tags
-    tag_result = await db.execute(select(MarkerTag).options(selectinload(MarkerTag.measurement_type)))
-    all_marker_tags = tag_result.scalars().all()
-    marker_tag_map: dict[str, list[str]] = defaultdict(list)
-    for mt in all_marker_tags:
-        marker_tag_map[mt.marker_name].append(mt.tag)
+    stored_marker_tags = await _load_stored_marker_tags(db)
+    marker_tag_map = {
+        marker_name: _combine_marker_tags(
+            stored_marker_tags.get(marker_name, []),
+            marker_measurements[-1].group_name,
+            len(marker_measurements),
+        )
+        for marker_name, marker_measurements in by_marker.items()
+    }
 
     # Apply tag filter (AND)
     if tags:
@@ -912,7 +974,11 @@ async def measurement_detail(
     tag_result = await db.execute(
         select(MarkerTag.tag).where(MarkerTag.measurement_type_id == measurement_type.id)
     )
-    marker_tags = tag_result.scalars().all()
+    marker_tags = _combine_marker_tags(
+        tag_result.scalars().all(),
+        measurement_type.group_name,
+        len(measurements),
+    )
 
     return MarkerDetailResponse(
         **payload,
@@ -1085,8 +1151,30 @@ async def list_file_tags(db: AsyncSession = Depends(get_db)):
 @router.get("/tags/markers", response_model=list[str], tags=["tags"])
 async def list_marker_tags(db: AsyncSession = Depends(get_db)):
     """Return all distinct marker tags (for autocomplete)."""
-    result = await db.execute(select(MarkerTag.tag).distinct().order_by(MarkerTag.tag))
-    return result.scalars().all()
+    result = await db.execute(
+        select(Measurement)
+        .join(Measurement.measurement_type)
+        .options(selectinload(Measurement.measurement_type))
+        .order_by(MeasurementType.name.asc(), Measurement.measured_at.asc(), Measurement.id.asc())
+    )
+    measurements = result.scalars().all()
+
+    by_marker: dict[str, list[Measurement]] = defaultdict(list)
+    for measurement in measurements:
+        by_marker[measurement.marker_name].append(measurement)
+
+    stored_marker_tags = await _load_stored_marker_tags(db)
+    all_tags: list[str] = []
+    for marker_name, marker_measurements in by_marker.items():
+        all_tags.extend(
+            _combine_marker_tags(
+                stored_marker_tags.get(marker_name, []),
+                marker_measurements[-1].group_name,
+                len(marker_measurements),
+            )
+        )
+
+    return sorted(set(all_tags))
 
 
 @router.put("/files/{file_id}/tags", response_model=list[str], tags=["tags"])
@@ -1099,8 +1187,9 @@ async def set_file_tags(file_id: int, body: TagsUpdate, db: AsyncSession = Depen
     existing = await db.execute(select(LabFileTag).where(LabFileTag.lab_file_id == file_id))
     for t in existing.scalars().all():
         await db.delete(t)
+    await db.flush()
     # Add new
-    unique_tags = list(dict.fromkeys(body.tags))  # preserve order, deduplicate
+    unique_tags = _normalize_unique_tags(body.tags)
     for tag in unique_tags:
         db.add(LabFileTag(lab_file_id=file_id, tag=tag))
     await db.commit()
@@ -1117,12 +1206,19 @@ async def set_marker_tags(marker_name: str, body: TagsUpdate, db: AsyncSession =
     existing = await db.execute(select(MarkerTag).where(MarkerTag.measurement_type_id == measurement_type.id))
     for t in existing.scalars().all():
         await db.delete(t)
+    await db.flush()
     # Add new
-    unique_tags = list(dict.fromkeys(body.tags))
+    unique_tags = [
+        tag
+        for tag in _normalize_unique_tags(body.tags)
+        if tag not in _all_reserved_marker_tags(measurement_type.group_name)
+    ]
     for tag in unique_tags:
         db.add(MarkerTag(measurement_type_id=measurement_type.id, tag=tag))
     await db.commit()
-    return unique_tags
+
+    measurements = await _load_measurements_for_marker(db, marker_name)
+    return _combine_marker_tags(unique_tags, measurement_type.group_name, len(measurements))
 
 
 # ── Admin / Maintenance ──────────────────────────────────────────────────────

@@ -166,7 +166,10 @@ export default function MarkerChart() {
     .map((group) => ({
       ...group,
       markers: group.markers.filter((marker) => {
-        if (deferredSearch && !marker.marker_name.toLowerCase().includes(deferredSearch)) {
+        const searchText = [marker.marker_name, marker.group_name, ...marker.tags]
+          .join(" ")
+          .toLowerCase();
+        if (deferredSearch && !searchText.includes(deferredSearch)) {
           return false;
         }
         return true;
@@ -304,27 +307,41 @@ export default function MarkerChart() {
           </div>
         </div>
 
-        <label className="marker-search">
-          <span>Search biomarkers</span>
-          <input
-            type="search"
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="Hemoglobin, ferritin, CRP..."
-          />
-        </label>
-
-        {allMarkerTags.length > 0 && (
-          <div className="tag-filter-bar" style={{ margin: "0.5rem 0.75rem 0" }}>
-            <label>Tags:</label>
-            <TagFilter
-              selected={filterTags}
-              allTags={allMarkerTags}
-              onChange={setFilterTags}
-              label="Filter by marker tags…"
-            />
+        <div className="marker-search">
+          <div className="marker-search-head">
+            <span>Search biomarkers</span>
+            {filterTags.length > 0 && (
+              <button
+                type="button"
+                className="marker-search-clear"
+                onClick={() => setFilterTags([])}
+              >
+                Clear tags
+              </button>
+            )}
           </div>
-        )}
+
+          <div className="marker-search-shell">
+            <input
+              type="search"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Hemoglobin, ferritin, CRP..."
+            />
+
+            {allMarkerTags.length > 0 && (
+              <div className="marker-search-tag-row">
+                <span className="marker-search-tag-label">Tag filters</span>
+                <TagFilter
+                  selected={filterTags}
+                  allTags={allMarkerTags}
+                  onChange={setFilterTags}
+                  label="Add marker tag…"
+                />
+              </div>
+            )}
+          </div>
+        </div>
 
         {loadingOverview ? (
           <div className="card-empty">
@@ -334,6 +351,8 @@ export default function MarkerChart() {
           <div className="card-empty">
             {overview.length === 0
               ? "No measurements yet. Upload and OCR lab files first."
+              : filterTags.length > 0
+              ? "No biomarkers match this search or tag filters."
               : "No biomarkers match this search."}
           </div>
         ) : (

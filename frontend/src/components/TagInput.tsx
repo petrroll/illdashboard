@@ -36,17 +36,21 @@ export default function TagInput({ tags, allTags, onChange, placeholder = "Add t
     }
     setInput("");
     setHighlightIndex(-1);
+    setShowSuggestions(true);
   };
 
   const removeTag = (tag: string) => {
     onChange(tags.filter((t) => t !== tag));
   };
 
+  const highlightedSuggestion =
+    showSuggestions && highlightIndex >= 0 ? suggestions[highlightIndex] : undefined;
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") {
       e.preventDefault();
-      if (highlightIndex >= 0 && highlightIndex < suggestions.length) {
-        addTag(suggestions[highlightIndex]);
+      if (highlightedSuggestion) {
+        addTag(highlightedSuggestion);
       } else if (input.trim()) {
         addTag(input);
       }
@@ -60,6 +64,7 @@ export default function TagInput({ tags, allTags, onChange, placeholder = "Add t
       setHighlightIndex((i) => Math.max(i - 1, 0));
     } else if (e.key === "Escape") {
       setShowSuggestions(false);
+      setHighlightIndex(-1);
     }
   };
 

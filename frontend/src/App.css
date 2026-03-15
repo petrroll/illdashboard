@@ -458,29 +458,94 @@ input[type="file"] {
   margin-bottom: 1rem;
 }
 
-.marker-search span {
+.marker-search-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.marker-search-head span {
   font-size: 0.85rem;
   font-weight: 600;
 }
 
-.marker-search input {
-  width: 100%;
-  padding: 0.75rem 0.85rem;
-  border-radius: 10px;
+.marker-search-clear {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.marker-search-clear:hover {
+  color: var(--accent);
+}
+
+.marker-search-shell {
+  position: relative;
+  border-radius: 12px;
   border: 1px solid var(--border);
-  background: #1a2230;
+  background: linear-gradient(180deg, #1a2230 0%, #161d27 100%);
+  overflow: visible;
+}
+
+.marker-search-shell:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(15, 166, 122, 0.2);
+}
+
+.marker-search-shell > input {
+  width: 100%;
+  padding: 0.8rem 0.9rem;
+  border: none;
+  background: transparent;
   color: var(--text);
   font-size: 0.95rem;
 }
 
-.marker-search input::placeholder {
+.marker-search-shell > input::placeholder {
   color: var(--text-muted);
 }
 
-.marker-search input:focus {
+.marker-search-shell > input:focus {
   outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(15, 166, 122, 0.2);
+}
+
+.marker-search-tag-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  padding: 0.7rem 0.9rem 0.85rem;
+  border-top: 1px solid rgba(48, 60, 77, 0.85);
+}
+
+.marker-search-tag-label {
+  padding-top: 0.3rem;
+  font-size: 0.76rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.marker-search-tag-row .tag-filter-wrapper {
+  flex: 1;
+}
+
+.marker-search-tag-row .tag-input-box {
+  padding: 0;
+  min-height: auto;
+  border: none;
+  background: transparent;
+}
+
+.marker-search-tag-row .tag-input-box:focus-within {
+  border-color: transparent;
+}
+
+.marker-search-tag-row .tag-input-field {
+  min-height: 1.5rem;
 }
 
 .marker-groups {
@@ -978,7 +1043,7 @@ input[type="checkbox"] {
 .tag-input-field {
   border: none;
   background: transparent;
-  color: var(--text-primary);
+  color: var(--text);
   outline: none;
   padding: 0.15rem 0;
   min-width: 80px;
@@ -1040,7 +1105,7 @@ input[type="checkbox"] {
   padding: 0.35rem 0.75rem;
   cursor: pointer;
   font-size: 0.85rem;
-  color: var(--text-primary);
+  color: var(--text);
 }
 
 .tag-suggestions li:hover,

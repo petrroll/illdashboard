@@ -260,6 +260,50 @@ async def test_reprocess_replaces_old_values(client):
 
 
 @pytest.mark.asyncio
+async def test_set_file_tags_allows_extending_existing_tag_list(client):
+    file_id = await _upload_pdf(client)
+
+    first_resp = await client.put(f"/api/files/{file_id}/tags", json={"tags": ["baseline"]})
+    assert first_resp.status_code == 200
+    assert first_resp.json() == ["baseline"]
+
+    second_resp = await client.put(
+        f"/api/files/{file_id}/tags",
+        json={"tags": ["baseline", "fasting", " fasting ", ""]},
+    )
+    assert second_resp.status_code == 200
+    assert second_resp.json() == ["baseline", "fasting"]
+
+    detail_resp = await client.get(f"/api/files/{file_id}")
+    assert detail_resp.status_code == 200
+    assert detail_resp.json()["tags"] == ["baseline", "fasting"]
+
+
+@pytest.mark.asyncio
+async def test_set_marker_tags_allows_extending_existing_tag_list(client):
+    file_id = await _upload_pdf(client)
+
+    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+        ocr_resp = await client.post(f"/api/files/{file_id}/ocr")
+    assert ocr_resp.status_code == 200
+
+    first_resp = await client.put("/api/markers/Sodium/tags", json={"tags": ["electrolyte"]})
+    assert first_resp.status_code == 200
+    assert first_resp.json() == ["electrolyte"]
+
+    second_resp = await client.put(
+        "/api/markers/Sodium/tags",
+        json={"tags": ["electrolyte", "fasting", "fasting"]},
+    )
+    assert second_resp.status_code == 200
+    assert second_resp.json() == ["electrolyte", "fasting"]
+
+    detail_resp = await client.get("/api/measurements/detail", params={"marker_name": "Sodium"})
+    assert detail_resp.status_code == 200
+    assert detail_resp.json()["tags"] == ["electrolyte", "fasting"]
+
+
+@pytest.mark.asyncio
 async def test_batch_and_unprocessed_share_streaming_behavior(client):
     """Both streaming OCR endpoints should emit completion and persist processed data."""
     first_file_id = await _upload_pdf(client)
@@ -372,6 +416,78 @@ async def test_measurement_overview_groups_magnesium_as_electrolyte(client):
 
 
 @pytest.mark.asyncio
+async def test_measurement_overview_exposes_and_filters_by_derived_tags(client):
+    first_file_id = await _upload_pdf(client)
+    second_file_id = await _upload_pdf(client)
+
+    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_RESULT):
+        resp = await client.post(f"/api/files/{first_file_id}/ocr")
+        assert resp.status_code == 200
+
+    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_UPDATED_RESULT):
+        resp = await client.post(f"/api/files/{second_file_id}/ocr")
+        assert resp.status_code == 200
+
+    overview_resp = await client.get(
+        "/api/measurements/overview",
+        params=[("tags", "group:Blood Function"), ("tags", "multiplemeasurements")],
+    )
+    assert overview_resp.status_code == 200
+
+    overview = overview_resp.json()
+    assert len(overview) == 1
+
+    platelet = next(item for item in overview[0]["markers"] if item["marker_name"] == "Platelet Count")
+    assert "group:Blood Function" in platelet["tags"]
+    assert "multiplemeasurements" in platelet["tags"]
+
+    detail_resp = await client.get(
+        "/api/measurements/detail",
+        params={"marker_name": "Platelet Count"},
+    )
+    assert detail_resp.status_code == 200
+    detail = detail_resp.json()
+    assert "group:Blood Function" in detail["tags"]
+    assert "multiplemeasurements" in detail["tags"]
+
+
+@pytest.mark.asyncio
+async def test_marker_tags_endpoint_includes_derived_tags_and_does_not_persist_them(client):
+    file_id = await _upload_pdf(client)
+
+    with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+        resp = await client.post(f"/api/files/{file_id}/ocr")
+        assert resp.status_code == 200
+
+    tags_resp = await client.get("/api/tags/markers")
+    assert tags_resp.status_code == 200
+    assert "group:Electrolytes" in tags_resp.json()
+    assert "singlemeasurement" in tags_resp.json()
+
+    update_resp = await client.put(
+        "/api/markers/Sodium/tags",
+        json={"tags": ["group:Electrolytes", "singlemeasurement", "custom-tag"]},
+    )
+    assert update_resp.status_code == 200
+    assert update_resp.json() == ["custom-tag", "group:Electrolytes", "singlemeasurement"]
+
+    engine, session_factory = _open_current_test_db()
+    try:
+        async with session_factory() as session:
+            measurement_type_result = await session.execute(
+                select(MeasurementType).where(MeasurementType.name == "Sodium")
+            )
+            measurement_type = measurement_type_result.scalar_one()
+
+            tags_result = await session.execute(
+                select(MarkerTag.tag).where(MarkerTag.measurement_type_id == measurement_type.id)
+            )
+            assert tags_result.scalars().all() == ["custom-tag"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_measurements_persist_with_measurement_type_references(client):
     file_id = await _upload_pdf(client)
 
@@ -436,7 +552,7 @@ async def test_normalize_existing_markers_merges_measurement_types_and_tags(clie
 
     tag_resp = await client.put("/api/markers/Na/tags", json={"tags": ["electrolyte"]})
     assert tag_resp.status_code == 200
-    assert tag_resp.json() == ["electrolyte"]
+    assert tag_resp.json() == ["electrolyte", "group:Electrolytes", "singlemeasurement"]
 
     with patch("illdashboard.routes.ocr_extract", new_callable=AsyncMock, return_value=sodium_result), patch(
         "illdashboard.routes.normalize_marker_names",

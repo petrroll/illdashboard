@@ -40,17 +40,29 @@ export default function TagFilter({
     }
     setInput("");
     setHighlightIndex(-1);
+    setShowSuggestions(true);
   };
 
   const remove = (tag: string) => {
     onChange(selected.filter((t) => t !== tag));
   };
 
+  const highlightedSuggestion =
+    showSuggestions && highlightIndex >= 0 ? suggestions[highlightIndex] : undefined;
+
+  const exactMatch = input.trim()
+    ? allTags.find(
+        (tag) => tag.toLowerCase() === input.trim().toLowerCase() && !selected.includes(tag),
+      )
+    : undefined;
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") {
       e.preventDefault();
-      if (highlightIndex >= 0 && highlightIndex < suggestions.length) {
-        add(suggestions[highlightIndex]);
+      if (highlightedSuggestion) {
+        add(highlightedSuggestion);
+      } else if (exactMatch) {
+        add(exactMatch);
       }
     } else if (e.key === "Backspace" && !input && selected.length > 0) {
       remove(selected[selected.length - 1]);
@@ -62,6 +74,7 @@ export default function TagFilter({
       setHighlightIndex((i) => Math.max(i - 1, 0));
     } else if (e.key === "Escape") {
       setShowSuggestions(false);
+      setHighlightIndex(-1);
     }
   };
 
