@@ -11,6 +11,7 @@ import math
 import os
 import tempfile
 from pathlib import Path
+from collections.abc import Awaitable, Callable
 from typing import cast
 
 import fitz  # PyMuPDF
@@ -31,6 +32,8 @@ _client: CopilotClient | None = None
 OCR_PDF_BATCH_SIZE = 2
 OCR_PDF_RENDER_DPI = 144
 OCR_PDF_MIN_RENDER_DPI = 96
+OCR_ASK_TIMEOUT = 180
+OCR_RETRY_DELAY = 3
 
 
 async def _get_client() -> CopilotClient:
@@ -252,6 +255,7 @@ async def _ocr_extract_from_attachments(attachments: list[dict], *, filename: st
         MEDICAL_OCR_SYSTEM_PROMPT,
         prompt,
         attachments=attachments,
+        timeout=OCR_ASK_TIMEOUT,
     )
     return _parse_json_response(raw)
 
@@ -265,6 +269,7 @@ async def _extract_document_text_from_attachments(attachments: list[dict], *, fi
         TEXT_OCR_SYSTEM_PROMPT,
         prompt,
         attachments=attachments,
+        timeout=OCR_ASK_TIMEOUT,
     )
     return _parse_json_response(raw)
 
@@ -349,6 +354,28 @@ def _combine_ocr_outputs(medical_result: dict, text_result: dict | None, summary
     return combined
 
 
+async def _pdf_batch_extract(
+    pdf_path: str,
+    *,
+    start_page: int,
+    stop_page: int,
+    dpi: int,
+    filename: str | None = None,
+    extract_fn: Callable[[list[dict]], Awaitable[dict]],
+) -> dict:
+    temp_images: list[str] = []
+    try:
+        temp_images = _pdf_to_images(pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi)
+        attachments = [{"type": "file", "path": path} for path in temp_images]
+        return await extract_fn(attachments, filename=filename)
+    finally:
+        for path in temp_images:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 async def _ocr_extract_pdf_batch(
     pdf_path: str,
     *,
@@ -357,17 +384,10 @@ async def _ocr_extract_pdf_batch(
     dpi: int,
     filename: str | None = None,
 ) -> dict:
-    temp_images: list[str] = []
-    try:
-        temp_images = _pdf_to_images(pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi)
-        attachments = [{"type": "file", "path": path} for path in temp_images]
-        return await _ocr_extract_from_attachments(attachments, filename=filename)
-    finally:
-        for path in temp_images:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+    return await _pdf_batch_extract(
+        pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi,
+        filename=filename, extract_fn=_ocr_extract_from_attachments,
+    )
 
 
 async def _extract_document_text_pdf_batch(
@@ -378,237 +398,110 @@ async def _extract_document_text_pdf_batch(
     dpi: int,
     filename: str | None = None,
 ) -> dict:
-    temp_images: list[str] = []
-    try:
-        temp_images = _pdf_to_images(pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi)
-        attachments = [{"type": "file", "path": path} for path in temp_images]
-        return await _extract_document_text_from_attachments(attachments, filename=filename)
-    finally:
-        for path in temp_images:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+    return await _pdf_batch_extract(
+        pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi,
+        filename=filename, extract_fn=_extract_document_text_from_attachments,
+    )
 
 
-async def _ocr_extract_pdf_range(
+async def _pdf_range_with_retries(
     pdf_path: str,
     *,
     start_page: int,
     stop_page: int,
     dpi: int = OCR_PDF_RENDER_DPI,
     filename: str | None = None,
+    batch_fn: Callable[..., Awaitable[dict]],
+    merge_fn: Callable[[list[dict]], dict],
+    post_process_fn: Callable[[dict, int], dict] | None = None,
+    label: str,
 ) -> dict:
     page_count = stop_page - start_page
 
+    async def _retry(**overrides) -> dict:
+        await asyncio.sleep(OCR_RETRY_DELAY)
+        kw = dict(start_page=start_page, stop_page=stop_page, dpi=dpi)
+        kw.update(overrides)
+        return await _pdf_range_with_retries(
+            pdf_path,
+            filename=filename,
+            batch_fn=batch_fn,
+            merge_fn=merge_fn,
+            post_process_fn=post_process_fn,
+            label=label,
+            **kw,
+        )
+
     try:
-        result = await _ocr_extract_pdf_batch(
+        result = await batch_fn(
             pdf_path,
             start_page=start_page,
             stop_page=stop_page,
             dpi=dpi,
             filename=filename,
         )
-        return _offset_result_page_numbers(result, start_page)
+        return post_process_fn(result, start_page) if post_process_fn else result
     except Exception as exc:
         retry_reason = _retryable_pdf_error_reason(exc)
         if not _is_retryable_pdf_error(exc):
             logger.exception(
-                "OCR PDF extraction failed for %s (filename=%s, pages=%s-%s, dpi=%s)",
-                pdf_path,
-                filename,
-                start_page + 1,
-                stop_page,
-                dpi,
+                "%s extraction failed for %s (filename=%s, pages=%s-%s, dpi=%s)",
+                label, pdf_path, filename, start_page + 1, stop_page, dpi,
             )
             raise
 
         if page_count > 1 and (_is_request_timeout_error(exc) or _is_rate_limited_error(exc)):
             logger.warning(
-                "OCR PDF batch request failed for %s (filename=%s, pages=%s-%s, dpi=%s, reason=%s); falling back to single-page retries",
-                pdf_path,
-                filename,
-                start_page + 1,
-                stop_page,
-                dpi,
-                retry_reason,
+                "%s batch request failed for %s (filename=%s, pages=%s-%s, dpi=%s, reason=%s); falling back to single-page retries",
+                label, pdf_path, filename, start_page + 1, stop_page, dpi, retry_reason,
             )
-            results: list[dict] = []
-            for page_index in range(start_page, stop_page):
-                results.append(
-                    await _ocr_extract_pdf_range(
-                        pdf_path,
-                        start_page=page_index,
-                        stop_page=page_index + 1,
-                        dpi=dpi,
-                        filename=filename,
-                    )
-                )
-            return _merge_ocr_results(results)
+            results = [await _retry(start_page=p, stop_page=p + 1) for p in range(start_page, stop_page)]
+            return merge_fn(results)
 
         if page_count > 1:
             logger.warning(
-                "OCR PDF batch request failed for %s (filename=%s, pages=%s-%s, dpi=%s, reason=%s); splitting batch",
-                pdf_path,
-                filename,
-                start_page + 1,
-                stop_page,
-                dpi,
-                retry_reason,
+                "%s batch request failed for %s (filename=%s, pages=%s-%s, dpi=%s, reason=%s); splitting batch",
+                label, pdf_path, filename, start_page + 1, stop_page, dpi, retry_reason,
             )
             midpoint = start_page + math.ceil(page_count / 2)
-            left = await _ocr_extract_pdf_range(
-                pdf_path,
-                start_page=start_page,
-                stop_page=midpoint,
-                dpi=dpi,
-                filename=filename,
-            )
-            right = await _ocr_extract_pdf_range(
-                pdf_path,
-                start_page=midpoint,
-                stop_page=stop_page,
-                dpi=dpi,
-                filename=filename,
-            )
-            return _merge_ocr_results([left, right])
+            left = await _retry(start_page=start_page, stop_page=midpoint)
+            right = await _retry(start_page=midpoint, stop_page=stop_page)
+            return merge_fn([left, right])
 
         smaller_dpi = max(OCR_PDF_MIN_RENDER_DPI, dpi - 24)
         if smaller_dpi != dpi:
             logger.warning(
-                "OCR PDF page request failed for %s (filename=%s, page=%s, dpi=%s, reason=%s); retrying at dpi=%s",
-                pdf_path,
-                filename,
-                start_page + 1,
-                dpi,
-                retry_reason,
-                smaller_dpi,
+                "%s page request failed for %s (filename=%s, page=%s, dpi=%s, reason=%s); retrying at dpi=%s",
+                label, pdf_path, filename, start_page + 1, dpi, retry_reason, smaller_dpi,
             )
-            return await _ocr_extract_pdf_range(
-                pdf_path,
-                start_page=start_page,
-                stop_page=stop_page,
-                dpi=smaller_dpi,
-                filename=filename,
-            )
+            return await _retry(dpi=smaller_dpi)
+
         logger.exception(
-            "OCR PDF extraction failed at minimum DPI for %s (filename=%s, page=%s, dpi=%s)",
-            pdf_path,
-            filename,
-            start_page + 1,
-            dpi,
+            "%s extraction failed at minimum DPI for %s (filename=%s, page=%s, dpi=%s)",
+            label, pdf_path, filename, start_page + 1, dpi,
         )
         raise
 
 
-async def _extract_document_text_pdf_range(
-    pdf_path: str,
-    *,
-    start_page: int,
-    stop_page: int,
-    dpi: int = OCR_PDF_RENDER_DPI,
-    filename: str | None = None,
-) -> dict:
-    page_count = stop_page - start_page
+async def _ocr_extract_pdf_range(pdf_path: str, **kwargs) -> dict:
+    return await _pdf_range_with_retries(
+        pdf_path,
+        batch_fn=_ocr_extract_pdf_batch,
+        merge_fn=_merge_ocr_results,
+        post_process_fn=_offset_result_page_numbers,
+        label="OCR PDF",
+        **kwargs,
+    )
 
-    try:
-        return await _extract_document_text_pdf_batch(
-            pdf_path,
-            start_page=start_page,
-            stop_page=stop_page,
-            dpi=dpi,
-            filename=filename,
-        )
-    except Exception as exc:
-        retry_reason = _retryable_pdf_error_reason(exc)
-        if not _is_retryable_pdf_error(exc):
-            logger.exception(
-                "OCR text extraction failed for %s (filename=%s, pages=%s-%s, dpi=%s)",
-                pdf_path,
-                filename,
-                start_page + 1,
-                stop_page,
-                dpi,
-            )
-            raise
 
-        if page_count > 1 and (_is_request_timeout_error(exc) or _is_rate_limited_error(exc)):
-            logger.warning(
-                "OCR text batch request failed for %s (filename=%s, pages=%s-%s, dpi=%s, reason=%s); falling back to single-page retries",
-                pdf_path,
-                filename,
-                start_page + 1,
-                stop_page,
-                dpi,
-                retry_reason,
-            )
-            results: list[dict] = []
-            for page_index in range(start_page, stop_page):
-                results.append(
-                    await _extract_document_text_pdf_range(
-                        pdf_path,
-                        start_page=page_index,
-                        stop_page=page_index + 1,
-                        dpi=dpi,
-                        filename=filename,
-                    )
-                )
-            return _merge_document_text_results(results)
-
-        if page_count > 1:
-            logger.warning(
-                "OCR text batch request failed for %s (filename=%s, pages=%s-%s, dpi=%s, reason=%s); splitting batch",
-                pdf_path,
-                filename,
-                start_page + 1,
-                stop_page,
-                dpi,
-                retry_reason,
-            )
-            midpoint = start_page + math.ceil(page_count / 2)
-            left = await _extract_document_text_pdf_range(
-                pdf_path,
-                start_page=start_page,
-                stop_page=midpoint,
-                dpi=dpi,
-                filename=filename,
-            )
-            right = await _extract_document_text_pdf_range(
-                pdf_path,
-                start_page=midpoint,
-                stop_page=stop_page,
-                dpi=dpi,
-                filename=filename,
-            )
-            return _merge_document_text_results([left, right])
-
-        smaller_dpi = max(OCR_PDF_MIN_RENDER_DPI, dpi - 24)
-        if smaller_dpi != dpi:
-            logger.warning(
-                "OCR text page request failed for %s (filename=%s, page=%s, dpi=%s, reason=%s); retrying at dpi=%s",
-                pdf_path,
-                filename,
-                start_page + 1,
-                dpi,
-                retry_reason,
-                smaller_dpi,
-            )
-            return await _extract_document_text_pdf_range(
-                pdf_path,
-                start_page=start_page,
-                stop_page=stop_page,
-                dpi=smaller_dpi,
-                filename=filename,
-            )
-
-        logger.exception(
-            "OCR text extraction failed at minimum DPI for %s (filename=%s, page=%s, dpi=%s)",
-            pdf_path,
-            filename,
-            start_page + 1,
-            dpi,
-        )
-        raise
+async def _extract_document_text_pdf_range(pdf_path: str, **kwargs) -> dict:
+    return await _pdf_range_with_retries(
+        pdf_path,
+        batch_fn=_extract_document_text_pdf_batch,
+        merge_fn=_merge_document_text_results,
+        label="OCR text",
+        **kwargs,
+    )
 
 
 async def _ocr_extract_pdf(pdf_path: str, *, filename: str | None = None) -> dict:

@@ -49,6 +49,12 @@ class DummyDoc:
         return False
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_delay():
+    with patch.object(copilot_service, "OCR_RETRY_DELAY", 0):
+        yield
+
+
 @pytest.mark.asyncio
 async def test_ocr_extract_pdf_splits_oversized_batches_and_preserves_page_numbers():
     async def fake_batch(
@@ -318,7 +324,8 @@ async def test_ocr_extract_pdf_range_logs_context_on_non_retryable_failure():
             )
 
     logger_mock.exception.assert_called_once_with(
-        "OCR PDF extraction failed for %s (filename=%s, pages=%s-%s, dpi=%s)",
+        "%s extraction failed for %s (filename=%s, pages=%s-%s, dpi=%s)",
+        "OCR PDF",
         "/tmp/2023-2-immunology.pdf",
         "2023-2-immunology.pdf",
         1,
