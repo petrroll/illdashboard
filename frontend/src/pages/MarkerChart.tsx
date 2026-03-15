@@ -347,9 +347,9 @@ export default function MarkerChart() {
                         <div className="marker-row-value">
                           <strong>{formatValue(latest.value, latest.unit)}</strong>
                           <span>
-                            {latest.reference_low != null && latest.reference_high != null
-                              ? `${latest.reference_low}–${latest.reference_high}`
-                              : "No reference range"}
+                            {delta == null
+                              ? "First result"
+                              : `${delta > 0 ? "+" : ""}${formatValue(delta, latest.unit)}`}
                           </span>
                         </div>
 
@@ -359,14 +359,9 @@ export default function MarkerChart() {
                           <strong>
                             {previous ? formatValue(previous.value, previous.unit) : "—"}
                           </strong>
-                          <span>
-                            {delta == null
-                              ? "First result"
-                              : `${delta > 0 ? "+" : ""}${formatValue(delta, latest.unit)}`}
-                          </span>
                           {otherCount > 0 && item.value_min != null && item.value_max != null && (
                             <span className="marker-row-history-note">
-                              {otherCount} other result{otherCount !== 1 ? "s" : ""} ({formatValue(item.value_min)}–{formatValue(item.value_max)})
+                              {otherCount} more ({formatValue(item.value_min)}–{formatValue(item.value_max)})
                             </span>
                           )}
                         </div>
