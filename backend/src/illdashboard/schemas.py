@@ -110,6 +110,7 @@ class MarkerOverviewItem(BaseModel):
     previous_measurement: MeasurementOut | None = None
     status: str
     range_position: float | None = None
+    has_numeric_history: bool = False
     total_count: int = 1
     value_min: float | None = None
     value_max: float | None = None
@@ -131,6 +132,7 @@ class MarkerDetailResponse(BaseModel):
     previous_measurement: MeasurementOut | None = None
     status: str
     range_position: float | None = None
+    has_numeric_history: bool = False
     measurements: list[MeasurementOut]
     explanation: str | None = None
     explanation_cached: bool = False

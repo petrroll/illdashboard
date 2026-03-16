@@ -309,6 +309,15 @@ export default function MarkerChart() {
   const summarySource = detail ?? selectedOverviewItem ?? null;
 
   const rangeMeter = (item: MarkerOverviewItem) => {
+    if (!item.has_numeric_history) {
+      return (
+        <div className="range-meter">
+          <span className={`status-pill status-${item.status}`}>{getMarkerStatusLabel(item.status)}</span>
+          <span className="range-meter-note">Qualitative only</span>
+        </div>
+      );
+    }
+
     return (
       <div className="range-meter">
         <span className={`status-pill status-${item.status}`}>{getMarkerStatusLabel(item.status)}</span>
@@ -390,7 +399,7 @@ export default function MarkerChart() {
           <div>
             <h2>Biomarkers</h2>
             <p className="marker-subtitle">
-              Latest result, range placement, and previous reading grouped into clinical buckets.
+              Latest result, range context, and previous reading grouped into clinical buckets.
             </p>
           </div>
           <div className="marker-stats">
@@ -461,10 +470,19 @@ export default function MarkerChart() {
                     const latest = item.latest_measurement;
                     const previous = item.previous_measurement;
                     const latestWarning = getUnitConversionWarning(latest);
+                    const latestTrendValue = getCanonicalTrendValue(latest);
+                    const previousTrendValue = previous ? getCanonicalTrendValue(previous) : null;
                     const delta =
-                      previous && getCanonicalTrendValue(latest) != null && getCanonicalTrendValue(previous) != null
-                        ? getCanonicalTrendValue(latest)! - getCanonicalTrendValue(previous)!
+                      previous && latestTrendValue != null && previousTrendValue != null
+                        ? latestTrendValue - previousTrendValue
                         : null;
+                    const latestValueNote = latestWarning
+                      ? latestWarning
+                      : previous == null
+                      ? "First result"
+                      : delta != null
+                      ? `${delta > 0 ? "+" : ""}${formatMeasurementValue(delta, latest.canonical_unit)}`
+                      : `Previous on ${formatDate(previous.measured_at)}`;
                     const otherCount = item.total_count - 1 - (previous ? 1 : 0);
 
                     return (
@@ -498,13 +516,7 @@ export default function MarkerChart() {
 
                         <div className="marker-row-value">
                           <strong>{formatPreferredMeasurementValue(latest)}</strong>
-                          <span>
-                            {latestWarning
-                              ? latestWarning
-                              : delta == null
-                              ? "First result"
-                              : `${delta > 0 ? "+" : ""}${formatMeasurementValue(delta, latest.canonical_unit)}`}
-                          </span>
+                          <span>{latestValueNote}</span>
                         </div>
 
                         <div className="marker-row-range">{rangeMeter(item)}</div>
@@ -668,7 +680,9 @@ export default function MarkerChart() {
                   </div>
                 ) : (
                   <div className="card-empty detail-loading-block">
-                    Trend chart unavailable until at least one value has a valid conversion rule.
+                    {!detail.has_numeric_history && detail.measurements.some((measurement) => measurement.qualitative_value != null)
+                      ? "Trend chart unavailable for qualitative-only markers."
+                      : "Trend chart unavailable until at least one value has a valid conversion rule."}
                   </div>
                 )}
 

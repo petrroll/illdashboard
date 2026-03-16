@@ -42,6 +42,7 @@ export interface MarkerOverviewItem {
   previous_measurement: Measurement | null;
   status: "low" | "high" | "in_range" | "no_range";
   range_position: number | null;
+  has_numeric_history: boolean;
   total_count: number;
   value_min: number | null;
   value_max: number | null;
@@ -63,6 +64,7 @@ export interface MarkerDetailResponse {
   previous_measurement: Measurement | null;
   status: "low" | "high" | "in_range" | "no_range";
   range_position: number | null;
+  has_numeric_history: boolean;
   measurements: Measurement[];
   explanation: string | null;
   explanation_cached: boolean;

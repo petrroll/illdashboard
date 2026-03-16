@@ -969,6 +969,11 @@ input[type="file"] {
   justify-items: start;
 }
 
+.range-meter-note {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+}
+
 .sparkline-img {
   display: block;
   width: 100%;

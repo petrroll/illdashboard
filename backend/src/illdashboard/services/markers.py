@@ -458,6 +458,7 @@ def range_position(measurement: Measurement) -> float | None:
 def build_marker_payload(measurements: list[Measurement]) -> dict:
     latest = measurements[-1]
     previous = measurements[-2] if len(measurements) > 1 else None
+    has_numeric_history = any(measurement.canonical_value is not None for measurement in measurements)
     values = [
         measurement.canonical_value
         for measurement in measurements
@@ -471,6 +472,7 @@ def build_marker_payload(measurements: list[Measurement]) -> dict:
         "previous_measurement": previous,
         "status": measurement_status(latest),
         "range_position": range_position(latest),
+        "has_numeric_history": has_numeric_history,
         "total_count": len(measurements),
         "value_min": min(values) if values else None,
         "value_max": max(values) if values else None,

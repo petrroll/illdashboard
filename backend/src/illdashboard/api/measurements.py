@@ -55,14 +55,13 @@ async def measurement_overview(
     result = await db.execute(
         select(Measurement)
         .join(Measurement.measurement_type)
-        .where(Measurement.qualitative_value.is_(None))
         .options(
             selectinload(Measurement.measurement_type),
             selectinload(Measurement.lab_file).selectinload(LabFile.tags),
         )
         .order_by(MeasurementType.name.asc(), Measurement.measured_at.asc(), Measurement.id.asc())
     )
-    measurements = result.scalars().all()
+    measurements = list(result.scalars().all())
     await annotate_missing_rescaling_measurements(db, measurements)
     by_marker = marker_service.build_marker_histories(measurements)
 
@@ -120,7 +119,6 @@ async def list_marker_names(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(MeasurementType.name)
         .join(MeasurementType.measurements)
-        .where(Measurement.qualitative_value.is_(None))
         .distinct()
         .order_by(MeasurementType.name)
     )
@@ -137,7 +135,6 @@ async def measurement_detail(
         raise HTTPException(404, "Marker not found")
 
     measurements = await marker_service.load_measurements_for_marker(db, marker_name)
-    measurements = [measurement for measurement in measurements if measurement.qualitative_value is None]
     if not measurements:
         raise HTTPException(404, "Marker not found")
 
@@ -152,7 +149,7 @@ async def measurement_detail(
 
     tag_result = await db.execute(select(MarkerTag.tag).where(MarkerTag.measurement_type_id == measurement_type.id))
     marker_tags = marker_service.combine_marker_tags(
-        tag_result.scalars().all(),
+        list(tag_result.scalars().all()),
         measurement_type.group_name,
         len(measurements),
     )
@@ -160,7 +157,7 @@ async def measurement_detail(
 
     return MarkerDetailResponse(
         **payload,
-        measurements=measurements,
+        measurements=[MeasurementOut.model_validate(measurement) for measurement in measurements],
         explanation=explanation,
         explanation_cached=explanation_cached,
         tags=marker_service.combine_search_tags(marker_tags, file_tags),
@@ -179,7 +176,6 @@ async def measurement_insight(
         raise HTTPException(404, "Marker not found")
 
     measurements = await marker_service.load_measurements_for_marker(db, marker_name)
-    measurements = [measurement for measurement in measurements if measurement.qualitative_value is None]
     if not measurements:
         raise HTTPException(404, "Marker not found")
 
@@ -239,7 +235,7 @@ async def measurement_sparkline(
         return Response(content=cached, media_type="image/png", headers={"Cache-Control": "no-store"})
 
     png_bytes = generate_sparkline(
-        values=[measurement.canonical_value for measurement in sparkline_measurements],
+        values=[measurement.canonical_value for measurement in sparkline_measurements if measurement.canonical_value is not None],
         ref_low=sparkline_measurements[-1].canonical_reference_low,
         ref_high=sparkline_measurements[-1].canonical_reference_high,
         signature=signature,

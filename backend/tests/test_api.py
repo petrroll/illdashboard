@@ -897,7 +897,7 @@ async def test_ocr_source_normalization_uses_filename_and_seen_sources(client):
 
 
 @pytest.mark.asyncio
-async def test_ocr_persists_qualitative_measurements_and_excludes_them_from_numeric_overview(client):
+async def test_ocr_persists_qualitative_measurements_and_includes_them_in_biomarker_views(client):
     file_id = await _upload_pdf(client, filename="immunology.pdf")
 
     qualitative_result = {
@@ -984,7 +984,48 @@ async def test_ocr_persists_qualitative_measurements_and_excludes_them_from_nume
     assert overview_resp.status_code == 200
     overview = overview_resp.json()
     marker_names = [marker["marker_name"] for group in overview for marker in group["markers"]]
-    assert marker_names == ["Ferritin"]
+    assert marker_names == ["Ferritin", "Chlamydia psittaci IgG", "Varicella-zoster IgG"]
+
+    chlamydia_overview = next(
+        marker
+        for group in overview
+        for marker in group["markers"]
+        if marker["marker_name"] == "Chlamydia psittaci IgG"
+    )
+    assert chlamydia_overview["latest_measurement"]["qualitative_value"] == "negative"
+    assert chlamydia_overview["has_numeric_history"] is False
+    assert chlamydia_overview["status"] == "no_range"
+
+    markers_resp = await client.get("/api/measurements/markers")
+    assert markers_resp.status_code == 200
+    assert markers_resp.json() == ["Chlamydia psittaci IgG", "Ferritin", "Varicella-zoster IgG"]
+
+    detail_resp = await client.get(
+        "/api/measurements/detail",
+        params={"marker_name": "Chlamydia psittaci IgG"},
+    )
+    assert detail_resp.status_code == 200
+    detail = detail_resp.json()
+    assert detail["marker_name"] == "Chlamydia psittaci IgG"
+    assert detail["has_numeric_history"] is False
+    assert detail["latest_measurement"]["qualitative_value"] == "negative"
+    assert len(detail["measurements"]) == 1
+
+    with patch(
+        "illdashboard.services.insights.explain_marker_history",
+        new_callable=AsyncMock,
+        return_value="qualitative explanation",
+    ) as explain_mock:
+        insight_resp = await client.get(
+            "/api/measurements/insight",
+            params={"marker_name": "Chlamydia psittaci IgG"},
+        )
+
+    assert insight_resp.status_code == 200
+    insight = insight_resp.json()
+    assert insight["explanation"] == "qualitative explanation"
+    assert insight["explanation_cached"] is False
+    explain_mock.assert_awaited_once()
 
 
 @pytest.mark.asyncio
