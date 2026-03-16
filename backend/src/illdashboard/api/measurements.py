@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from illdashboard.database import get_db
-from illdashboard.models import LabFile, MarkerTag, Measurement, MeasurementType
+from illdashboard.models import READY_FILE_STATUS, LabFile, MarkerTag, Measurement, MeasurementType
 from illdashboard.schemas import (
     MarkerDetailResponse,
     MarkerInsightResponse,
@@ -24,7 +24,6 @@ from illdashboard.services import markers as marker_service
 from illdashboard.services.rescaling import annotate_missing_rescaling_measurements
 from illdashboard.sparkline import generate_sparkline, get_cached_sparkline
 
-
 router = APIRouter(prefix="")
 
 
@@ -36,7 +35,12 @@ async def list_measurements(
     query = (
         select(Measurement)
         .join(Measurement.measurement_type)
-        .options(selectinload(Measurement.measurement_type))
+        .join(Measurement.lab_file)
+        .options(
+            selectinload(Measurement.measurement_type),
+            selectinload(Measurement.lab_file).selectinload(LabFile.tags),
+        )
+        .where(LabFile.status == READY_FILE_STATUS)
         .order_by(Measurement.measured_at.asc(), Measurement.id.asc())
     )
     if marker_name:
@@ -55,10 +59,12 @@ async def measurement_overview(
     result = await db.execute(
         select(Measurement)
         .join(Measurement.measurement_type)
+        .join(Measurement.lab_file)
         .options(
             selectinload(Measurement.measurement_type),
             selectinload(Measurement.lab_file).selectinload(LabFile.tags),
         )
+        .where(LabFile.status == READY_FILE_STATUS)
         .order_by(MeasurementType.name.asc(), Measurement.measured_at.asc(), Measurement.id.asc())
     )
     measurements = list(result.scalars().all())
@@ -79,9 +85,7 @@ async def measurement_overview(
     if tags:
         tag_set = set(tags)
         by_marker = {
-            name: entries
-            for name, entries in by_marker.items()
-            if tag_set <= set(marker_search_tag_map.get(name, []))
+            name: entries for name, entries in by_marker.items() if tag_set <= set(marker_search_tag_map.get(name, []))
         }
 
     grouped_items: dict[str, list[MarkerOverviewItem]] = defaultdict(list)
@@ -119,6 +123,8 @@ async def list_marker_names(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(MeasurementType.name)
         .join(MeasurementType.measurements)
+        .join(Measurement.lab_file)
+        .where(LabFile.status == READY_FILE_STATUS)
         .distinct()
         .order_by(MeasurementType.name)
     )
@@ -134,7 +140,11 @@ async def measurement_detail(
     if measurement_type is None:
         raise HTTPException(404, "Marker not found")
 
-    measurements = await marker_service.load_measurements_for_marker(db, marker_name)
+    measurements = [
+        measurement
+        for measurement in await marker_service.load_measurements_for_marker(db, marker_name)
+        if measurement.lab_file.status == READY_FILE_STATUS
+    ]
     if not measurements:
         raise HTTPException(404, "Marker not found")
 
@@ -175,7 +185,11 @@ async def measurement_insight(
     if measurement_type is None:
         raise HTTPException(404, "Marker not found")
 
-    measurements = await marker_service.load_measurements_for_marker(db, marker_name)
+    measurements = [
+        measurement
+        for measurement in await marker_service.load_measurements_for_marker(db, marker_name)
+        if measurement.lab_file.status == READY_FILE_STATUS
+    ]
     if not measurements:
         raise HTTPException(404, "Marker not found")
 
@@ -195,10 +209,19 @@ async def measurement_insight(
 
 @router.get("/files/{file_id}/measurements", response_model=list[MeasurementOut], tags=["measurements"])
 async def file_measurements(file_id: int, db: AsyncSession = Depends(get_db)):
+    file = await db.get(LabFile, file_id)
+    if file is None:
+        raise HTTPException(404, "File not found")
+    if file.status != READY_FILE_STATUS:
+        return []
+
     result = await db.execute(
         select(Measurement)
         .join(Measurement.measurement_type)
-        .options(selectinload(Measurement.measurement_type))
+        .options(
+            selectinload(Measurement.measurement_type),
+            selectinload(Measurement.lab_file).selectinload(LabFile.tags),
+        )
         .where(Measurement.lab_file_id == file_id)
         .order_by(MeasurementType.name.asc(), Measurement.id.asc())
     )
@@ -212,7 +235,11 @@ async def measurement_sparkline(
     marker_name: str = Query(...),
     db: AsyncSession = Depends(get_db),
 ):
-    measurements = await marker_service.load_measurements_for_marker(db, marker_name)
+    measurements = [
+        measurement
+        for measurement in await marker_service.load_measurements_for_marker(db, marker_name)
+        if measurement.lab_file.status == READY_FILE_STATUS
+    ]
     if not measurements:
         raise HTTPException(404, "Marker not found")
 
@@ -224,7 +251,9 @@ async def measurement_sparkline(
         if measurement.canonical_value is not None and not getattr(measurement, "unit_conversion_missing", False)
     ]
     if not sparkline_measurements:
-        sparkline_measurements = [measurement for measurement in measurements if measurement.canonical_value is not None]
+        sparkline_measurements = [
+            measurement for measurement in measurements if measurement.canonical_value is not None
+        ]
     if sparkline_measurements:
         signature = insight_service.marker_signature(sparkline_measurements)
         cached = get_cached_sparkline(marker_name, signature)
@@ -233,7 +262,11 @@ async def measurement_sparkline(
 
         ref_low, ref_high = marker_service.latest_reference_range_for_history(sparkline_measurements)
         png_bytes = generate_sparkline(
-            values=[measurement.canonical_value for measurement in sparkline_measurements if measurement.canonical_value is not None],
+            values=[
+                measurement.canonical_value
+                for measurement in sparkline_measurements
+                if measurement.canonical_value is not None
+            ],
             ref_low=ref_low,
             ref_high=ref_high,
             signature=signature,
@@ -242,9 +275,7 @@ async def measurement_sparkline(
         return Response(content=png_bytes, media_type="image/png", headers={"Cache-Control": "no-store"})
 
     qualitative_sparkline_measurements = [
-        measurement
-        for measurement in measurements
-        if measurement.qualitative_bool is not None
+        measurement for measurement in measurements if measurement.qualitative_bool is not None
     ]
     if len(qualitative_sparkline_measurements) < 2:
         raise HTTPException(404, "Marker not found")

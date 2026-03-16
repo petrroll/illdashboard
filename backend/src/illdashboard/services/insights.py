@@ -73,7 +73,9 @@ def serialize_history_for_ai(measurements: list[Measurement]) -> list[dict]:
             "value": _measurement_value_for_ai(measurement),
             "unit": _measurement_display_unit(measurement),
             "reference_low": effective_reference_low if measurement is latest else measurement.canonical_reference_low,
-            "reference_high": effective_reference_high if measurement is latest else measurement.canonical_reference_high,
+            "reference_high": effective_reference_high
+            if measurement is latest
+            else measurement.canonical_reference_high,
         }
         for measurement in measurements[-8:]
     ]
@@ -99,7 +101,9 @@ def fallback_marker_explanation(marker_name: str, measurements: list[Measurement
 
         if previous is not None and previous.qualitative_value is not None:
             if previous.qualitative_value == latest.qualitative_value:
-                parts.append(f"Compared with the previous result, it is **unchanged** at **{latest.qualitative_value}**.")
+                parts.append(
+                    f"Compared with the previous result, it is **unchanged** at **{latest.qualitative_value}**."
+                )
             else:
                 parts.append(
                     "Compared with the previous result, it changed "
@@ -114,20 +118,24 @@ def fallback_marker_explanation(marker_name: str, measurements: list[Measurement
 
     if effective_reference_low is not None and effective_reference_high is not None:
         parts.append(
-            f"Reference range from the report: **{effective_reference_low:g} to {effective_reference_high:g}{unit_suffix}**."
+            "Reference range from the report: "
+            f"**{effective_reference_low:g} to {effective_reference_high:g}{unit_suffix}**."
         )
 
     if status == "low":
         parts.append(
-            "The latest result is below the reported range, which means it is lower than the lab's usual reference interval for this marker."
+            "The latest result is below the reported range, which means it is "
+            "lower than the lab's usual reference interval for this marker."
         )
     elif status == "high":
         parts.append(
-            "The latest result is above the reported range, which means it is higher than the lab's usual reference interval for this marker."
+            "The latest result is above the reported range, which means it is "
+            "higher than the lab's usual reference interval for this marker."
         )
     elif status == "in range":
         parts.append(
-            "The latest result is within the reported range, which means it falls inside the lab's usual reference interval for this marker."
+            "The latest result is within the reported range, which means it "
+            "falls inside the lab's usual reference interval for this marker."
         )
 
     if previous is not None and latest.canonical_value is not None and previous.canonical_value is not None:

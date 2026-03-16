@@ -3,7 +3,16 @@ export interface LabFile {
   filename: string;
   filepath: string;
   mime_type: string;
+  page_count: number;
+  status: "uploaded" | "queued" | "processing" | "ready" | "error";
+  measurement_status: "queued" | "running" | "done" | "error";
+  normalization_status: "queued" | "running" | "done" | "error";
+  text_status: "queued" | "running" | "done" | "error";
+  summary_status: "queued" | "running" | "done" | "error";
+  publish_status: "queued" | "running" | "done" | "error";
+  processing_error: string | null;
   uploaded_at: string;
+  published_at: string | null;
   ocr_raw: string | null;
   ocr_text_raw: string | null;
   ocr_text_english: string | null;

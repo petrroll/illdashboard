@@ -1,27 +1,27 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useParams, Link } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import {
   explainMeasurement,
   explainMeasurements,
   fetchFile,
-  fetchFileTags,
   fetchFileMeasurements,
   fetchFilePageInfo,
+  fetchFileTags,
   runFileOcr,
   setFileTags,
   type PageInfo,
 } from "../api";
 import StackedMeasurementValue from "../components/StackedMeasurementValue";
 import TagInput from "../components/TagInput";
-import type { LabFile, Measurement, ExplainRequest } from "../types";
+import type { ExplainRequest, LabFile, Measurement } from "../types";
 import {
   areUnitsEquivalent,
   formatDate,
   formatDateTime,
   formatMeasurementScalarValue,
-  formatPreferredMeasurementUnit,
   formatPreferredMeasurementScalarValue,
+  formatPreferredMeasurementUnit,
   formatPreferredReferenceRange,
   formatReferenceRange,
   getDisplayUnit,
@@ -34,6 +34,60 @@ import {
   hasRescaledMeasurementValue,
   isUnitConversionMissing,
 } from "../utils/measurements";
+
+const FILE_POLL_INTERVAL_MS = 1500;
+
+function isFileActive(file: LabFile | null) {
+  return file?.status === "queued" || file?.status === "processing";
+}
+
+function getStageLabel(file: LabFile) {
+  if (file.status === "error") {
+    return file.processing_error || "Processing failed";
+  }
+  if (file.status === "uploaded") {
+    return "Not processed";
+  }
+  if (file.publish_status === "running") {
+    return "Publishing";
+  }
+  if (file.summary_status === "running") {
+    return "Generating summary";
+  }
+  if (file.text_status === "running") {
+    return "Extracting text";
+  }
+  if (file.normalization_status === "running") {
+    return "Normalizing measurements";
+  }
+  if (file.measurement_status === "running") {
+    return "Extracting measurements";
+  }
+  if (file.status === "queued") {
+    return "Queued";
+  }
+  return "Ready";
+}
+
+function renderStatusBadge(file: LabFile) {
+  if (file.status === "ready") {
+    return <span className="badge badge-success">Ready</span>;
+  }
+  if (file.status === "error") {
+    return <span className="badge badge-danger">Error</span>;
+  }
+  if (file.status === "queued") {
+    return <span className="badge badge-warning">Queued</span>;
+  }
+  if (file.status === "uploaded") {
+    return <span className="badge">Not processed</span>;
+  }
+  return (
+    <span className="badge badge-info">
+      <span className="spinner" style={{ width: 12, height: 12 }} /> {getStageLabel(file)}…
+    </span>
+  );
+}
 
 export default function FileDetail() {
   const { id } = useParams<{ id: string }>();
@@ -78,6 +132,16 @@ export default function FileDetail() {
   }, [load]);
 
   useEffect(() => {
+    if (!isFileActive(file)) {
+      return;
+    }
+    const intervalId = window.setInterval(() => {
+      void load();
+    }, FILE_POLL_INTERVAL_MS);
+    return () => window.clearInterval(intervalId);
+  }, [file, load]);
+
+  useEffect(() => {
     return () => {
       if (highlightTimeoutRef.current !== null) {
         window.clearTimeout(highlightTimeoutRef.current);
@@ -110,46 +174,46 @@ export default function FileDetail() {
     }
   };
 
-  const toggleSelect = (mId: number) => {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(mId)) next.delete(mId);
-      else next.add(mId);
+  const toggleSelect = (measurementId: number) => {
+    setSelected((previous) => {
+      const next = new Set(previous);
+      if (next.has(measurementId)) next.delete(measurementId);
+      else next.add(measurementId);
       return next;
     });
   };
 
   const explainSelected = async () => {
     const items: ExplainRequest[] = measurements
-      .filter((m) => selected.has(m.id))
-      .map((m) => ({
-        marker_name: m.marker_name,
-        value: getOriginalMeasurementValue(m),
-        qualitative_value: m.qualitative_value,
-        unit: getOriginalMeasurementUnit(m),
-        reference_low: getOriginalMeasurementReferenceLow(m),
-        reference_high: getOriginalMeasurementReferenceHigh(m),
+      .filter((measurement) => selected.has(measurement.id))
+      .map((measurement) => ({
+        marker_name: measurement.marker_name,
+        value: getOriginalMeasurementValue(measurement),
+        qualitative_value: measurement.qualitative_value,
+        unit: getOriginalMeasurementUnit(measurement),
+        reference_low: getOriginalMeasurementReferenceLow(measurement),
+        reference_high: getOriginalMeasurementReferenceHigh(measurement),
       }));
     if (items.length === 0) return;
     await requestExplanation(() => explainMeasurements(items));
   };
 
-  const explainSingle = async (m: Measurement) => {
+  const explainSingle = async (measurement: Measurement) => {
     await requestExplanation(() => explainMeasurement({
-      marker_name: m.marker_name,
-      value: getOriginalMeasurementValue(m),
-      qualitative_value: m.qualitative_value,
-      unit: getOriginalMeasurementUnit(m),
-      reference_low: getOriginalMeasurementReferenceLow(m),
-      reference_high: getOriginalMeasurementReferenceHigh(m),
+      marker_name: measurement.marker_name,
+      value: getOriginalMeasurementValue(measurement),
+      qualitative_value: measurement.qualitative_value,
+      unit: getOriginalMeasurementUnit(measurement),
+      reference_low: getOriginalMeasurementReferenceLow(measurement),
+      reference_high: getOriginalMeasurementReferenceHigh(measurement),
     }));
   };
 
   const scrollToPage = useCallback((pageNum: number) => {
     setHighlightedPage(pageNum);
-    const el = pageRefs.current.get(pageNum);
-    if (el) {
-      el.scrollIntoView({ behavior: "smooth", block: "center" });
+    const element = pageRefs.current.get(pageNum);
+    if (element) {
+      element.scrollIntoView({ behavior: "smooth", block: "center" });
     }
 
     if (highlightTimeoutRef.current !== null) {
@@ -162,9 +226,9 @@ export default function FileDetail() {
     }, 1500);
   }, []);
 
-  const setPageRef = useCallback((pageNum: number, el: HTMLDivElement | null) => {
-    if (el) {
-      pageRefs.current.set(pageNum, el);
+  const setPageRef = useCallback((pageNum: number, element: HTMLDivElement | null) => {
+    if (element) {
+      pageRefs.current.set(pageNum, element);
     } else {
       pageRefs.current.delete(pageNum);
     }
@@ -177,7 +241,7 @@ export default function FileDetail() {
   const showPageColumn = (pageInfo?.page_count ?? 0) > 1;
   const searchLower = search.toLowerCase();
   const filteredMeasurements = searchLower
-    ? measurements.filter((m) => m.marker_name.toLowerCase().includes(searchLower))
+    ? measurements.filter((measurement) => measurement.marker_name.toLowerCase().includes(searchLower))
     : measurements;
 
   return (
@@ -190,10 +254,24 @@ export default function FileDetail() {
         Uploaded {formatDateTime(file.uploaded_at)}
         {file.lab_date && ` · Lab date: ${formatDate(file.lab_date)}`}
       </p>
+
+      <section className="card" style={{ marginBottom: "1rem" }}>
+        <div style={{ display: "flex", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
+          {renderStatusBadge(file)}
+          <span style={{ color: "var(--text-muted)", fontSize: "0.9rem" }}>{getStageLabel(file)}</span>
+          {file.processing_error && file.status === "error" && (
+            <span style={{ color: "var(--red, #e74c3c)", fontSize: "0.85rem" }}>{file.processing_error}</span>
+          )}
+        </div>
+        <div style={{ color: "var(--text-muted)", fontSize: "0.82rem", marginTop: "0.5rem" }}>
+          Measurement OCR: {file.measurement_status} · Normalization: {file.normalization_status} · Text: {file.text_status} · Summary: {file.summary_status}
+        </div>
+      </section>
+
       <div
         style={{
           display: "flex",
-          alignItems: "flex-start",
+          alignItems: "center",
           gap: "0.6rem",
           flexWrap: "wrap",
           marginBottom: "1rem",
@@ -226,20 +304,19 @@ export default function FileDetail() {
         </div>
       </div>
 
-      {/* OCR controls */}
       <div className="flex-row mb-1">
-        <button className="btn btn-primary" onClick={runOcr} disabled={ocrRunning}>
+        <button className="btn btn-primary" onClick={runOcr} disabled={ocrRunning || isFileActive(file)}>
           {ocrRunning ? (
             <>
-              <span className="spinner" /> Running OCR…
+              <span className="spinner" /> Queueing…
             </>
-          ) : file.ocr_raw ? (
-            "Re-run OCR"
+          ) : file.status === "ready" ? (
+            "Re-run processing"
           ) : (
-            "Run OCR (extract values)"
+            "Start processing"
           )}
         </button>
-        {selected.size > 0 && (
+        {selected.size > 0 && measurements.length > 0 && (
           <button className="btn btn-outline" onClick={explainSelected} disabled={explaining}>
             {explaining ? (
               <>
@@ -263,7 +340,7 @@ export default function FileDetail() {
         <details className="card ocr-text-details">
           <summary>
             <span>Extracted document text</span>
-            <span className="ocr-text-details-hint">English and Czech/original OCR text</span>
+            <span className="ocr-text-details-hint">English and original OCR text</span>
           </summary>
 
           <div className="ocr-text-grid">
@@ -284,9 +361,7 @@ export default function FileDetail() {
         </details>
       )}
 
-      {/* Side-by-side: document preview + measurements */}
       <div className="file-detail-split">
-        {/* Document preview */}
         {hasPages && (
           <div className="file-preview-panel card">
             <h3 style={{ fontSize: "0.9rem", color: "var(--text-muted)", marginBottom: "0.75rem" }}>
@@ -294,34 +369,35 @@ export default function FileDetail() {
               {pageInfo.page_count > 1 && ` · ${pageInfo.page_count} pages`}
             </h3>
             <div className="file-preview-pages">
-              {Array.from({ length: pageInfo.page_count }, (_, i) => i + 1).map(
-                (pageNum) => (
-                  <div
-                    key={pageNum}
-                    ref={(el) => setPageRef(pageNum, el)}
-                    className={`file-preview-page${highlightedPage === pageNum ? " file-preview-page--highlighted" : ""}`}
-                  >
-                    {pageInfo.page_count > 1 && (
-                      <span className="file-preview-page-label">Page {pageNum}</span>
-                    )}
-                    <img
-                      src={`/api/files/${fileId}/pages/${pageNum}`}
-                      alt={`Page ${pageNum}`}
-                      loading="lazy"
-                    />
-                  </div>
-                )
-              )}
+              {Array.from({ length: pageInfo.page_count }, (_, index) => index + 1).map((pageNum) => (
+                <div
+                  key={pageNum}
+                  ref={(element) => setPageRef(pageNum, element)}
+                  className={`file-preview-page${highlightedPage === pageNum ? " file-preview-page--highlighted" : ""}`}
+                >
+                  {pageInfo.page_count > 1 && (
+                    <span className="file-preview-page-label">Page {pageNum}</span>
+                  )}
+                  <img
+                    src={`/api/files/${fileId}/pages/${pageNum}`}
+                    alt={`Page ${pageNum}`}
+                    loading="lazy"
+                  />
+                </div>
+              ))}
             </div>
           </div>
         )}
 
-        {/* Measurements table */}
         <div className="file-measurements-panel">
           {measurements.length === 0 ? (
             <div className="card">
               <p style={{ color: "var(--text-muted)" }}>
-                No measurements extracted yet. Click "Run OCR" to extract lab values.
+                {isFileActive(file)
+                  ? "This file is still processing. Measurements will appear once the file is published."
+                  : file.status === "error"
+                  ? "Processing failed. Re-run the pipeline to try again."
+                  : "No measurements were published for this file."}
               </p>
             </div>
           ) : (
@@ -331,7 +407,7 @@ export default function FileDetail() {
                   type="text"
                   placeholder="Search markers…"
                   value={search}
-                  onChange={(e) => setSearch(e.target.value)}
+                  onChange={(event) => setSearch(event.target.value)}
                 />
               </div>
               <table>
@@ -348,22 +424,22 @@ export default function FileDetail() {
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredMeasurements.map((m) => {
-                    const canonicalValue = m.canonical_value;
-                    const canonicalUnit = m.canonical_unit;
-                    const canonicalReferenceLow = m.canonical_reference_low;
-                    const canonicalReferenceHigh = m.canonical_reference_high;
-                    const originalValue = getOriginalMeasurementValue(m);
-                    const originalUnit = getOriginalMeasurementUnit(m);
-                    const originalReferenceLow = getOriginalMeasurementReferenceLow(m);
-                    const originalReferenceHigh = getOriginalMeasurementReferenceHigh(m);
-                    const conversionMissing = isUnitConversionMissing(m);
-                    const conversionWarning = getUnitConversionWarning(m);
+                  {filteredMeasurements.map((measurement) => {
+                    const canonicalValue = measurement.canonical_value;
+                    const canonicalUnit = measurement.canonical_unit;
+                    const canonicalReferenceLow = measurement.canonical_reference_low;
+                    const canonicalReferenceHigh = measurement.canonical_reference_high;
+                    const originalValue = getOriginalMeasurementValue(measurement);
+                    const originalUnit = getOriginalMeasurementUnit(measurement);
+                    const originalReferenceLow = getOriginalMeasurementReferenceLow(measurement);
+                    const originalReferenceHigh = getOriginalMeasurementReferenceHigh(measurement);
+                    const conversionMissing = isUnitConversionMissing(measurement);
+                    const conversionWarning = getUnitConversionWarning(measurement);
                     const showOriginalValue = !conversionMissing
-                      && m.qualitative_value == null
-                      && hasRescaledMeasurementValue(m);
+                      && measurement.qualitative_value == null
+                      && hasRescaledMeasurementValue(measurement);
                     const showOriginalReference = !conversionMissing
-                      && m.qualitative_value == null
+                      && measurement.qualitative_value == null
                       && (originalReferenceLow !== canonicalReferenceLow || originalReferenceHigh !== canonicalReferenceHigh);
                     const showOriginalUnit = !conversionMissing && !areUnitsEquivalent(originalUnit, canonicalUnit);
                     const statusValue = conversionMissing ? originalValue : canonicalValue;
@@ -371,57 +447,63 @@ export default function FileDetail() {
                     const statusReferenceHigh = conversionMissing ? originalReferenceHigh : canonicalReferenceHigh;
 
                     return (
-                      <tr key={m.id}>
+                      <tr key={measurement.id}>
                         <td>
                           <label className="checkbox-row">
                             <input
                               type="checkbox"
-                              checked={selected.has(m.id)}
-                              onChange={() => toggleSelect(m.id)}
+                              checked={selected.has(measurement.id)}
+                              onChange={() => toggleSelect(measurement.id)}
                             />
                           </label>
                         </td>
-                        <td style={{ fontWeight: 500 }}>{m.marker_name}</td>
-                        <td className={getMeasurementValueClass({ value: statusValue, reference_low: statusReferenceLow, reference_high: statusReferenceHigh, qualitative_bool: m.qualitative_bool })}>
+                        <td style={{ fontWeight: 500 }}>{measurement.marker_name}</td>
+                        <td
+                          className={getMeasurementValueClass({
+                            value: statusValue,
+                            reference_low: statusReferenceLow,
+                            reference_high: statusReferenceHigh,
+                            qualitative_bool: measurement.qualitative_bool,
+                          })}
+                        >
                           <StackedMeasurementValue
-                            primary={formatPreferredMeasurementScalarValue(m)}
+                            primary={formatPreferredMeasurementScalarValue(measurement)}
                             secondary={conversionMissing
                               ? conversionWarning ?? undefined
                               : showOriginalValue
-                              ? formatMeasurementScalarValue(originalValue, m.qualitative_value)
+                              ? formatMeasurementScalarValue(originalValue, measurement.qualitative_value)
                               : undefined}
                           />
                         </td>
                         <td>
                           <StackedMeasurementValue
-                            primary={formatPreferredMeasurementUnit(m)}
+                            primary={formatPreferredMeasurementUnit(measurement)}
                             secondary={conversionMissing
                               ? getDisplayUnit(canonicalUnit)
                                 ? `Target ${getDisplayUnit(canonicalUnit)}`
                                 : undefined
                               : showOriginalUnit
-                                ? getDisplayUnit(originalUnit) ?? "—"
-                                : undefined}
+                              ? getDisplayUnit(originalUnit) ?? "—"
+                              : undefined}
                           />
                         </td>
                         <td>
                           <StackedMeasurementValue
-                            primary={formatPreferredReferenceRange(m)}
+                            primary={formatPreferredReferenceRange(measurement)}
                             secondary={showOriginalReference
                               ? formatReferenceRange(originalReferenceLow, originalReferenceHigh)
                               : undefined}
                           />
                         </td>
-                        <td>{formatDate(m.measured_at)}</td>
+                        <td>{formatDate(measurement.measured_at)}</td>
                         {hasPages && showPageColumn && (
                           <td>
-                            {m.page_number ? (
+                            {measurement.page_number ? (
                               <button
                                 className="btn-page-link"
-                                onClick={() => scrollToPage(m.page_number!)}
-                                title={`Scroll to page ${m.page_number}`}
+                                onClick={() => scrollToPage(measurement.page_number!)}
                               >
-                                p.{m.page_number}
+                                Page {measurement.page_number}
                               </button>
                             ) : (
                               "—"
@@ -429,11 +511,7 @@ export default function FileDetail() {
                           </td>
                         )}
                         <td>
-                          <button
-                            className="btn btn-outline btn-sm"
-                            onClick={() => explainSingle(m)}
-                            disabled={explaining}
-                          >
+                          <button className="btn btn-outline btn-sm" onClick={() => void explainSingle(measurement)}>
                             Explain
                           </button>
                         </td>
@@ -445,18 +523,13 @@ export default function FileDetail() {
             </div>
           )}
 
-          {/* AI Explanation */}
-          {(explanation || explaining) && (
-            <div className="explanation-panel">
-              <h3>🤖 AI Explanation</h3>
-              {explaining ? (
-                <span className="flex-row">
-                  <span className="spinner" /> Generating explanation…
-                </span>
-              ) : (
-                <ReactMarkdown>{explanation || ""}</ReactMarkdown>
-              )}
-            </div>
+          {explanation && (
+            <section className="card" style={{ marginTop: "1rem" }}>
+              <div style={{ color: "var(--text-muted)", fontSize: "0.8rem", marginBottom: "0.5rem" }}>
+                AI explanation
+              </div>
+              <ReactMarkdown>{explanation}</ReactMarkdown>
+            </section>
           )}
         </div>
       </div>

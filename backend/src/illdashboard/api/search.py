@@ -9,7 +9,6 @@ from illdashboard.database import get_db
 from illdashboard.schemas import SearchResultOut
 from illdashboard.services import search as search_service
 
-
 router = APIRouter(prefix="")
 
 

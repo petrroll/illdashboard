@@ -9,7 +9,6 @@ from illdashboard.api.measurements import router as measurements_router
 from illdashboard.api.search import router as search_router
 from illdashboard.api.tags import router as tags_router
 
-
 router = APIRouter()
 router.include_router(files_router)
 router.include_router(measurements_router)

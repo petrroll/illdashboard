@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from illdashboard.copilot.client import _ask
 
-
 EXPLAIN_SYSTEM_PROMPT = """\
 You are a knowledgeable medical lab advisor. The user will give you one or more \
 lab markers with their values, units, and reference ranges. For each marker:

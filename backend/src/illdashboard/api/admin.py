@@ -6,10 +6,9 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from illdashboard.database import get_db
-from illdashboard.schemas import RescalingRuleOut
 from illdashboard.metrics import get_premium_requests_used
+from illdashboard.schemas import RescalingRuleOut
 from illdashboard.services import admin as admin_service
-
 
 router = APIRouter(prefix="")
 

@@ -3,8 +3,6 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-# ── LabFile ──────────────────────────────────────────────────────────────────
-
 
 class LabFileOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -13,7 +11,16 @@ class LabFileOut(BaseModel):
     filename: str
     filepath: str
     mime_type: str
+    page_count: int
+    status: str
+    measurement_status: str
+    normalization_status: str
+    text_status: str
+    summary_status: str
+    publish_status: str
+    processing_error: str | None = None
     uploaded_at: datetime
+    published_at: datetime | None = None
     ocr_raw: str | None = None
     ocr_text_raw: str | None = None
     ocr_text_english: str | None = None
@@ -24,17 +31,13 @@ class LabFileOut(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _flatten_tags(cls, data: Any):
-        """Convert LabFileTag ORM objects to plain strings."""
         if isinstance(data, dict):
             return data
         if hasattr(data, "__table__"):
-            raw = data.__dict__.get("tags", [])
-            data = {c.key: getattr(data, c.key) for c in data.__table__.columns}
-            data["tags"] = [t.tag for t in raw] if raw and hasattr(raw[0], "tag") else list(raw)
+            raw_tags = data.__dict__.get("tags", [])
+            data = {column.key: getattr(data, column.key) for column in data.__table__.columns}
+            data["tags"] = [tag.tag for tag in raw_tags] if raw_tags and hasattr(raw_tags[0], "tag") else list(raw_tags)
         return data
-
-
-# ── Measurement ──────────────────────────────────────────────────────────────
 
 
 class MeasurementOut(BaseModel):
@@ -66,16 +69,12 @@ class MeasurementOut(BaseModel):
         if isinstance(data, dict):
             data.setdefault("unit_conversion_missing", False)
             return data
-        if hasattr(data, "measurement_type"):
-            measurement_type = data.measurement_type
-            lab_file = data.__dict__.get("lab_file")
+        if hasattr(data, "lab_file"):
+            measurement_type = getattr(data, "measurement_type", None)
+            lab_file = getattr(data, "lab_file", None)
             lab_file_tags = lab_file.__dict__.get("tags", []) if lab_file is not None else []
             source_tag = next(
-                (
-                    tag.tag
-                    for tag in lab_file_tags
-                    if hasattr(tag, "tag") and tag.tag.casefold().startswith("source:")
-                ),
+                (tag.tag for tag in lab_file_tags if hasattr(tag, "tag") and tag.tag.casefold().startswith("source:")),
                 None,
             )
             return {
@@ -83,8 +82,8 @@ class MeasurementOut(BaseModel):
                 "lab_file_id": data.lab_file_id,
                 "lab_file_filename": getattr(lab_file, "filename", None),
                 "lab_file_source_tag": source_tag,
-                "marker_name": measurement_type.name,
-                "canonical_unit": measurement_type.canonical_unit,
+                "marker_name": getattr(data, "marker_name", None) or getattr(measurement_type, "name", None),
+                "canonical_unit": data.canonical_unit or getattr(measurement_type, "canonical_unit", None),
                 "canonical_value": data.canonical_value,
                 "original_value": data.original_value,
                 "original_qualitative_value": data.original_qualitative_value,
@@ -153,19 +152,6 @@ class MarkerInsightResponse(BaseModel):
     explanation_cached: bool
 
 
-class MeasurementCreate(BaseModel):
-    marker_name: str
-    value: float | None = None
-    qualitative_value: str | None = None
-    unit: str | None = None
-    reference_low: float | None = None
-    reference_high: float | None = None
-    measured_at: datetime | None = None
-
-
-# ── AI / explanation ─────────────────────────────────────────────────────────
-
-
 class ExplainRequest(BaseModel):
     marker_name: str
     value: float | None = None
@@ -176,39 +162,15 @@ class ExplainRequest(BaseModel):
 
 
 class MultiExplainRequest(BaseModel):
-    """Ask the AI to explain a set of values together."""
-
     measurements: list[ExplainRequest]
-
-
-# ── Batch OCR ────────────────────────────────────────────────────────────────
 
 
 class BatchOcrRequest(BaseModel):
     file_ids: list[int]
 
 
-class OcrJobProgressOut(BaseModel):
-    file_id: int
-    filename: str
-    index: int
-    total: int
-    status: str
-    error: str | None = None
-
-
-class OcrJobStartResponse(BaseModel):
-    job_id: str
-
-
-class OcrJobStatusResponse(BaseModel):
-    job_id: str
-    status: str
-    total: int
-    completed_count: int
-    error_count: int
-    last_updated_at: float
-    progress: list[OcrJobProgressOut] = Field(default_factory=list)
+class QueueFilesResponse(BaseModel):
+    queued_file_ids: list[int] = Field(default_factory=list)
 
 
 class ExplainResponse(BaseModel):

@@ -8,11 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from illdashboard.database import get_db
-from illdashboard.models import LabFile, LabFileTag, MarkerTag, Measurement, MeasurementType
+from illdashboard.models import READY_FILE_STATUS, LabFile, LabFileTag, MarkerTag, Measurement, MeasurementType
 from illdashboard.schemas import TagsUpdate
 from illdashboard.services import markers as marker_service
 from illdashboard.services import search as search_service
-
 
 router = APIRouter(prefix="")
 
@@ -28,10 +27,12 @@ async def list_marker_tags(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(Measurement)
         .join(Measurement.measurement_type)
+        .join(Measurement.lab_file)
         .options(
             selectinload(Measurement.measurement_type),
             selectinload(Measurement.lab_file).selectinload(LabFile.tags),
         )
+        .where(LabFile.status == READY_FILE_STATUS)
         .order_by(MeasurementType.name.asc(), Measurement.measured_at.asc(), Measurement.id.asc())
     )
     measurements = result.scalars().all()
@@ -67,7 +68,8 @@ async def set_file_tags(file_id: int, body: TagsUpdate, db: AsyncSession = Depen
     for tag in unique_tags:
         db.add(LabFileTag(lab_file_id=file_id, tag=tag))
     await db.flush()
-    await search_service.refresh_lab_search_document(file_id, db)
+    if lab.status == READY_FILE_STATUS:
+        await search_service.refresh_lab_search_document(file_id, db)
     await db.commit()
     return unique_tags
 
@@ -84,14 +86,14 @@ async def set_marker_tags(marker_name: str, body: TagsUpdate, db: AsyncSession =
     await db.flush()
 
     reserved_tags = await marker_service.all_reserved_marker_tags(db, measurement_type.group_name)
-    unique_tags = [
-        tag
-        for tag in marker_service.normalize_unique_tags(body.tags)
-        if tag not in reserved_tags
-    ]
+    unique_tags = [tag for tag in marker_service.normalize_unique_tags(body.tags) if tag not in reserved_tags]
     for tag in unique_tags:
         db.add(MarkerTag(measurement_type_id=measurement_type.id, tag=tag))
     await db.commit()
 
-    measurements = await marker_service.load_measurements_for_marker(db, marker_name)
+    measurements = [
+        measurement
+        for measurement in await marker_service.load_measurements_for_marker(db, marker_name)
+        if measurement.lab_file.status == READY_FILE_STATUS
+    ]
     return marker_service.combine_marker_tags(unique_tags, measurement_type.group_name, len(measurements))

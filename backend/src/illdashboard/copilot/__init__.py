@@ -2,6 +2,7 @@
 
 from illdashboard.copilot.client import SessionEventType, shutdown_client
 from illdashboard.copilot.explanations import explain_marker_history, explain_markers
+from illdashboard.copilot.extraction import ocr_extract
 from illdashboard.copilot.normalization import (
     MarkerObservation,
     MarkerUnitGroup,
@@ -14,7 +15,6 @@ from illdashboard.copilot.normalization import (
     normalize_qualitative_values,
     normalize_source_name,
 )
-from illdashboard.copilot.extraction import ocr_extract
 
 __all__ = [
     "MarkerObservation",

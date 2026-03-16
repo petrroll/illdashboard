@@ -8,8 +8,7 @@ from collections import defaultdict
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from illdashboard.models import LabFileTag, Measurement, MeasurementType
-
+from illdashboard.models import READY_FILE_STATUS, LabFileTag, Measurement, MeasurementType
 
 SEARCH_TABLE_NAME = "lab_file_search"
 
@@ -74,7 +73,7 @@ async def refresh_lab_search_document(file_id: int, db: AsyncSession) -> None:
     file_result = await db.execute(
         text(
             """
-            SELECT filename, ocr_summary_english, ocr_text_raw, ocr_text_english
+            SELECT filename, ocr_summary_english, ocr_text_raw, ocr_text_english, status
             FROM lab_files
             WHERE id = :file_id
             """
@@ -83,6 +82,9 @@ async def refresh_lab_search_document(file_id: int, db: AsyncSession) -> None:
     )
     row = file_result.mappings().first()
     if row is None:
+        return
+    if row["status"] != READY_FILE_STATUS:
+        await remove_lab_search_document(file_id, db)
         return
 
     tag_result = await db.execute(
@@ -143,7 +145,10 @@ async def remove_lab_search_document(file_id: int, db: AsyncSession) -> None:
 
 
 async def rebuild_lab_search_index(db: AsyncSession) -> None:
-    result = await db.execute(text("SELECT id FROM lab_files ORDER BY id ASC"))
+    result = await db.execute(
+        text("SELECT id FROM lab_files WHERE status = :status ORDER BY id ASC"),
+        {"status": READY_FILE_STATUS},
+    )
     file_ids = [row[0] for row in result.fetchall()]
     await db.execute(text(f"DELETE FROM {SEARCH_TABLE_NAME}"))
     for file_id in file_ids:
@@ -186,7 +191,7 @@ async def search_lab_files(raw_query: str, tags: list[str], db: AsyncSession, *,
             bm25({SEARCH_TABLE_NAME}, 1.0, 2.2, 3.4, 1.2, 1.8, 2.5) AS score
         FROM {SEARCH_TABLE_NAME}
         JOIN lab_files lf ON lf.id = {SEARCH_TABLE_NAME}.rowid
-        WHERE {' AND '.join(conditions)}
+        WHERE {" AND ".join(conditions)}
         ORDER BY score ASC, lf.uploaded_at DESC
         LIMIT :limit
         """

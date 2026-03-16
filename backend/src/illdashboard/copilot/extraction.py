@@ -15,17 +15,20 @@ from pathlib import Path
 
 import fitz
 
-from illdashboard.copilot.client import _ask_json
-
+from illdashboard.copilot.client import _ask_json, get_copilot_request_load
 
 logger = logging.getLogger(__name__)
 
 OCR_PDF_BATCH_SIZE = 2
+OCR_PDF_MAX_BATCH_SIZE = 4
 OCR_PDF_RENDER_DPI = 144
 OCR_PDF_MIN_RENDER_DPI = 96
 OCR_ASK_TIMEOUT = 180
 OCR_RETRY_DELAY = 3
 OCR_PDF_BATCH_CONCURRENCY = 4
+OCR_PDF_BACKPRESSURE_BATCH_CONCURRENCY = 2
+OCR_PDF_BACKPRESSURE_MIN_PAGE_COUNT = 8
+OCR_PDF_BACKPRESSURE_QUEUE_THRESHOLD = 6
 
 
 class _PdfRenderCache:
@@ -53,6 +56,39 @@ class _PdfRenderCache:
                 os.unlink(path)
             except OSError:
                 pass
+
+
+@dataclass(frozen=True)
+class _PdfBatchPlan:
+    batch_size: int
+    concurrency: int
+    queue_depth: int
+    active_requests: int
+
+
+@dataclass(frozen=True)
+class _ExtractionBatch:
+    batch_index: int
+    start_page: int
+    stop_page: int
+    result: dict
+
+
+def _select_pdf_batch_plan(page_count: int) -> _PdfBatchPlan:
+    queue_depth, active_requests = get_copilot_request_load()
+    batch_size = OCR_PDF_BATCH_SIZE
+    concurrency = OCR_PDF_BATCH_CONCURRENCY
+
+    if page_count >= OCR_PDF_BACKPRESSURE_MIN_PAGE_COUNT and queue_depth >= OCR_PDF_BACKPRESSURE_QUEUE_THRESHOLD:
+        batch_size = OCR_PDF_MAX_BATCH_SIZE
+        concurrency = OCR_PDF_BACKPRESSURE_BATCH_CONCURRENCY
+
+    return _PdfBatchPlan(
+        batch_size=batch_size,
+        concurrency=concurrency,
+        queue_depth=queue_depth,
+        active_requests=active_requests,
+    )
 
 
 def _is_request_too_large_error(exc: Exception) -> bool:
@@ -95,9 +131,10 @@ PDF of a document. Your job is to:
     This includes qualitative serology and immunology markers reported as positive/negative/reactive/not detected.
 2. Identify the lab/report source when possible (for example Synlab, Jaeger, Unilabs).
 3. For each marker return a JSON array of objects with keys:
-    "marker_name", "value" (number for numeric results, string for qualitative results), "unit", "reference_low" (numeric or null),
-    "reference_high" (numeric or null), "measured_at" (ISO date string or null),
-    "page_number" (integer, 1-indexed – which page/image the value appears on).
+    "marker_name", "value" (number for numeric results, string for qualitative
+    results), "unit", "reference_low" (numeric or null), "reference_high"
+    (numeric or null), "measured_at" (ISO date string or null), "page_number"
+    (integer, 1-indexed – which page/image the value appears on).
 4. Also return "lab_date" (ISO date string or null) for the report date.
 5. Also return "source" as a short raw source/provider name string, or null if unclear.
 
@@ -105,7 +142,9 @@ If the document is not a lab report, return an empty "measurements" array instea
 
 CRITICAL rules for values:
 - Use a JSON number in "value" when the report shows a numeric result.
-- Use a short JSON string in "value" when the report shows a qualitative result such as "positive", "negative", "reactive", "non-reactive", "detected", or "not detected".
+ - Use a short JSON string in "value" when the report shows a qualitative
+   result such as "positive", "negative", "reactive", "non-reactive",
+   "detected", or "not detected".
 - Do NOT omit a marker just because its value is qualitative.
 - "reference_low" and "reference_high" MUST be JSON numbers or null.
 - Use a dot (.) as the decimal separator, never a comma or space. E.g. 0.1, not "0,1" or "0 1".
@@ -114,9 +153,12 @@ CRITICAL rules for values:
 - Read decimal points carefully – "0.1" (zero point one) is very different from "1".
 
 CRITICAL extraction rules:
-- Do not skip dense semicolon-separated or comma-separated sections. Split every assay/result pair into its own measurement object.
-- Serology and immunology pages often list many markers inline on one line. Extract every marker, even when many share the same sentence.
-- Keep marker names specific. For example, include the organism plus antibody class such as "Chlamydia psittaci IgG" rather than only "IgG".
+ - Do not skip dense semicolon-separated or comma-separated sections. Split
+   every assay/result pair into its own measurement object.
+ - Serology and immunology pages often list many markers inline on one line.
+   Extract every marker, even when many share the same sentence.
+ - Keep marker names specific. For example, include the organism plus antibody
+   class such as "Chlamydia psittaci IgG" rather than only "IgG".
 
 When multiple pages/images are attached, number them starting from 1 in the \
 order they are provided and set "page_number" accordingly for every measurement.
@@ -166,7 +208,9 @@ Do not include any commentary outside the JSON.\
 """
 
 
-def _pdf_to_images(pdf_path: str, *, start_page: int = 0, stop_page: int | None = None, dpi: int = OCR_PDF_RENDER_DPI) -> list[str]:
+def _pdf_to_images(
+    pdf_path: str, *, start_page: int = 0, stop_page: int | None = None, dpi: int = OCR_PDF_RENDER_DPI
+) -> list[str]:
     """Convert selected PDF pages to temporary PNG files."""
     document = fitz.open(pdf_path)
     paths: list[str] = []
@@ -485,7 +529,8 @@ async def _pdf_range_with_retries(
 
         if page_count > 1 and (_is_request_timeout_error(exc) or _is_rate_limited_error(exc)):
             logger.warning(
-                "%s batch request failed for %s (filename=%s, pages=%s-%s, dpi=%s, reason=%s); falling back to single-page retries",
+                "%s batch request failed for %s (filename=%s, pages=%s-%s, dpi=%s, reason=%s); "
+                "falling back to single-page retries",
                 kind.label,
                 pdf_path,
                 filename,
@@ -549,43 +594,16 @@ async def _extract_file(
     started_at = time.perf_counter()
     logger.info("%s start path=%s filename=%s", kind.label, file_path, filename)
 
-    if Path(file_path).suffix.lower() != ".pdf":
-        logger.info("%s single-image path=%s filename=%s", kind.label, file_path, filename)
-        result = await kind.extract_fn([{"type": "file", "path": file_path}], filename=filename)
-    else:
-        with fitz.open(file_path) as document:
-            page_count = document.page_count
+    batches: list[_ExtractionBatch] = []
+    async for batch in _extract_file_batches(
+        file_path,
+        kind,
+        filename=filename,
+        render_cache=render_cache,
+    ):
+        batches.append(batch)
 
-        batch_count = math.ceil(page_count / OCR_PDF_BATCH_SIZE)
-        logger.info(
-            "%s pdf batches path=%s filename=%s page_count=%s batch_size=%s batch_count=%s concurrency=%s",
-            kind.label,
-            file_path,
-            filename,
-            page_count,
-            OCR_PDF_BATCH_SIZE,
-            batch_count,
-            OCR_PDF_BATCH_CONCURRENCY,
-        )
-
-        semaphore = asyncio.Semaphore(OCR_PDF_BATCH_CONCURRENCY)
-
-        async def _run_range(start_page: int, stop_page: int) -> dict:
-            async with semaphore:
-                return await _pdf_range_with_retries(
-                    file_path,
-                    kind,
-                    start_page=start_page,
-                    stop_page=stop_page,
-                    filename=filename,
-                    render_cache=render_cache,
-                )
-
-        tasks = [
-            asyncio.create_task(_run_range(start_page, min(start_page + OCR_PDF_BATCH_SIZE, page_count)))
-            for start_page in range(0, page_count, OCR_PDF_BATCH_SIZE)
-        ]
-        result = kind.merge_fn(await asyncio.gather(*tasks))
+    result = kind.merge_fn([batch.result for batch in sorted(batches, key=lambda current: current.batch_index)])
 
     logger.info(
         "%s finished path=%s filename=%s duration=%.2fs",
@@ -595,6 +613,83 @@ async def _extract_file(
         time.perf_counter() - started_at,
     )
     return result
+
+
+async def _extract_file_batches(
+    file_path: str,
+    kind: _ExtractionKind,
+    *,
+    filename: str | None = None,
+    render_cache: _PdfRenderCache | None = None,
+):
+    """Yield finished extraction batches as soon as they complete.
+
+    This is the core primitive that lets downstream code start normalizing the
+    first extracted measurement pages before the whole file has finished OCR.
+    """
+
+    if Path(file_path).suffix.lower() != ".pdf":
+        logger.info("%s single-image path=%s filename=%s", kind.label, file_path, filename)
+        result = await kind.extract_fn([{"type": "file", "path": file_path}], filename=filename)
+        yield _ExtractionBatch(
+            batch_index=0,
+            start_page=0,
+            stop_page=1,
+            result=kind.post_process_fn(result, 0) if kind.post_process_fn else result,
+        )
+        return
+
+    with fitz.open(file_path) as document:
+        page_count = document.page_count
+
+    batch_plan = _select_pdf_batch_plan(page_count)
+    batch_count = math.ceil(page_count / batch_plan.batch_size)
+    logger.info(
+        "%s pdf batches path=%s filename=%s page_count=%s batch_size=%s "
+        "batch_count=%s concurrency=%s queue_depth=%s active_requests=%s",
+        kind.label,
+        file_path,
+        filename,
+        page_count,
+        batch_plan.batch_size,
+        batch_count,
+        batch_plan.concurrency,
+        batch_plan.queue_depth,
+        batch_plan.active_requests,
+    )
+
+    semaphore = asyncio.Semaphore(batch_plan.concurrency)
+
+    async def _run_range(batch_index: int, start_page: int, stop_page: int) -> _ExtractionBatch:
+        async with semaphore:
+            result = await _pdf_range_with_retries(
+                file_path,
+                kind,
+                start_page=start_page,
+                stop_page=stop_page,
+                filename=filename,
+                render_cache=render_cache,
+            )
+        return _ExtractionBatch(
+            batch_index=batch_index,
+            start_page=start_page,
+            stop_page=stop_page,
+            result=result,
+        )
+
+    tasks = [
+        asyncio.create_task(
+            _run_range(
+                batch_index,
+                start_page,
+                min(start_page + batch_plan.batch_size, page_count),
+            )
+        )
+        for batch_index, start_page in enumerate(range(0, page_count, batch_plan.batch_size))
+    ]
+
+    for task in asyncio.as_completed(tasks):
+        yield await task
 
 
 _MEDICAL_EXTRACTION = _ExtractionKind(
@@ -611,7 +706,12 @@ _TEXT_EXTRACTION = _ExtractionKind(
 )
 
 
-async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
+async def ocr_extract(
+    file_path: str,
+    *,
+    filename: str | None = None,
+    on_medical_batch: Callable[[int, dict], Awaitable[None]] | None = None,
+) -> dict:
     """Run the full OCR extraction pipeline for one uploaded file."""
     started_at = time.perf_counter()
     logger.info("OCR pipeline start path=%s filename=%s", file_path, filename)
@@ -620,8 +720,28 @@ async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
     # Keep structured extraction and free-form OCR + translation as separate
     # stages. Do not merge them. They intentionally serve different prompts and
     # failure modes even when they reuse the same rendered pages.
-    medical_task = asyncio.create_task(_extract_file(file_path, _MEDICAL_EXTRACTION, filename=filename, render_cache=render_cache))
-    text_task = asyncio.create_task(_extract_file(file_path, _TEXT_EXTRACTION, filename=filename, render_cache=render_cache))
+    async def _extract_medical_result() -> dict:
+        if on_medical_batch is None:
+            return await _extract_file(file_path, _MEDICAL_EXTRACTION, filename=filename, render_cache=render_cache)
+
+        medical_batches: list[_ExtractionBatch] = []
+        async for batch in _extract_file_batches(
+            file_path,
+            _MEDICAL_EXTRACTION,
+            filename=filename,
+            render_cache=render_cache,
+        ):
+            medical_batches.append(batch)
+            await on_medical_batch(batch.batch_index, batch.result)
+
+        return _MEDICAL_EXTRACTION.merge_fn(
+            [batch.result for batch in sorted(medical_batches, key=lambda current: current.batch_index)]
+        )
+
+    medical_task = asyncio.create_task(_extract_medical_result())
+    text_task = asyncio.create_task(
+        _extract_file(file_path, _TEXT_EXTRACTION, filename=filename, render_cache=render_cache)
+    )
 
     try:
         medical_result_or_error, text_result_or_error = await asyncio.gather(
@@ -692,3 +812,89 @@ async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
         time.perf_counter() - started_at,
     )
     return _combine_ocr_outputs(medical_result, usable_text_result, summary_english)
+
+
+def page_count_for_file(file_path: str) -> int:
+    if Path(file_path).suffix.lower() != ".pdf":
+        return 1
+    with fitz.open(file_path) as document:
+        return document.page_count
+
+
+def build_page_ranges(page_count: int, batch_size: int) -> list[tuple[int, int]]:
+    if page_count <= 0:
+        return []
+    return [
+        (start_page, min(start_page + max(1, batch_size), page_count))
+        for start_page in range(0, page_count, max(1, batch_size))
+    ]
+
+
+async def extract_measurement_batch(
+    file_path: str,
+    *,
+    start_page: int,
+    stop_page: int,
+    dpi: int,
+    filename: str | None = None,
+) -> dict:
+    if Path(file_path).suffix.lower() != ".pdf":
+        result = await _MEDICAL_EXTRACTION.extract_fn([{"type": "file", "path": file_path}], filename=filename)
+        return _offset_result_page_numbers(result, 0)
+
+    # The DB-backed pipeline calls this wrapper directly for each durable OCR
+    # job, so it must go through the retry/split/lower-DPI path instead of the
+    # raw single-attempt batch call.
+    return await _pdf_range_with_retries(
+        file_path,
+        _MEDICAL_EXTRACTION,
+        start_page=start_page,
+        stop_page=stop_page,
+        dpi=dpi,
+        filename=filename,
+    )
+
+
+async def extract_text_batch(
+    file_path: str,
+    *,
+    start_page: int,
+    stop_page: int,
+    dpi: int,
+    filename: str | None = None,
+) -> dict:
+    if Path(file_path).suffix.lower() != ".pdf":
+        return await _TEXT_EXTRACTION.extract_fn([{"type": "file", "path": file_path}], filename=filename)
+
+    # Keep the durable text-extraction jobs on the same resilient path as the
+    # full OCR flow so oversized or slow batches fan out instead of failing the
+    # whole file immediately.
+    return await _pdf_range_with_retries(
+        file_path,
+        _TEXT_EXTRACTION,
+        start_page=start_page,
+        stop_page=stop_page,
+        dpi=dpi,
+        filename=filename,
+    )
+
+
+def merge_measurement_results(results: list[dict]) -> dict:
+    return _merge_structured_medical_results(results)
+
+
+def merge_text_results(results: list[dict]) -> dict:
+    return _merge_document_text_results(results)
+
+
+async def generate_summary(
+    medical_result: dict,
+    text_result: dict | None,
+    *,
+    filename: str | None = None,
+) -> str | None:
+    return await _generate_medical_summary(medical_result, text_result, filename=filename)
+
+
+def is_retryable_batch_error(exc: Exception) -> bool:
+    return _is_retryable_pdf_error(exc)

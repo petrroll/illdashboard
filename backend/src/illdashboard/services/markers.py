@@ -11,8 +11,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from illdashboard.models import BiomarkerInsight, LabFile, MarkerGroup, MarkerTag, Measurement, MeasurementAlias, MeasurementType
-
+from illdashboard.models import (
+    BiomarkerInsight,
+    LabFile,
+    MarkerGroup,
+    MarkerTag,
+    Measurement,
+    MeasurementAlias,
+    MeasurementType,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -195,11 +202,7 @@ async def load_measurement_type_aliases(db: AsyncSession, names: list[str]) -> d
         .where(MeasurementAlias.normalized_key.in_(unique_keys))
     )
     alias_by_key = {alias.normalized_key: alias.measurement_type for alias in result.scalars().all()}
-    return {
-        name: alias_by_key[key]
-        for name, key in keys_by_name.items()
-        if key in alias_by_key
-    }
+    return {name: alias_by_key[key] for name, key in keys_by_name.items() if key in alias_by_key}
 
 
 async def ensure_measurement_type_aliases(
@@ -275,7 +278,7 @@ async def classify_marker_groups(
         return {name: DEFAULT_GROUP_NAME for name in names}
 
 
-async def _resolve_marker_group_names(
+async def resolve_marker_group_names(
     db: AsyncSession,
     names: list[str],
 ) -> dict[str, str]:
@@ -284,8 +287,7 @@ async def _resolve_marker_group_names(
     Uses existing MeasurementType assignments first, then falls back to LLM.
     """
     result = await db.execute(
-        select(MeasurementType.name, MeasurementType.group_name)
-        .where(MeasurementType.name.in_(names))
+        select(MeasurementType.name, MeasurementType.group_name).where(MeasurementType.name.in_(names))
     )
     known = {row[0]: row[1] for row in result.all()}
 
@@ -298,7 +300,9 @@ async def _resolve_marker_group_names(
     return {**known, **llm_groups}
 
 
-async def _ensure_group_exists(db: AsyncSession, group_name: str, groups_by_name: dict[str, MarkerGroup]) -> MarkerGroup:
+async def _ensure_group_exists(
+    db: AsyncSession, group_name: str, groups_by_name: dict[str, MarkerGroup]
+) -> MarkerGroup:
     """Return an existing MarkerGroup or create a new one."""
     group = groups_by_name.get(group_name)
     if group is not None:
@@ -315,7 +319,12 @@ async def _ensure_group_exists(db: AsyncSession, group_name: str, groups_by_name
     return group
 
 
-async def ensure_measurement_types(db: AsyncSession, names: list[str]) -> dict[str, MeasurementType]:
+async def ensure_measurement_types(
+    db: AsyncSession,
+    names: list[str],
+    *,
+    group_assignments: dict[str, str] | None = None,
+) -> dict[str, MeasurementType]:
     unique_names = list(dict.fromkeys(name for name in names if name))
     if not unique_names:
         return {}
@@ -325,13 +334,14 @@ async def ensure_measurement_types(db: AsyncSession, names: list[str]) -> dict[s
 
     new_names = [name for name in unique_names if name not in by_name]
     if new_names:
-        group_assignments = await _resolve_marker_group_names(db, new_names)
-        groups_by_name = await load_marker_groups(db)
-
         for name in new_names:
-            group_name = group_assignments.get(name, DEFAULT_GROUP_NAME)
-            group = await _ensure_group_exists(db, group_name, groups_by_name)
-            measurement_type = MeasurementType(name=name, group_name=group_name, group_id=group.id)
+            group_name = (group_assignments or {}).get(name, DEFAULT_GROUP_NAME)
+            measurement_type = MeasurementType(
+                name=name,
+                normalized_key=normalize_marker_alias_key(name),
+                group_name=group_name,
+                group_id=None,
+            )
             db.add(measurement_type)
             by_name[name] = measurement_type
 
@@ -379,7 +389,9 @@ async def merge_measurement_types(source: MeasurementType, target: MeasurementTy
     source_tags_result = await db.execute(select(MarkerTag).where(MarkerTag.measurement_type_id == source.id))
     source_tags = source_tags_result.scalars().all()
 
-    source_alias_result = await db.execute(select(MeasurementAlias).where(MeasurementAlias.measurement_type_id == source.id))
+    source_alias_result = await db.execute(
+        select(MeasurementAlias).where(MeasurementAlias.measurement_type_id == source.id)
+    )
     source_aliases = source_alias_result.scalars().all()
 
     target_alias_result = await db.execute(

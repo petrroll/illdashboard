@@ -8,8 +8,8 @@ import pytest
 
 from illdashboard.copilot import client as copilot_client
 from illdashboard.copilot import explanations as copilot_explanations
-from illdashboard.copilot import normalization as copilot_normalization
 from illdashboard.copilot import extraction as copilot_ocr
+from illdashboard.copilot import normalization as copilot_normalization
 
 
 class DummySession:
@@ -96,10 +96,17 @@ async def test_ocr_extract_splits_oversized_batches_and_preserves_page_numbers()
             ],
         }
 
-    with patch("illdashboard.copilot.extraction.fitz.open", return_value=DummyDoc(page_count=4)), patch(
-        "illdashboard.copilot.extraction._pdf_batch_extract",
-        new=AsyncMock(side_effect=fake_batch),
-    ) as batch_mock, patch("illdashboard.copilot.extraction._generate_medical_summary", new=AsyncMock(return_value=None)):
+    with (
+        patch("illdashboard.copilot.extraction.fitz.open", return_value=DummyDoc(page_count=4)),
+        patch(
+            "illdashboard.copilot.extraction._pdf_batch_extract",
+            new=AsyncMock(side_effect=fake_batch),
+        ) as batch_mock,
+        patch(
+            "illdashboard.copilot.extraction._generate_medical_summary",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
         result = await copilot_ocr.ocr_extract("/tmp/report.pdf")
 
     assert result["lab_date"] == "2025-09-05"
@@ -107,7 +114,13 @@ async def test_ocr_extract_splits_oversized_batches_and_preserves_page_numbers()
     assert [measurement["page_number"] for measurement in result["measurements"]] == [1, 2, 3, 4]
     observed_calls = sorted(
         [
-            (args.args[0], args.kwargs["start_page"], args.kwargs["stop_page"], args.kwargs["dpi"], args.kwargs["filename"])
+            (
+                args.args[0],
+                args.kwargs["start_page"],
+                args.kwargs["stop_page"],
+                args.kwargs["dpi"],
+                args.kwargs["filename"],
+            )
             for args in _medical_calls(batch_mock)
         ],
         key=lambda item: (item[1], item[2], item[3]),
@@ -154,10 +167,17 @@ async def test_ocr_extract_retries_single_page_at_lower_dpi_after_413():
             ],
         }
 
-    with patch("illdashboard.copilot.extraction.fitz.open", return_value=DummyDoc(page_count=1)), patch(
-        "illdashboard.copilot.extraction._pdf_batch_extract",
-        new=AsyncMock(side_effect=fake_batch),
-    ) as batch_mock, patch("illdashboard.copilot.extraction._generate_medical_summary", new=AsyncMock(return_value=None)):
+    with (
+        patch("illdashboard.copilot.extraction.fitz.open", return_value=DummyDoc(page_count=1)),
+        patch(
+            "illdashboard.copilot.extraction._pdf_batch_extract",
+            new=AsyncMock(side_effect=fake_batch),
+        ) as batch_mock,
+        patch(
+            "illdashboard.copilot.extraction._generate_medical_summary",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
         result = await copilot_ocr.ocr_extract("/tmp/report.pdf")
 
     assert result == {
@@ -178,9 +198,129 @@ async def test_ocr_extract_retries_single_page_at_lower_dpi_after_413():
         ],
     }
     medical = _medical_calls(batch_mock)
-    assert [(c.args[0], c.kwargs["start_page"], c.kwargs["stop_page"], c.kwargs["dpi"], c.kwargs["filename"]) for c in medical] == [
+    assert [
+        (
+            call.args[0],
+            call.kwargs["start_page"],
+            call.kwargs["stop_page"],
+            call.kwargs["dpi"],
+            call.kwargs["filename"],
+        )
+        for call in medical
+    ] == [
         ("/tmp/report.pdf", 0, 1, 144, None),
         ("/tmp/report.pdf", 0, 1, 120, None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_extract_measurement_batch_uses_retrying_pdf_range_path():
+    async def fake_batch(
+        pdf_path: str,
+        kind: copilot_ocr._ExtractionKind,
+        *,
+        start_page: int,
+        stop_page: int,
+        dpi: int,
+        filename: str | None = None,
+        render_cache=None,
+    ):
+        assert pdf_path == "/tmp/report.pdf"
+        assert kind is copilot_ocr._MEDICAL_EXTRACTION
+        if stop_page - start_page > 1:
+            raise Exception("CAPIError: 413 failed to parse request")
+        return {
+            "lab_date": None,
+            "source": None,
+            "measurements": [
+                {
+                    "marker_name": f"Marker {start_page + 1}",
+                    "value": start_page + 1,
+                    "unit": "mmol/l",
+                    "reference_low": None,
+                    "reference_high": None,
+                    "measured_at": None,
+                    "page_number": 1,
+                }
+            ],
+        }
+
+    with patch(
+        "illdashboard.copilot.extraction._pdf_batch_extract",
+        new=AsyncMock(side_effect=fake_batch),
+    ) as batch_mock:
+        result = await copilot_ocr.extract_measurement_batch(
+            "/tmp/report.pdf",
+            start_page=2,
+            stop_page=4,
+            dpi=144,
+        )
+
+    assert [measurement["page_number"] for measurement in result["measurements"]] == [3, 4]
+    assert [
+        (
+            call.args[0],
+            call.kwargs["start_page"],
+            call.kwargs["stop_page"],
+            call.kwargs["dpi"],
+        )
+        for call in _medical_calls(batch_mock)
+    ] == [
+        ("/tmp/report.pdf", 2, 4, 144),
+        ("/tmp/report.pdf", 2, 3, 144),
+        ("/tmp/report.pdf", 3, 4, 144),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_extract_text_batch_uses_retrying_pdf_range_path():
+    async def fake_batch(
+        pdf_path: str,
+        kind: copilot_ocr._ExtractionKind,
+        *,
+        start_page: int,
+        stop_page: int,
+        dpi: int,
+        filename: str | None = None,
+        render_cache=None,
+    ):
+        assert pdf_path == "/tmp/report.pdf"
+        assert kind is copilot_ocr._TEXT_EXTRACTION
+        if stop_page - start_page > 1:
+            raise Exception("CAPIError: 413 failed to parse request")
+        page_number = start_page + 1
+        return {
+            "raw_text": f"raw page {page_number}",
+            "translated_text_english": f"translated page {page_number}",
+        }
+
+    with patch(
+        "illdashboard.copilot.extraction._pdf_batch_extract",
+        new=AsyncMock(side_effect=fake_batch),
+    ) as batch_mock:
+        result = await copilot_ocr.extract_text_batch(
+            "/tmp/report.pdf",
+            start_page=0,
+            stop_page=2,
+            dpi=144,
+        )
+
+    assert result == {
+        "raw_text": "raw page 1\n\nraw page 2",
+        "translated_text_english": "translated page 1\n\ntranslated page 2",
+    }
+    assert [
+        (
+            call.args[0],
+            call.kwargs["start_page"],
+            call.kwargs["stop_page"],
+            call.kwargs["dpi"],
+        )
+        for call in batch_mock.await_args_list
+    ] == [
+        ("/tmp/report.pdf", 0, 2, 144),
+        ("/tmp/report.pdf", 0, 1, 144),
+        ("/tmp/report.pdf", 1, 2, 144),
     ]
 
 
@@ -224,17 +364,114 @@ async def test_extract_file_processes_page_batches_in_parallel():
             ],
         }
 
-    with patch("illdashboard.copilot.extraction.fitz.open", return_value=DummyDoc(page_count=4)), patch.object(
-        copilot_ocr,
-        "OCR_PDF_BATCH_CONCURRENCY",
-        2,
-    ), patch(
-        "illdashboard.copilot.extraction._pdf_batch_extract",
-        new=AsyncMock(side_effect=fake_batch),
+    with (
+        patch("illdashboard.copilot.extraction.fitz.open", return_value=DummyDoc(page_count=4)),
+        patch.object(
+            copilot_ocr,
+            "OCR_PDF_BATCH_CONCURRENCY",
+            2,
+        ),
+        patch(
+            "illdashboard.copilot.extraction._pdf_batch_extract",
+            new=AsyncMock(side_effect=fake_batch),
+        ),
     ):
         result = await copilot_ocr._extract_file("/tmp/report.pdf", copilot_ocr._MEDICAL_EXTRACTION)
 
     assert second_batch_started.is_set()
+    assert [measurement["page_number"] for measurement in result["measurements"]] == [1, 3]
+
+
+@pytest.mark.asyncio
+async def test_ocr_extract_streams_medical_batches_before_combining_result():
+    observed_batches: list[tuple[int, list[int]]] = []
+
+    async def fake_extract_batches(
+        file_path: str,
+        kind: copilot_ocr._ExtractionKind,
+        *,
+        filename: str | None = None,
+        render_cache=None,
+    ):
+        assert file_path == "/tmp/report.pdf"
+        assert kind is copilot_ocr._MEDICAL_EXTRACTION
+        yield copilot_ocr._ExtractionBatch(
+            batch_index=1,
+            start_page=2,
+            stop_page=4,
+            result={
+                "lab_date": None,
+                "source": None,
+                "measurements": [
+                    {
+                        "marker_name": "Marker 2",
+                        "value": 2,
+                        "unit": "mmol/l",
+                        "reference_low": None,
+                        "reference_high": None,
+                        "measured_at": None,
+                        "page_number": 3,
+                    }
+                ],
+            },
+        )
+        yield copilot_ocr._ExtractionBatch(
+            batch_index=0,
+            start_page=0,
+            stop_page=2,
+            result={
+                "lab_date": "2025-09-05",
+                "source": "synlab",
+                "measurements": [
+                    {
+                        "marker_name": "Marker 1",
+                        "value": 1,
+                        "unit": "mmol/l",
+                        "reference_low": None,
+                        "reference_high": None,
+                        "measured_at": None,
+                        "page_number": 1,
+                    }
+                ],
+            },
+        )
+
+    async def fake_extract_file(
+        file_path: str,
+        kind: copilot_ocr._ExtractionKind,
+        *,
+        filename: str | None = None,
+        render_cache=None,
+    ):
+        assert file_path == "/tmp/report.pdf"
+        assert kind is copilot_ocr._TEXT_EXTRACTION
+        return {"raw_text": "text", "translated_text_english": "text"}
+
+    async def on_medical_batch(batch_index: int, batch_result: dict) -> None:
+        observed_batches.append(
+            (
+                batch_index,
+                [measurement["page_number"] for measurement in batch_result["measurements"]],
+            )
+        )
+
+    with (
+        patch.object(copilot_ocr, "_extract_file_batches", side_effect=fake_extract_batches),
+        patch.object(
+            copilot_ocr,
+            "_extract_file",
+            side_effect=fake_extract_file,
+        ),
+        patch.object(copilot_ocr, "_generate_medical_summary", new=AsyncMock(return_value=None)),
+    ):
+        result = await copilot_ocr.ocr_extract(
+            "/tmp/report.pdf",
+            on_medical_batch=on_medical_batch,
+        )
+
+    assert observed_batches == [(1, [3]), (0, [1])]
+    assert result["lab_date"] == "2025-09-05"
+    assert result["source"] == "synlab"
     assert [measurement["page_number"] for measurement in result["measurements"]] == [1, 3]
 
 
@@ -245,11 +482,15 @@ async def test_normalize_marker_names_splits_large_batches():
         '{"Marker 3": "Canonical 3"}',
     ]
 
-    with patch.object(copilot_normalization, "MARKER_NORMALIZATION_BATCH_SIZE", 2), patch.object(
-        copilot_normalization,
-        "MARKER_NORMALIZATION_CONCURRENCY",
-        1,
-    ), patch("illdashboard.copilot.normalization._ask", new=AsyncMock(side_effect=responses)) as ask_mock:
+    with (
+        patch.object(copilot_normalization, "MARKER_NORMALIZATION_BATCH_SIZE", 2),
+        patch.object(
+            copilot_normalization,
+            "MARKER_NORMALIZATION_CONCURRENCY",
+            1,
+        ),
+        patch("illdashboard.copilot.normalization._ask", new=AsyncMock(side_effect=responses)) as ask_mock,
+    ):
         result = await copilot_normalization.normalize_marker_names(
             ["Marker 1", "Marker 2", "Marker 3"],
             ["Existing Marker"],
@@ -311,6 +552,7 @@ async def test_normalize_qualitative_values_includes_existing_canonical_values_i
 
     assert result == {"negative": ("negative", False)}
     ask_mock.assert_awaited_once()
+    assert ask_mock.await_args is not None
     _system_prompt, user_prompt = ask_mock.await_args.args
     assert "EXISTING canonical qualitative values:\n- negative\n" in user_prompt
 
@@ -357,11 +599,15 @@ async def test_infer_rescaling_factors_splits_large_batches():
         ),
     ]
 
-    with patch.object(copilot_normalization, "UNIT_NORMALIZATION_BATCH_SIZE", 2), patch.object(
-        copilot_normalization,
-        "UNIT_NORMALIZATION_CONCURRENCY",
-        1,
-    ), patch("illdashboard.copilot.normalization._ask", new=AsyncMock(side_effect=responses)) as ask_mock:
+    with (
+        patch.object(copilot_normalization, "UNIT_NORMALIZATION_BATCH_SIZE", 2),
+        patch.object(
+            copilot_normalization,
+            "UNIT_NORMALIZATION_CONCURRENCY",
+            1,
+        ),
+        patch("illdashboard.copilot.normalization._ask", new=AsyncMock(side_effect=responses)) as ask_mock,
+    ):
         result = await copilot_normalization.infer_rescaling_factors(conversion_requests)
 
     assert result == {
@@ -401,9 +647,10 @@ async def test_ask_adds_observed_premium_usage_cost():
     )
     client = SimpleNamespace(create_session=AsyncMock(return_value=session))
 
-    with patch("illdashboard.copilot.client._get_client", new=AsyncMock(return_value=client)), patch(
-        "illdashboard.copilot.client.add_premium_requests"
-    ) as add_mock:
+    with (
+        patch("illdashboard.copilot.client._get_client", new=AsyncMock(return_value=client)),
+        patch("illdashboard.copilot.client.add_premium_requests") as add_mock,
+    ):
         result = await copilot_client._ask("system", "user")
 
     assert result == "ok"
@@ -419,9 +666,10 @@ async def test_ask_adds_observed_usage_even_when_send_fails():
     )
     client = SimpleNamespace(create_session=AsyncMock(return_value=session))
 
-    with patch("illdashboard.copilot.client._get_client", new=AsyncMock(return_value=client)), patch(
-        "illdashboard.copilot.client.add_premium_requests"
-    ) as add_mock:
+    with (
+        patch("illdashboard.copilot.client._get_client", new=AsyncMock(return_value=client)),
+        patch("illdashboard.copilot.client.add_premium_requests") as add_mock,
+    ):
         with pytest.raises(RuntimeError, match="boom"):
             await copilot_client._ask("system", "user")
 
@@ -446,6 +694,7 @@ async def test_explain_marker_history_prompt_avoids_generic_caution_and_trend_fi
         )
 
     assert result == "ok"
+    assert ask_mock.await_args is not None
     system_prompt, user_prompt = ask_mock.await_args.args
     assert "Do not add a generic caution or disclaimer section" in system_prompt
     assert "do not dwell on the lack of a trend" in system_prompt

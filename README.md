@@ -11,10 +11,11 @@ backend/          FastAPI + SQLite + async SQLAlchemy (uv-managed)
     main.py           – app entry point
     config.py         – settings (env vars)
     database.py       – async DB session
-    models.py         – LabFile, Measurement ORM models
+    models.py         – DB-first file, job, rule, and measurement ORM models
     schemas.py        – Pydantic request/response schemas
-    routes.py         – API endpoints
-    copilot_service.py – GitHub Copilot SDK (OCR + explanations)
+    api/              – API endpoints
+    copilot/          – GitHub Copilot SDK integration modules
+    services/pipeline.py – durable background job runtime for OCR, normalization, summary, publish
   tests/              – pytest test suite
 
 frontend/         React + TypeScript + Vite
@@ -33,8 +34,10 @@ justfile          – build / dev / test / lint commands
 ## Features
 
 - **Upload** PDF and image lab files (PNG, JPG, WEBP)
-- **OCR** via [GitHub Copilot SDK](https://github.com/github/copilot-sdk) (`github-copilot-sdk`) – extracts marker names, values, units, reference ranges
-- **Database** stores all extracted measurements in SQLite
+- **DB-first OCR pipeline** – files, jobs, extracted rows, normalization rules, and publish state all live in SQLite
+- **Parallel extraction** – measurement OCR runs separately from text / translation / summary work, with page-batch fanout across files
+- **Serialized normalization** – DB lookups are used first, and any LLM-backed normalization result is stored back into the DB for reuse
+- **Publish gate** – measurements stay hidden until a file has fully finished extraction, normalization, and summary generation
 - **Charts** – visualize any marker's trend over time (with reference range lines)
 - **Tables** – view all values from a single lab report
 - **AI Explanations** – click "Explain" on any marker or select multiple and get a cross-marker analysis
@@ -83,11 +86,12 @@ just help            # List all recipes
 ### 3. Usage
 
 1. Go to **Lab Files** → upload a PDF or image of a lab report
-2. Click into the file → **Run OCR** to extract values
-3. View extracted measurements in the table
-4. Click **Explain** on any row, or select multiple rows and click **Explain selected**
-5. Go to **Charts** to see how a specific marker changes over time
-6. Select data points in the chart table to get AI cross-analysis
+2. Click into the file → **Run OCR** to queue the file into the durable processing pipeline
+3. Watch the file stages update as extraction, normalization, summary, and publish complete
+4. View extracted measurements once the file reaches the ready state
+5. Click **Explain** on any row, or select multiple rows and click **Explain selected**
+6. Go to **Charts** to see how a specific marker changes over time
+7. Select data points in the chart table to get AI cross-analysis
 
 ## Configuration
 

@@ -4,16 +4,17 @@ import hashlib
 import io
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib import pyplot as plt
+
+plt.switch_backend("Agg")
 
 
 SPARKLINE_CACHE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "sparklines"
 SPARKLINE_WIDTH = 180  # px
 SPARKLINE_HEIGHT = 40  # px
 DPI = 72
-STYLE_VERSION = "v7"  # bump when changing sparkline colors/styling
+LINE_WIDTH = 2.8  # shared between sparkline segments and gauge bars
+STYLE_VERSION = "v8"  # bump when changing sparkline colors/styling
 
 
 def _cache_path(marker_name: str, signature: str) -> Path:
@@ -46,25 +47,20 @@ def _draw_gauge(ax, value, ref_low, ref_high, color_ok, color_oor, is_oor):
     gauge_max = max(gauge_max, value + 0.5)
 
     y = 0.5
-    lw = 8
 
     # Draw full green bar as base (provides rounded caps at both ends)
-    ax.plot([gauge_min, gauge_max], [y, y], color=color_ok, linewidth=lw,
-            solid_capstyle="round")
+    ax.plot([gauge_min, gauge_max], [y, y], color=color_ok, linewidth=LINE_WIDTH, solid_capstyle="round")
 
     if ref_low is not None and ref_high is not None:
         # Red zone below ref_low
         if ref_low > gauge_min:
-            ax.plot([gauge_min, ref_low], [y, y], color=color_oor, linewidth=lw,
-                    solid_capstyle="round")
+            ax.plot([gauge_min, ref_low], [y, y], color=color_oor, linewidth=LINE_WIDTH, solid_capstyle="round")
         # Red zone above ref_high
         if ref_high < gauge_max:
-            ax.plot([ref_high, gauge_max], [y, y], color=color_oor, linewidth=lw,
-                    solid_capstyle="round")
+            ax.plot([ref_high, gauge_max], [y, y], color=color_oor, linewidth=LINE_WIDTH, solid_capstyle="round")
 
     # Circle indicator at the value
-    ax.plot(value, y, "o", color="white", markersize=10,
-            markeredgecolor="#888888", markeredgewidth=1.5, zorder=10)
+    ax.plot(value, y, "o", color="white", markersize=6, markeredgecolor="#888888", markeredgewidth=1.2, zorder=10)
 
     pad = (gauge_max - gauge_min) * 0.06
     ax.set_xlim(gauge_min - pad, gauge_max + pad)
@@ -88,16 +84,16 @@ def _draw_sparkline(ax, values, ref_low, ref_high, color_ok, color_oor, is_oor):
         oor0, oor1 = is_oor(v0), is_oor(v1)
 
         if not oor0 and not oor1:
-            ax.plot([x0, x1], [v0, v1], color=color_ok, linewidth=2.8, solid_capstyle="round")
+            ax.plot([x0, x1], [v0, v1], color=color_ok, linewidth=LINE_WIDTH, solid_capstyle="round")
         elif oor0 and oor1:
-            ax.plot([x0, x1], [v0, v1], color=color_oor, linewidth=2.8, solid_capstyle="round")
+            ax.plot([x0, x1], [v0, v1], color=color_oor, linewidth=LINE_WIDTH, solid_capstyle="round")
         else:
             xm = (x0 + x1) / 2
             vm = (v0 + v1) / 2
             c0 = color_oor if oor0 else color_ok
             c1 = color_oor if oor1 else color_ok
-            ax.plot([x0, xm], [v0, vm], color=c0, linewidth=2.8, solid_capstyle="round")
-            ax.plot([xm, x1], [vm, v1], color=c1, linewidth=2.8, solid_capstyle="round")
+            ax.plot([x0, xm], [v0, vm], color=c0, linewidth=LINE_WIDTH, solid_capstyle="round")
+            ax.plot([xm, x1], [vm, v1], color=c1, linewidth=LINE_WIDTH, solid_capstyle="round")
 
     # Dots
     dot_colors = [color_oor if is_oor(v) else color_ok for v in values]

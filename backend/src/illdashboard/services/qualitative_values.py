@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from illdashboard.models import MeasurementType, QualitativeRule
+from illdashboard.models import QualitativeRule
 
 
 def normalize_qualitative_key(value: str | None) -> str | None:
@@ -32,9 +32,7 @@ async def load_qualitative_rules(
 ) -> dict[str, QualitativeRule]:
     normalized_values = list(
         dict.fromkeys(
-            normalized_value
-            for value in values
-            if (normalized_value := normalize_qualitative_key(value)) is not None
+            normalized_value for value in values if (normalized_value := normalize_qualitative_key(value)) is not None
         )
     )
     if not normalized_values:
@@ -45,10 +43,7 @@ async def load_qualitative_rules(
         .options(selectinload(QualitativeRule.measurement_type))
         .where(QualitativeRule.normalized_original_value.in_(normalized_values))
     )
-    return {
-        rule.normalized_original_value: rule
-        for rule in result.scalars().all()
-    }
+    return {rule.normalized_original_value: rule for rule in result.scalars().all()}
 
 
 async def upsert_qualitative_rules(

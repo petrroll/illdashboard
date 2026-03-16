@@ -12,16 +12,14 @@ from dataclasses import dataclass, field
 
 from illdashboard.copilot.client import _ask
 from illdashboard.services.markers import normalize_marker_alias_key
-from illdashboard.services.qualitative_values import normalize_qualitative_key
 from illdashboard.services.rescaling import normalize_unit_key
-
 
 logger = logging.getLogger(__name__)
 
 
-MARKER_NORMALIZATION_BATCH_SIZE = 40
+MARKER_NORMALIZATION_BATCH_SIZE = 120
 MARKER_NORMALIZATION_CONCURRENCY = 2
-UNIT_NORMALIZATION_BATCH_SIZE = 20
+UNIT_NORMALIZATION_BATCH_SIZE = 40
 UNIT_NORMALIZATION_CONCURRENCY = 2
 QUALITATIVE_NORMALIZATION_BATCH_SIZE = 40
 QUALITATIVE_NORMALIZATION_CONCURRENCY = 2
@@ -102,7 +100,7 @@ class QualitativeNormalizationRequest:
 
 
 def _chunk_items(items: list, chunk_size: int) -> list[list]:
-    return [items[index:index + chunk_size] for index in range(0, len(items), chunk_size)]
+    return [items[index : index + chunk_size] for index in range(0, len(items), chunk_size)]
 
 
 async def _run_batched_tasks(
@@ -551,9 +549,7 @@ def _unit_key_likely_requires_llm(unit_key: str | None) -> bool:
 
 def _can_skip_canonical_unit_selection(group: MarkerUnitGroup) -> bool:
     observation_unit_keys = {
-        unit_key
-        for observation in group.observations
-        if (unit_key := normalize_unit_key(observation.unit)) is not None
+        unit_key for observation in group.observations if (unit_key := normalize_unit_key(observation.unit)) is not None
     }
     existing_unit_key = normalize_unit_key(group.existing_canonical_unit)
 
@@ -765,7 +761,8 @@ async def infer_rescaling_factors(conversion_requests: list[UnitConversionReques
         merged_mapping.update(batch_mapping)
 
     logger.info(
-        "Infer rescaling factors finished conversion_requests=%s deterministic_resolved=%s llm_requests=%s resolved=%s duration=%.2fs",
+        "Infer rescaling factors finished conversion_requests=%s "
+        "deterministic_resolved=%s llm_requests=%s resolved=%s duration=%.2fs",
         len(conversion_requests),
         len(conversion_requests) - len(unresolved_requests),
         len(unresolved_requests),

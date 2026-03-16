@@ -7,7 +7,6 @@ from fastapi import APIRouter
 from illdashboard.copilot.explanations import explain_markers
 from illdashboard.schemas import ExplainRequest, ExplainResponse, MultiExplainRequest
 
-
 router = APIRouter(prefix="")
 
 

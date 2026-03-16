@@ -16,15 +16,19 @@ from copilot.types import CopilotClientOptions, MessageOptions
 from illdashboard.config import settings
 from illdashboard.metrics import add_premium_requests
 
-
 logger = logging.getLogger(__name__)
 
 COPILOT_REQUEST_CONCURRENCY = 6
+COPILOT_SUMMARY_CONCURRENCY = 1
 
 _client: CopilotClient | None = None
 _client_start_lock = asyncio.Lock()
 _request_semaphore: asyncio.Semaphore | None = None
 _request_semaphore_limit = 0
+_summary_request_semaphore: asyncio.Semaphore | None = None
+_summary_request_semaphore_limit = 0
+_queued_request_count = 0
+_active_request_count = 0
 
 
 async def _get_client() -> CopilotClient:
@@ -74,6 +78,23 @@ def _get_request_semaphore() -> asyncio.Semaphore:
         _request_semaphore = asyncio.Semaphore(COPILOT_REQUEST_CONCURRENCY)
         _request_semaphore_limit = COPILOT_REQUEST_CONCURRENCY
     return _request_semaphore
+
+
+def _get_summary_request_semaphore() -> asyncio.Semaphore:
+    global _summary_request_semaphore, _summary_request_semaphore_limit
+
+    if _summary_request_semaphore is None or _summary_request_semaphore_limit != COPILOT_SUMMARY_CONCURRENCY:
+        _summary_request_semaphore = asyncio.Semaphore(COPILOT_SUMMARY_CONCURRENCY)
+        _summary_request_semaphore_limit = COPILOT_SUMMARY_CONCURRENCY
+    return _summary_request_semaphore
+
+
+def get_copilot_request_load() -> tuple[int, int]:
+    return _queued_request_count, _active_request_count
+
+
+def _uses_summary_lane(request_name: str) -> bool:
+    return request_name == "medical_summary"
 
 
 async def shutdown_client() -> None:
@@ -126,59 +147,84 @@ async def _ask(
     content = ""
     observed_usage_cost = 0.0
     request_error: Exception | None = None
+    summary_lane = _get_summary_request_semaphore() if _uses_summary_lane(request_name) else None
+    queued_registered = False
 
-    semaphore_wait_started_at = time.perf_counter()
-    async with _get_request_semaphore():
-        semaphore_wait_ms = (time.perf_counter() - semaphore_wait_started_at) * 1000
-        client_wait_started_at = time.perf_counter()
-        client = await _get_client()
-        client_wait_ms = (time.perf_counter() - client_wait_started_at) * 1000
-        session_create_started_at = time.perf_counter()
-        session = await client.create_session(
-            {
-                "model": settings.COPILOT_MODEL,
-                "system_message": {"mode": "replace", "content": system_prompt},
-                "available_tools": [],
-                "on_permission_request": PermissionHandler.approve_all,
-            }
-        )
-        session_create_ms = (time.perf_counter() - session_create_started_at) * 1000
-        logger.info(
-            "Copilot request ready request_name=%s request_id=%s semaphore_wait_ms=%.1f client_wait_ms=%.1f session_create_ms=%.1f",
-            request_name,
-            request_id,
-            semaphore_wait_ms,
-            client_wait_ms,
-            session_create_ms,
-        )
+    if summary_lane is not None:
+        await summary_lane.acquire()
 
-        def handle_session_event(event) -> None:
-            nonlocal observed_usage_cost
+    try:
+        global _queued_request_count, _active_request_count
 
-            if event.type != SessionEventType.ASSISTANT_USAGE:
-                return
-
-            cost = getattr(event.data, "cost", None)
-            if isinstance(cost, int | float) and cost > 0:
-                observed_usage_cost += float(cost)
-
-        unsubscribe = session.on(handle_session_event)
-        try:
-            message_options: MessageOptions = {"prompt": user_prompt}
-            if attachments:
-                message_options["attachments"] = attachments
-            response = await session.send_and_wait(message_options, timeout=timeout)
-            content = getattr(response.data, "content", "") if response else ""
-            if content is None:
-                content = ""
-        except Exception as exc:
-            request_error = exc
-        finally:
-            unsubscribe()
+        _queued_request_count += 1
+        queued_registered = True
+        semaphore_wait_started_at = time.perf_counter()
+        async with _get_request_semaphore():
+            semaphore_wait_ms = (time.perf_counter() - semaphore_wait_started_at) * 1000
+            _queued_request_count -= 1
+            queued_registered = False
+            _active_request_count += 1
             try:
-                await session.disconnect()
-            except Exception as exc:
-                logger.warning("Copilot session disconnect had errors: %s", exc)
+                client_wait_started_at = time.perf_counter()
+                client = await _get_client()
+                client_wait_ms = (time.perf_counter() - client_wait_started_at) * 1000
+                session_create_started_at = time.perf_counter()
+                session = await client.create_session(
+                    {
+                        "model": settings.COPILOT_MODEL,
+                        "system_message": {"mode": "replace", "content": system_prompt},
+                        "available_tools": [],
+                        "on_permission_request": PermissionHandler.approve_all,
+                    }
+                )
+                session_create_ms = (time.perf_counter() - session_create_started_at) * 1000
+                logger.info(
+                    "Copilot request ready request_name=%s request_id=%s "
+                    "semaphore_wait_ms=%.1f client_wait_ms=%.1f "
+                    "session_create_ms=%.1f queued_requests=%s active_requests=%s",
+                    request_name,
+                    request_id,
+                    semaphore_wait_ms,
+                    client_wait_ms,
+                    session_create_ms,
+                    _queued_request_count,
+                    _active_request_count,
+                )
+
+                def handle_session_event(event) -> None:
+                    nonlocal observed_usage_cost
+
+                    if event.type != SessionEventType.ASSISTANT_USAGE:
+                        return
+
+                    cost = getattr(event.data, "cost", None)
+                    if isinstance(cost, int | float) and cost > 0:
+                        observed_usage_cost += float(cost)
+
+                unsubscribe = session.on(handle_session_event)
+                try:
+                    message_options: MessageOptions = {"prompt": user_prompt}
+                    if attachments:
+                        message_options["attachments"] = attachments
+                    response = await session.send_and_wait(message_options, timeout=timeout)
+                    content = getattr(response.data, "content", "") if response else ""
+                    if content is None:
+                        content = ""
+                except Exception as exc:
+                    request_error = exc
+                finally:
+                    unsubscribe()
+                    try:
+                        await session.disconnect()
+                    except Exception as exc:
+                        logger.warning("Copilot session disconnect had errors: %s", exc)
+            finally:
+                _active_request_count -= 1
+    finally:
+        if queued_registered:
+            _queued_request_count -= 1
+        if summary_lane is not None:
+            summary_lane.release()
 
     duration = time.perf_counter() - started_at
     add_premium_requests(observed_usage_cost)
@@ -196,7 +242,8 @@ async def _ask(
         raise request_error
 
     logger.info(
-        "Copilot request finished request_name=%s request_id=%s model=%s attachments=%s duration=%.2fs response_chars=%s usage_cost=%.4f",
+        "Copilot request finished request_name=%s request_id=%s model=%s "
+        "attachments=%s duration=%.2fs response_chars=%s usage_cost=%.4f",
         request_name,
         request_id,
         settings.COPILOT_MODEL,
