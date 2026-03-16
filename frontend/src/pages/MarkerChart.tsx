@@ -112,7 +112,7 @@ export default function MarkerChart() {
     return () => {
       cancelled = true;
     };
-  }, [filterTags, requestedMarker]);
+  }, [filterTags]);
 
   useEffect(() => {
     if (!requestedMarker || requestedMarker === selectedMarker) {
