@@ -1086,6 +1086,11 @@ input[type="file"] {
   font-size: 0.78rem;
 }
 
+.measurement-warning-note {
+  color: var(--warning);
+  font-size: 0.78rem;
+}
+
 .history-source-link {
   color: var(--accent);
   font-weight: 600;

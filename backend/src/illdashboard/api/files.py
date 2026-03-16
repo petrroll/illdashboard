@@ -22,6 +22,7 @@ from illdashboard.database import get_db
 from illdashboard.models import LabFile, LabFileTag, Measurement
 from illdashboard.schemas import BatchOcrRequest, LabFileOut, MeasurementOut, OcrJobStartResponse, OcrJobStatusResponse
 from illdashboard.services import ocr_workflow as ocr_service
+from illdashboard.services.rescaling import annotate_missing_rescaling_measurements
 from illdashboard.services import search as search_service
 
 
@@ -204,7 +205,9 @@ async def run_ocr(file_id: int, db: AsyncSession = Depends(get_db)):
             .where(Measurement.id.in_(measurement_ids))
             .order_by(Measurement.id.asc())
         )
-        return persisted_result.scalars().all()
+        measurements = persisted_result.scalars().all()
+        await annotate_missing_rescaling_measurements(session, measurements)
+        return measurements
 
 
 @router.post("/files/ocr/batch", response_model=OcrJobStartResponse, tags=["ocr"])

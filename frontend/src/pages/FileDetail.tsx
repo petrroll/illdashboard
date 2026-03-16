@@ -20,6 +20,9 @@ import {
   formatDate,
   formatDateTime,
   formatMeasurementValue,
+  formatPreferredMeasurementUnit,
+  formatPreferredMeasurementValue,
+  formatPreferredReferenceRange,
   formatReferenceRange,
   getDisplayUnit,
   getMeasurementValueClass,
@@ -27,7 +30,9 @@ import {
   getOriginalMeasurementReferenceLow,
   getOriginalMeasurementUnit,
   getOriginalMeasurementValue,
+  getUnitConversionWarning,
   hasRescaledMeasurementValue,
+  isUnitConversionMissing,
 } from "../utils/measurements";
 
 export default function FileDetail() {
@@ -352,10 +357,18 @@ export default function FileDetail() {
                     const originalUnit = getOriginalMeasurementUnit(m);
                     const originalReferenceLow = getOriginalMeasurementReferenceLow(m);
                     const originalReferenceHigh = getOriginalMeasurementReferenceHigh(m);
-                    const showOriginalValue = m.qualitative_value == null && hasRescaledMeasurementValue(m);
-                    const showOriginalReference = m.qualitative_value == null
+                    const conversionMissing = isUnitConversionMissing(m);
+                    const conversionWarning = getUnitConversionWarning(m);
+                    const showOriginalValue = !conversionMissing
+                      && m.qualitative_value == null
+                      && hasRescaledMeasurementValue(m);
+                    const showOriginalReference = !conversionMissing
+                      && m.qualitative_value == null
                       && (originalReferenceLow !== canonicalReferenceLow || originalReferenceHigh !== canonicalReferenceHigh);
-                    const showOriginalUnit = !areUnitsEquivalent(originalUnit, canonicalUnit);
+                    const showOriginalUnit = !conversionMissing && !areUnitsEquivalent(originalUnit, canonicalUnit);
+                    const statusValue = conversionMissing ? originalValue : canonicalValue;
+                    const statusReferenceLow = conversionMissing ? originalReferenceLow : canonicalReferenceLow;
+                    const statusReferenceHigh = conversionMissing ? originalReferenceHigh : canonicalReferenceHigh;
 
                     return (
                       <tr key={m.id}>
@@ -369,23 +382,31 @@ export default function FileDetail() {
                           </label>
                         </td>
                         <td style={{ fontWeight: 500 }}>{m.marker_name}</td>
-                        <td className={getMeasurementValueClass({ value: canonicalValue, reference_low: canonicalReferenceLow, reference_high: canonicalReferenceHigh, qualitative_bool: m.qualitative_bool })}>
+                        <td className={getMeasurementValueClass({ value: statusValue, reference_low: statusReferenceLow, reference_high: statusReferenceHigh, qualitative_bool: m.qualitative_bool })}>
                           <StackedMeasurementValue
-                            primary={formatMeasurementValue(canonicalValue, canonicalUnit, m.qualitative_value)}
-                            secondary={showOriginalValue
+                            primary={formatPreferredMeasurementValue(m)}
+                            secondary={conversionMissing
+                              ? conversionWarning ?? undefined
+                              : showOriginalValue
                               ? formatMeasurementValue(originalValue, originalUnit, m.qualitative_value)
                               : undefined}
                           />
                         </td>
                         <td>
                           <StackedMeasurementValue
-                            primary={getDisplayUnit(canonicalUnit) ?? "—"}
-                            secondary={showOriginalUnit ? getDisplayUnit(originalUnit) ?? "—" : undefined}
+                            primary={formatPreferredMeasurementUnit(m)}
+                            secondary={conversionMissing
+                              ? getDisplayUnit(canonicalUnit)
+                                ? `Target ${getDisplayUnit(canonicalUnit)}`
+                                : undefined
+                              : showOriginalUnit
+                                ? getDisplayUnit(originalUnit) ?? "—"
+                                : undefined}
                           />
                         </td>
                         <td>
                           <StackedMeasurementValue
-                            primary={formatReferenceRange(canonicalReferenceLow, canonicalReferenceHigh)}
+                            primary={formatPreferredReferenceRange(m)}
                             secondary={showOriginalReference
                               ? formatReferenceRange(originalReferenceLow, originalReferenceHigh)
                               : undefined}

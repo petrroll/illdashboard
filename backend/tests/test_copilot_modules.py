@@ -373,6 +373,27 @@ async def test_infer_rescaling_factors_splits_large_batches():
 
 
 @pytest.mark.asyncio
+async def test_infer_rescaling_factors_handles_dimensionless_ratio_units_without_llm():
+    conversion_requests = [
+        copilot_normalization.UnitConversionRequest(
+            id="ml/l=>%",
+            marker_name="Plateletcrit (PCT)",
+            original_unit="ml/l",
+            canonical_unit="%",
+            example_value=1.03,
+            reference_low=None,
+            reference_high=None,
+        )
+    ]
+
+    with patch("illdashboard.copilot.normalization._ask", new=AsyncMock()) as ask_mock:
+        result = await copilot_normalization.infer_rescaling_factors(conversion_requests)
+
+    assert result == {"ml/l=>%": pytest.approx(0.1)}
+    ask_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_ask_adds_observed_premium_usage_cost():
     session = DummySession(
         response=SimpleNamespace(data=SimpleNamespace(content="ok")),

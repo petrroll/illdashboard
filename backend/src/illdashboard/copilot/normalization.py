@@ -23,6 +23,18 @@ QUALITATIVE_NORMALIZATION_CONCURRENCY = 2
 MARKER_GROUP_CLASSIFICATION_BATCH_SIZE = 40
 MARKER_GROUP_CLASSIFICATION_CONCURRENCY = 2
 
+_METRIC_PREFIX_FACTORS = {
+    "n": 1e-9,
+    "u": 1e-6,
+    "m": 1e-3,
+    "c": 1e-2,
+    "d": 1e-1,
+    "": 1.0,
+    "da": 1e1,
+    "h": 1e2,
+    "k": 1e3,
+}
+
 
 async def _ask_json(
     system_prompt: str,
@@ -366,6 +378,8 @@ For each request:
 - Use a factor of 1 when the units are equivalent formatting variants.
 - If the conversion is unclear or not safely inferable as a simple multiplicative conversion,
     return null.
+- For dimensionless fraction units, remember that 1 L/L = 100%, 1 mL/L = 0.1%,
+    and 1 % = 10 mL/L.
 - Be careful with count units. For example, converting /µL to 10^9/L uses a factor of 0.001,
     and converting 10^9/L to /µL uses a factor of 1000.
 
@@ -474,6 +488,39 @@ def _default_canonical_unit(group: MarkerUnitGroup) -> str | None:
     if isinstance(canonical_unit, str):
         canonical_unit = canonical_unit.strip() or None
     return canonical_unit
+
+
+def _parse_dimensionless_unit_factor(unit: str | None) -> float | None:
+    unit_key = normalize_unit_key(unit)
+    if unit_key is None:
+        return None
+
+    if unit_key == "1":
+        return 1.0
+    if unit_key == "%":
+        return 1e-2
+    if unit_key in {"‰", "permille"}:
+        return 1e-3
+
+    # Ratio-style units such as mL/L and % describe the same underlying
+    # dimensionless fraction, so we can convert them locally without asking the LLM.
+    match = re.fullmatch(r"(da|[numcdhk]?)[l]/(da|[numcdhk]?)[l]", unit_key)
+    if match is None:
+        return None
+
+    numerator_factor = _METRIC_PREFIX_FACTORS.get(match.group(1))
+    denominator_factor = _METRIC_PREFIX_FACTORS.get(match.group(2))
+    if numerator_factor is None or denominator_factor is None:
+        return None
+    return numerator_factor / denominator_factor
+
+
+def _infer_deterministic_scale_factor(request: UnitConversionRequest) -> float | None:
+    original_factor = _parse_dimensionless_unit_factor(request.original_unit)
+    canonical_factor = _parse_dimensionless_unit_factor(request.canonical_unit)
+    if original_factor is None or canonical_factor is None:
+        return None
+    return original_factor / canonical_factor
 
 
 def _unit_key_likely_requires_llm(unit_key: str | None) -> bool:
@@ -617,8 +664,19 @@ async def infer_rescaling_factors(conversion_requests: list[UnitConversionReques
         return {}
 
     merged_mapping: dict[str, float | None] = {}
+    unresolved_requests: list[UnitConversionRequest] = []
+    for request in conversion_requests:
+        scale_factor = _infer_deterministic_scale_factor(request)
+        if scale_factor is not None:
+            merged_mapping[request.id] = scale_factor
+            continue
+        unresolved_requests.append(request)
+
+    if not unresolved_requests:
+        return merged_mapping
+
     for batch_mapping in await _run_json_batches(
-        conversion_requests,
+        unresolved_requests,
         batch_size=UNIT_NORMALIZATION_BATCH_SIZE,
         concurrency=UNIT_NORMALIZATION_CONCURRENCY,
         system_prompt=UNIT_SCALE_SYSTEM_PROMPT,

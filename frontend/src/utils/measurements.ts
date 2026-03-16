@@ -25,6 +25,12 @@ export function getDisplayUnit(unit?: string | null) {
   return unit && unit !== DIMENSIONLESS_UNIT ? unit : null;
 }
 
+export function isUnitConversionMissing(
+  measurement: Pick<Measurement, "unit_conversion_missing">,
+) {
+  return measurement.unit_conversion_missing === true;
+}
+
 export function areUnitsEquivalent(left?: string | null, right?: string | null) {
   const leftKey = normalizeUnitKey(left);
   const rightKey = normalizeUnitKey(right);
@@ -91,6 +97,77 @@ export function getOriginalMeasurementReferenceHigh(
   measurement: Pick<Measurement, "original_reference_high" | "canonical_reference_high">,
 ) {
   return measurement.original_reference_high ?? measurement.canonical_reference_high;
+}
+
+export function formatPreferredMeasurementValue(
+  measurement: Pick<
+    Measurement,
+    | "unit_conversion_missing"
+    | "canonical_value"
+    | "canonical_unit"
+    | "qualitative_value"
+    | "original_value"
+    | "original_unit"
+  >,
+) {
+  return isUnitConversionMissing(measurement)
+    ? formatMeasurementValue(
+        getOriginalMeasurementValue(measurement),
+        getOriginalMeasurementUnit(measurement),
+        measurement.qualitative_value,
+      )
+    : formatMeasurementValue(
+        measurement.canonical_value,
+        measurement.canonical_unit,
+        measurement.qualitative_value,
+      );
+}
+
+export function formatPreferredMeasurementUnit(
+  measurement: Pick<Measurement, "unit_conversion_missing" | "original_unit" | "canonical_unit">,
+) {
+  const displayUnit = isUnitConversionMissing(measurement)
+    ? getDisplayUnit(getOriginalMeasurementUnit(measurement))
+    : getDisplayUnit(measurement.canonical_unit);
+  return displayUnit ?? "—";
+}
+
+export function formatPreferredReferenceRange(
+  measurement: Pick<
+    Measurement,
+    | "unit_conversion_missing"
+    | "original_reference_low"
+    | "original_reference_high"
+    | "canonical_reference_low"
+    | "canonical_reference_high"
+  >,
+) {
+  return isUnitConversionMissing(measurement)
+    ? formatReferenceRange(
+        getOriginalMeasurementReferenceLow(measurement),
+        getOriginalMeasurementReferenceHigh(measurement),
+      )
+    : formatReferenceRange(
+        measurement.canonical_reference_low,
+        measurement.canonical_reference_high,
+      );
+}
+
+export function getUnitConversionWarning(
+  measurement: Pick<Measurement, "unit_conversion_missing" | "canonical_unit">,
+) {
+  if (!isUnitConversionMissing(measurement)) {
+    return null;
+  }
+
+  const displayUnit = getDisplayUnit(measurement.canonical_unit);
+  return displayUnit ? `No conversion rule for ${displayUnit}` : "No conversion rule";
+}
+
+export function getCanonicalTrendValue(
+  measurement: Pick<Measurement, "unit_conversion_missing" | "canonical_value">,
+) {
+  return isUnitConversionMissing(measurement) ? null : measurement.canonical_value;
 }
 
 export function formatDate(value: string | null, options?: Intl.DateTimeFormatOptions) {

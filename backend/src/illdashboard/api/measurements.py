@@ -21,6 +21,7 @@ from illdashboard.schemas import (
 )
 from illdashboard.services import insights as insight_service
 from illdashboard.services import markers as marker_service
+from illdashboard.services.rescaling import annotate_missing_rescaling_measurements
 from illdashboard.sparkline import generate_sparkline, get_cached_sparkline
 
 
@@ -41,7 +42,9 @@ async def list_measurements(
     if marker_name:
         query = query.where(MeasurementType.name == marker_name)
     result = await db.execute(query)
-    return result.scalars().all()
+    measurements = result.scalars().all()
+    await annotate_missing_rescaling_measurements(db, measurements)
+    return measurements
 
 
 @router.get("/measurements/overview", response_model=list[MarkerOverviewGroup], tags=["measurements"])
@@ -60,6 +63,7 @@ async def measurement_overview(
         .order_by(MeasurementType.name.asc(), Measurement.measured_at.asc(), Measurement.id.asc())
     )
     measurements = result.scalars().all()
+    await annotate_missing_rescaling_measurements(db, measurements)
     by_marker = marker_service.build_marker_histories(measurements)
 
     stored_marker_tags = await marker_service.load_stored_marker_tags(db)
@@ -137,6 +141,8 @@ async def measurement_detail(
     if not measurements:
         raise HTTPException(404, "Marker not found")
 
+    await annotate_missing_rescaling_measurements(db, measurements)
+
     payload = marker_service.build_marker_payload(measurements)
     explanation, explanation_cached = await insight_service.get_cached_insight(
         measurement_type,
@@ -177,6 +183,8 @@ async def measurement_insight(
     if not measurements:
         raise HTTPException(404, "Marker not found")
 
+    await annotate_missing_rescaling_measurements(db, measurements)
+
     explanation, explanation_cached = await insight_service.get_cached_or_generated_insight(
         measurement_type,
         measurements,
@@ -198,7 +206,9 @@ async def file_measurements(file_id: int, db: AsyncSession = Depends(get_db)):
         .where(Measurement.lab_file_id == file_id)
         .order_by(MeasurementType.name.asc(), Measurement.id.asc())
     )
-    return result.scalars().all()
+    measurements = result.scalars().all()
+    await annotate_missing_rescaling_measurements(db, measurements)
+    return measurements
 
 
 @router.get("/measurements/sparkline", tags=["measurements"])
@@ -210,6 +220,8 @@ async def measurement_sparkline(
     measurements = [measurement for measurement in measurements if measurement.qualitative_value is None]
     if not measurements:
         raise HTTPException(404, "Marker not found")
+
+    await annotate_missing_rescaling_measurements(db, measurements)
 
     signature = insight_service.marker_signature(measurements)
     cached = get_cached_sparkline(marker_name, signature)

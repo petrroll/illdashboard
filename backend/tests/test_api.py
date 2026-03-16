@@ -240,6 +240,20 @@ CASE_ONLY_CANONICAL_UNIT_RESULT = {
     ],
 }
 
+PLATELETCRIT_RESULT = {
+    "lab_date": "2023-02-17",
+    "measurements": [
+        {
+            "marker_name": "Plateletcrit (PCT)",
+            "value": 1.03,
+            "unit": "ml/l",
+            "reference_low": None,
+            "reference_high": None,
+            "measured_at": "2023-02-17",
+        },
+    ],
+}
+
 EGFR_SECONDS_RESULT = {
     "lab_date": "2024-11-25",
     "measurements": [
@@ -557,6 +571,93 @@ async def test_ocr_reuses_rescaling_rule_for_decimal_comma_unit_variant(client):
         assert second_payload[0]["canonical_value"] == pytest.approx(124.2)
         assert second_payload[0]["original_unit"] == "ml/s/1,73 m2"
         assert second_payload[0]["canonical_unit"] == "mL/min/1.73 m²"
+
+
+@pytest.mark.asyncio
+async def test_ocr_flags_measurements_with_missing_unit_conversion_rules(client):
+    file_id = await _upload_pdf(client, filename="missing-conversion.pdf")
+
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=CANONICAL_UNIT_RESULT), patch(
+        "illdashboard.copilot.normalization.normalize_marker_names",
+        new=AsyncMock(return_value={"Absolute CD4+ T-Helper Cell Count": "Absolute CD4+ T-Helper Cell Count"}),
+    ), patch(
+        "illdashboard.copilot.normalization.choose_canonical_units",
+        new=AsyncMock(return_value={"Absolute CD4+ T-Helper Cell Count": "10^9/L"}),
+    ), patch(
+        "illdashboard.copilot.normalization.infer_rescaling_factors",
+        new=AsyncMock(return_value={}),
+    ):
+        resp = await client.post(f"/api/files/{file_id}/ocr")
+
+    assert resp.status_code == 200
+    created_rows = resp.json()
+    assert created_rows[0]["unit_conversion_missing"] is False
+    assert created_rows[1]["unit_conversion_missing"] is True
+    assert created_rows[1]["canonical_value"] == 432
+    assert created_rows[1]["canonical_unit"] == "10^9/L"
+    assert created_rows[1]["original_unit"] == "Zellen/µl"
+
+    file_measurements_resp = await client.get(f"/api/files/{file_id}/measurements")
+    assert file_measurements_resp.status_code == 200
+    file_measurements = file_measurements_resp.json()
+    assert file_measurements[1]["unit_conversion_missing"] is True
+
+    detail_resp = await client.get(
+        "/api/measurements/detail",
+        params={"marker_name": "Absolute CD4+ T-Helper Cell Count"},
+    )
+    assert detail_resp.status_code == 200
+    detail = detail_resp.json()
+    assert detail["latest_measurement"]["unit_conversion_missing"] is True
+    assert detail["status"] == "no_range"
+
+    overview_resp = await client.get("/api/measurements/overview")
+    assert overview_resp.status_code == 200
+    overview = overview_resp.json()
+    marker = next(item for group in overview for item in group["markers"] if item["marker_name"] == "Absolute CD4+ T-Helper Cell Count")
+    assert marker["latest_measurement"]["unit_conversion_missing"] is True
+    assert marker["status"] == "no_range"
+    assert marker["value_min"] == 0.38
+    assert marker["value_max"] == 0.38
+
+
+@pytest.mark.asyncio
+async def test_ocr_deterministically_converts_ml_per_l_to_percent(client):
+    file_id = await _upload_pdf(client, filename="plateletcrit.pdf")
+
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=PLATELETCRIT_RESULT), patch(
+        "illdashboard.copilot.normalization.normalize_marker_names",
+        new=AsyncMock(return_value={"Plateletcrit (PCT)": "Plateletcrit (PCT)"}),
+    ), patch(
+        "illdashboard.copilot.normalization.choose_canonical_units",
+        new=AsyncMock(return_value={"Plateletcrit (PCT)": "%"}),
+    ), patch(
+        "illdashboard.copilot.normalization.normalize_source_name",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "illdashboard.copilot.normalization._ask",
+        new=AsyncMock(side_effect=AssertionError("dimensionless ratio conversion should not call the LLM")),
+    ) as ask_mock:
+        resp = await client.post(f"/api/files/{file_id}/ocr")
+
+    assert resp.status_code == 200
+    ask_mock.assert_not_awaited()
+
+    payload = resp.json()
+    assert len(payload) == 1
+    assert payload[0]["original_value"] == 1.03
+    assert payload[0]["original_unit"] == "ml/l"
+    assert payload[0]["canonical_value"] == pytest.approx(0.103)
+    assert payload[0]["canonical_unit"] == "%"
+
+    rules_resp = await client.get("/api/admin/rescaling-rules")
+    assert rules_resp.status_code == 200
+    rules = rules_resp.json()
+    assert len(rules) == 1
+    assert rules[0]["original_unit"] == "ml/l"
+    assert rules[0]["canonical_unit"] == "%"
+    assert rules[0]["scale_factor"] == pytest.approx(0.1)
+    assert rules[0]["marker_name"] == "Plateletcrit (PCT)"
 
 
 @pytest.mark.asyncio

@@ -31,12 +31,17 @@ import type {
 import {
   formatDate,
   formatMeasurementValue,
-  formatReferenceRange,
+  formatPreferredMeasurementUnit,
+  formatPreferredMeasurementValue,
+  formatPreferredReferenceRange,
+  getCanonicalTrendValue,
   getDisplayUnit,
   getMarkerStatusLabel,
   getOriginalMeasurementUnit,
   getOriginalMeasurementValue,
+  getUnitConversionWarning,
   hasRescaledMeasurementValue,
+  isUnitConversionMissing,
 } from "../utils/measurements";
 
 const LIST_PANE_STORAGE_KEY = "illdashboard.markerListWidth";
@@ -233,10 +238,14 @@ export default function MarkerChart() {
       measurements.map((measurement) => ({
         dateLabel: formatDate(measurement.measured_at),
         measuredAt: measurement.measured_at ?? "",
-        value: measurement.canonical_value,
-        reference_low: measurement.canonical_reference_low,
-        reference_high: measurement.canonical_reference_high,
+        value: getCanonicalTrendValue(measurement),
+        reference_low: measurement.unit_conversion_missing ? null : measurement.canonical_reference_low,
+        reference_high: measurement.unit_conversion_missing ? null : measurement.canonical_reference_high,
       })),
+    [measurements],
+  );
+  const hasMissingUnitConversions = useMemo(
+    () => measurements.some((measurement) => isUnitConversionMissing(measurement)),
     [measurements],
   );
 
@@ -442,9 +451,10 @@ export default function MarkerChart() {
                   {group.markers.map((item) => {
                     const latest = item.latest_measurement;
                     const previous = item.previous_measurement;
+                    const latestWarning = getUnitConversionWarning(latest);
                     const delta =
-                      previous && latest.canonical_value != null && previous.canonical_value != null
-                        ? latest.canonical_value - previous.canonical_value
+                      previous && getCanonicalTrendValue(latest) != null && getCanonicalTrendValue(previous) != null
+                        ? getCanonicalTrendValue(latest)! - getCanonicalTrendValue(previous)!
                         : null;
                     const otherCount = item.total_count - 1 - (previous ? 1 : 0);
 
@@ -478,9 +488,11 @@ export default function MarkerChart() {
                         </div>
 
                         <div className="marker-row-value">
-                          <strong>{formatMeasurementValue(latest.canonical_value, latest.canonical_unit, latest.qualitative_value)}</strong>
+                          <strong>{formatPreferredMeasurementValue(latest)}</strong>
                           <span>
-                            {delta == null
+                            {latestWarning
+                              ? latestWarning
+                              : delta == null
                               ? "First result"
                               : `${delta > 0 ? "+" : ""}${formatMeasurementValue(delta, latest.canonical_unit)}`}
                           </span>
@@ -490,7 +502,7 @@ export default function MarkerChart() {
 
                         <div className="marker-row-previous">
                           <strong>
-                            {previous ? formatMeasurementValue(previous.canonical_value, previous.canonical_unit, previous.qualitative_value) : "—"}
+                            {previous ? formatPreferredMeasurementValue(previous) : "—"}
                           </strong>
                           {otherCount > 0 && item.value_min != null && item.value_max != null && (
                             <span className="marker-row-history-note">
@@ -555,15 +567,18 @@ export default function MarkerChart() {
             <div className="detail-summary-grid">
               <div className="detail-stat-card">
                 <span>Latest</span>
-                <strong>{formatMeasurementValue(summarySource.latest_measurement.canonical_value, summarySource.latest_measurement.canonical_unit, summarySource.latest_measurement.qualitative_value)}</strong>
+                <strong>{formatPreferredMeasurementValue(summarySource.latest_measurement)}</strong>
                 <small>{formatDate(summarySource.latest_measurement.measured_at)}</small>
+                {getUnitConversionWarning(summarySource.latest_measurement) && (
+                  <small className="measurement-warning-note">{getUnitConversionWarning(summarySource.latest_measurement)}</small>
+                )}
               </div>
 
               <div className="detail-stat-card">
                 <span>Previous</span>
                 <strong>
                   {summarySource.previous_measurement
-                    ? formatMeasurementValue(summarySource.previous_measurement.canonical_value, summarySource.previous_measurement.canonical_unit, summarySource.previous_measurement.qualitative_value)
+                    ? formatPreferredMeasurementValue(summarySource.previous_measurement)
                     : "—"}
                 </strong>
                 <small>
@@ -571,17 +586,20 @@ export default function MarkerChart() {
                     ? formatDate(summarySource.previous_measurement.measured_at)
                     : "No earlier result"}
                 </small>
+                {summarySource.previous_measurement && getUnitConversionWarning(summarySource.previous_measurement) && (
+                  <small className="measurement-warning-note">{getUnitConversionWarning(summarySource.previous_measurement)}</small>
+                )}
               </div>
 
               <div className="detail-stat-card">
                 <span>Reference range</span>
                 <strong>
-                  {formatReferenceRange(
-                    summarySource.latest_measurement.canonical_reference_low,
-                    summarySource.latest_measurement.canonical_reference_high,
-                  )}
+                  {formatPreferredReferenceRange(summarySource.latest_measurement)}
                 </strong>
-                <small>{getDisplayUnit(summarySource.latest_measurement.canonical_unit) ?? "No unit recorded"}</small>
+                <small>{formatPreferredMeasurementUnit(summarySource.latest_measurement)}</small>
+                {getUnitConversionWarning(summarySource.latest_measurement) && (
+                  <small className="measurement-warning-note">{getUnitConversionWarning(summarySource.latest_measurement)}</small>
+                )}
               </div>
             </div>
 
@@ -591,6 +609,11 @@ export default function MarkerChart() {
               </div>
             ) : (
               <>
+                {hasMissingUnitConversions && (
+                  <p className="measurement-warning-note" style={{ marginBottom: "0.75rem" }}>
+                    Some history points stay in their original units because no conversion rule exists yet.
+                  </p>
+                )}
                 <div className="chart-wrapper mb-1">
                   <ResponsiveContainer width="100%" height={320}>
                     <LineChart data={chartData}>
@@ -652,7 +675,10 @@ export default function MarkerChart() {
                           const filename = measurement.lab_file_filename || `File ${measurement.lab_file_id}`;
                           const originalValue = getOriginalMeasurementValue(measurement);
                           const originalUnit = getOriginalMeasurementUnit(measurement);
-                          const showOriginalValue = measurement.qualitative_value == null
+                          const conversionMissing = isUnitConversionMissing(measurement);
+                          const conversionWarning = getUnitConversionWarning(measurement);
+                          const showOriginalValue = !conversionMissing
+                            && measurement.qualitative_value == null
                             && hasRescaledMeasurementValue(measurement);
 
                           return (
@@ -660,17 +686,15 @@ export default function MarkerChart() {
                               <td>{formatDate(measurement.measured_at)}</td>
                               <td>
                                 <StackedMeasurementValue
-                                  primary={formatMeasurementValue(
-                                    measurement.canonical_value,
-                                    measurement.canonical_unit,
-                                    measurement.qualitative_value,
-                                  )}
-                                  secondary={showOriginalValue
+                                  primary={formatPreferredMeasurementValue(measurement)}
+                                  secondary={conversionMissing
+                                    ? conversionWarning ?? undefined
+                                    : showOriginalValue
                                     ? formatMeasurementValue(originalValue, originalUnit, measurement.qualitative_value)
                                     : undefined}
                                 />
                               </td>
-                              <td>{formatReferenceRange(measurement.canonical_reference_low, measurement.canonical_reference_high)}</td>
+                              <td>{formatPreferredReferenceRange(measurement)}</td>
                               <td>
                                 <div className="history-source-cell">
                                   <Link

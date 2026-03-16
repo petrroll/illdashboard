@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from illdashboard.models import MeasurementType, RescalingRule
+from illdashboard.models import Measurement, MeasurementType, RescalingRule
 
 
 def _normalized_unit_pairs(unit_pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -51,6 +52,53 @@ def apply_scale_factor(value: float | None, scale_factor: float | None) -> float
     if value is None or scale_factor is None:
         return value
     return value * scale_factor
+
+
+async def missing_rescaling_measurement_ids(
+    db: AsyncSession,
+    measurements: Sequence[Measurement],
+) -> set[int]:
+    requested_pairs: list[tuple[str, str]] = []
+    pairs_by_measurement_id: dict[int, tuple[str, str]] = {}
+
+    for measurement in measurements:
+        if measurement.id is None or measurement.original_value is None:
+            continue
+
+        original_unit = measurement.original_unit
+        canonical_unit = measurement.canonical_unit
+        if original_unit is None or canonical_unit is None or units_equivalent(original_unit, canonical_unit):
+            continue
+
+        requested_pairs.append((original_unit, canonical_unit))
+        pairs_by_measurement_id[measurement.id] = (original_unit, canonical_unit)
+
+    if not pairs_by_measurement_id:
+        return set()
+
+    rule_map = await load_rescaling_rules(db, requested_pairs)
+    missing_ids: set[int] = set()
+
+    for measurement_id, (original_unit, canonical_unit) in pairs_by_measurement_id.items():
+        original_key = normalize_unit_key(original_unit)
+        canonical_key = normalize_unit_key(canonical_unit)
+        if original_key is None or canonical_key is None:
+            missing_ids.add(measurement_id)
+            continue
+        if (original_key, canonical_key) not in rule_map:
+            missing_ids.add(measurement_id)
+
+    return missing_ids
+
+
+async def annotate_missing_rescaling_measurements(
+    db: AsyncSession,
+    measurements: Sequence[Measurement],
+) -> set[int]:
+    missing_ids = await missing_rescaling_measurement_ids(db, measurements)
+    for measurement in measurements:
+        setattr(measurement, "unit_conversion_missing", measurement.id in missing_ids)
+    return missing_ids
 
 
 async def load_rescaling_rules(

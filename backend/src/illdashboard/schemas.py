@@ -52,6 +52,7 @@ class MeasurementOut(BaseModel):
     qualitative_bool: bool | None = None
     qualitative_value: str | None = None
     original_unit: str | None = None
+    unit_conversion_missing: bool = False
     canonical_reference_low: float | None = None
     canonical_reference_high: float | None = None
     original_reference_low: float | None = None
@@ -63,6 +64,7 @@ class MeasurementOut(BaseModel):
     @classmethod
     def _flatten_measurement_type(cls, data: Any):
         if isinstance(data, dict):
+            data.setdefault("unit_conversion_missing", False)
             return data
         if hasattr(data, "measurement_type"):
             measurement_type = data.measurement_type
@@ -89,6 +91,7 @@ class MeasurementOut(BaseModel):
                 "qualitative_bool": data.qualitative_bool,
                 "qualitative_value": data.qualitative_value,
                 "original_unit": data.original_unit,
+                "unit_conversion_missing": bool(getattr(data, "unit_conversion_missing", False)),
                 "canonical_reference_low": data.canonical_reference_low,
                 "canonical_reference_high": data.canonical_reference_high,
                 "original_reference_low": data.original_reference_low,
