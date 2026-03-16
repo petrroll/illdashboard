@@ -17,7 +17,7 @@ import type {
 } from "../types";
 import {
   formatDate,
-  formatMeasurementValue,
+  formatMeasurementScalarValue,
   formatReferenceRange,
   getDisplayUnit,
   getMeasurementValueClass,
@@ -229,7 +229,7 @@ export default function Settings() {
                 return (
                   <tr key={m.id}>
                     <td>{m.marker_name}</td>
-                    <td className={getMeasurementValueClass({ value: originalValue, reference_low: originalReferenceLow, reference_high: originalReferenceHigh, qualitative_bool: m.qualitative_bool })}>{formatMeasurementValue(originalValue, originalUnit, m.qualitative_value)}</td>
+                    <td className={getMeasurementValueClass({ value: originalValue, reference_low: originalReferenceLow, reference_high: originalReferenceHigh, qualitative_bool: m.qualitative_bool })}>{formatMeasurementScalarValue(originalValue, m.qualitative_value)}</td>
                     <td>{getDisplayUnit(originalUnit) ?? "—"}</td>
                     <td>{formatReferenceRange(originalReferenceLow, originalReferenceHigh)}</td>
                     <td>{formatDate(m.measured_at)}</td>

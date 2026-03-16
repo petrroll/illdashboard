@@ -14,6 +14,8 @@
   --danger: #f85149;
   --success: #46d160;
   --warning: #e8b32a;
+  --value-ok: #8fd3a5;
+  --value-attention: #e6b170;
 }
 
 * {
@@ -228,19 +230,26 @@ tr:hover td {
 /* ── Value indicator ──────────────────────────────────────────── */
 
 .value-low {
-  color: var(--accent);
+  color: var(--value-attention);
 }
 
 .value-normal {
-  color: var(--success);
+  color: var(--value-ok);
 }
 
 .value-high {
-  color: var(--danger);
+  color: var(--value-attention);
 }
 
 .value-positive {
-  color: var(--warning);
+  color: var(--value-attention);
+}
+
+.value-low .history-measurement-primary,
+.value-normal .history-measurement-primary,
+.value-high .history-measurement-primary,
+.value-positive .history-measurement-primary {
+  color: inherit;
 }
 
 /* ── Explanation panel ────────────────────────────────────────── */

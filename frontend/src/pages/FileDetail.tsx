@@ -19,9 +19,9 @@ import {
   areUnitsEquivalent,
   formatDate,
   formatDateTime,
-  formatMeasurementValue,
+  formatMeasurementScalarValue,
   formatPreferredMeasurementUnit,
-  formatPreferredMeasurementValue,
+  formatPreferredMeasurementScalarValue,
   formatPreferredReferenceRange,
   formatReferenceRange,
   getDisplayUnit,
@@ -384,11 +384,11 @@ export default function FileDetail() {
                         <td style={{ fontWeight: 500 }}>{m.marker_name}</td>
                         <td className={getMeasurementValueClass({ value: statusValue, reference_low: statusReferenceLow, reference_high: statusReferenceHigh, qualitative_bool: m.qualitative_bool })}>
                           <StackedMeasurementValue
-                            primary={formatPreferredMeasurementValue(m)}
+                            primary={formatPreferredMeasurementScalarValue(m)}
                             secondary={conversionMissing
                               ? conversionWarning ?? undefined
                               : showOriginalValue
-                              ? formatMeasurementValue(originalValue, originalUnit, m.qualitative_value)
+                              ? formatMeasurementScalarValue(originalValue, m.qualitative_value)
                               : undefined}
                           />
                         </td>

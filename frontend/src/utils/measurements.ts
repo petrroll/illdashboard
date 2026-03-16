@@ -61,6 +61,20 @@ export function formatMeasurementValue(
   unit?: string | null,
   qualitativeValue?: string | null,
 ) {
+  const renderedValue = formatMeasurementScalarValue(value, qualitativeValue);
+  if (renderedValue === "—" || qualitativeValue) {
+    return renderedValue;
+  }
+
+  const displayUnit = getDisplayUnit(unit);
+  return displayUnit ? `${renderedValue} ${displayUnit}` : renderedValue;
+}
+
+// Value columns stay unit-free when the table already renders the unit separately.
+export function formatMeasurementScalarValue(
+  value?: number | null,
+  qualitativeValue?: string | null,
+) {
   if (qualitativeValue) {
     return qualitativeValue;
   }
@@ -72,9 +86,7 @@ export function formatMeasurementValue(
   const renderedValue = Number.isInteger(value)
     ? value.toString()
     : value.toFixed(2).replace(/\.00$/, "");
-  const displayUnit = getDisplayUnit(unit);
-
-  return displayUnit ? `${renderedValue} ${displayUnit}` : renderedValue;
+  return renderedValue;
 }
 
 export function formatReferenceRange(
@@ -133,6 +145,26 @@ export function formatPreferredMeasurementValue(
     : formatMeasurementValue(
         measurement.canonical_value,
         measurement.canonical_unit,
+        measurement.qualitative_value,
+      );
+}
+
+export function formatPreferredMeasurementScalarValue(
+  measurement: Pick<
+    Measurement,
+    | "unit_conversion_missing"
+    | "canonical_value"
+    | "qualitative_value"
+    | "original_value"
+  >,
+) {
+  return isUnitConversionMissing(measurement)
+    ? formatMeasurementScalarValue(
+        getOriginalMeasurementValue(measurement),
+        measurement.qualitative_value,
+      )
+    : formatMeasurementScalarValue(
+        measurement.canonical_value,
         measurement.qualitative_value,
       );
 }

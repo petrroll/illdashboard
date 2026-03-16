@@ -31,6 +31,9 @@ import type {
 import {
   formatDate,
   formatMeasurementValue,
+  getMeasurementValueClass,
+  getOriginalMeasurementReferenceHigh,
+  getOriginalMeasurementReferenceLow,
   formatPreferredMeasurementUnit,
   formatPreferredMeasurementValue,
   formatPreferredReferenceRange,
@@ -688,16 +691,32 @@ export default function MarkerChart() {
                           const filename = measurement.lab_file_filename || `File ${measurement.lab_file_id}`;
                           const originalValue = getOriginalMeasurementValue(measurement);
                           const originalUnit = getOriginalMeasurementUnit(measurement);
+                          const originalReferenceLow = getOriginalMeasurementReferenceLow(measurement);
+                          const originalReferenceHigh = getOriginalMeasurementReferenceHigh(measurement);
                           const conversionMissing = isUnitConversionMissing(measurement);
                           const conversionWarning = getUnitConversionWarning(measurement);
                           const showOriginalValue = !conversionMissing
                             && measurement.qualitative_value == null
                             && hasRescaledMeasurementValue(measurement);
+                          const statusValue = conversionMissing
+                            ? originalValue
+                            : measurement.canonical_value;
+                          const statusReferenceLow = conversionMissing
+                            ? originalReferenceLow
+                            : measurement.canonical_reference_low;
+                          const statusReferenceHigh = conversionMissing
+                            ? originalReferenceHigh
+                            : measurement.canonical_reference_high;
 
                           return (
                             <tr key={measurement.id}>
                               <td>{formatDate(measurement.measured_at)}</td>
-                              <td>
+                              <td className={getMeasurementValueClass({
+                                value: statusValue,
+                                reference_low: statusReferenceLow,
+                                reference_high: statusReferenceHigh,
+                                qualitative_bool: measurement.qualitative_bool,
+                              })}>
                                 <StackedMeasurementValue
                                   primary={formatPreferredMeasurementValue(measurement)}
                                   secondary={conversionMissing
