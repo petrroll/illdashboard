@@ -7,7 +7,7 @@ import json
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from illdashboard.copilot_service import explain_marker_history
+from illdashboard.copilot.explanations import explain_marker_history
 from illdashboard.models import BiomarkerInsight, Measurement, MeasurementType
 from illdashboard.services.markers import measurement_status
 

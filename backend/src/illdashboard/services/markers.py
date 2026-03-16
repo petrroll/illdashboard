@@ -65,6 +65,8 @@ async def load_marker_groups(db: AsyncSession) -> dict[str, MarkerGroup]:
     """Return all marker groups keyed by name."""
     result = await db.execute(select(MarkerGroup))
     return {group.name: group for group in result.scalars().all()}
+
+
 SINGLE_MEASUREMENT_TAG = "singlemeasurement"
 MULTIPLE_MEASUREMENTS_TAG = "multiplemeasurements"
 SOURCE_TAG_PREFIX = "source:"
@@ -264,7 +266,7 @@ async def classify_marker_groups(
     if not names:
         return {}
 
-    from illdashboard.copilot_service import classify_marker_groups as llm_classify
+    from illdashboard.copilot.normalization import classify_marker_groups as llm_classify
 
     try:
         return await llm_classify(names, existing_groups)

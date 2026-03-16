@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 
 from illdashboard.config import settings
-from illdashboard.copilot_service import shutdown_client
+from illdashboard.copilot.client import shutdown_client
 from illdashboard.api import router
 from illdashboard.database import async_session, engine
 from illdashboard.models import Base, LabFile

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from illdashboard.copilot_service import explain_markers
+from illdashboard.copilot.explanations import explain_markers
 from illdashboard.schemas import ExplainRequest, ExplainResponse, MultiExplainRequest
 
 

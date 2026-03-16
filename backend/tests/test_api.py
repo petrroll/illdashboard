@@ -15,7 +15,7 @@ from illdashboard import config
 from illdashboard.database import create_database_engine
 from illdashboard.main import preload_uploaded_files
 from illdashboard.models import Base, LabFile, LabFileTag, MarkerTag, Measurement, MeasurementType, RescalingRule
-from illdashboard.services import ocr as ocr_service
+from illdashboard.services import ocr_workflow as ocr_service
 
 
 @pytest.mark.asyncio
@@ -311,7 +311,7 @@ async def test_reprocess_file_no_duplicates(client):
     """Running OCR twice on the same file should NOT create duplicate measurements."""
     file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
         # First OCR run
         resp1 = await client.post(f"/api/files/{file_id}/ocr")
         assert resp1.status_code == 200
@@ -346,12 +346,12 @@ async def test_reprocess_replaces_old_values(client):
         ],
     }
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
         resp1 = await client.post(f"/api/files/{file_id}/ocr")
         assert resp1.status_code == 200
         assert len(resp1.json()) == 2
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=updated_result):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=updated_result):
         resp2 = await client.post(f"/api/files/{file_id}/ocr")
         assert resp2.status_code == 200
         assert len(resp2.json()) == 1
@@ -367,14 +367,14 @@ async def test_reprocess_replaces_old_values(client):
 async def test_ocr_persists_original_values_while_marker_views_use_canonical_units(client):
     file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=CANONICAL_UNIT_RESULT), patch(
-        "illdashboard.services.ocr.normalize_marker_names",
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=CANONICAL_UNIT_RESULT), patch(
+        "illdashboard.copilot.normalization.normalize_marker_names",
         new=AsyncMock(return_value={"Absolute CD4+ T-Helper Cell Count": "Absolute CD4+ T-Helper Cell Count"}),
     ), patch(
-        "illdashboard.services.ocr.choose_canonical_units",
+        "illdashboard.copilot.normalization.choose_canonical_units",
         new=AsyncMock(return_value={"Absolute CD4+ T-Helper Cell Count": "10^9/L"}),
     ), patch(
-        "illdashboard.services.ocr.infer_rescaling_factors",
+        "illdashboard.copilot.normalization.infer_rescaling_factors",
         new=AsyncMock(return_value={"zellen/ul=>10^9/l": 0.001}),
     ):
         resp = await client.post(f"/api/files/{file_id}/ocr")
@@ -409,14 +409,14 @@ async def test_ocr_persists_original_values_while_marker_views_use_canonical_uni
 async def test_ocr_rewrites_equivalent_original_unit_to_canonical_spelling(client):
     file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=CASE_ONLY_CANONICAL_UNIT_RESULT), patch(
-        "illdashboard.services.ocr.normalize_marker_names",
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=CASE_ONLY_CANONICAL_UNIT_RESULT), patch(
+        "illdashboard.copilot.normalization.normalize_marker_names",
         new=AsyncMock(return_value={"Absolute CD4+ T-Helper Cell Count": "Absolute CD4+ T-Helper Cell Count"}),
     ), patch(
-        "illdashboard.services.ocr.choose_canonical_units",
+        "illdashboard.copilot.normalization.choose_canonical_units",
         new=AsyncMock(return_value={"Absolute CD4+ T-Helper Cell Count": "10^9/L"}),
     ), patch(
-        "illdashboard.services.ocr.infer_rescaling_factors",
+        "illdashboard.copilot.normalization.infer_rescaling_factors",
         new=AsyncMock(return_value={}),
     ):
         resp = await client.post(f"/api/files/{file_id}/ocr")
@@ -436,28 +436,28 @@ async def test_ocr_persists_and_reuses_rescaling_rules(client):
     first_file_id = await _upload_pdf(client, filename="first.pdf")
     second_file_id = await _upload_pdf(client, filename="second.pdf")
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=CANONICAL_UNIT_RESULT), patch(
-        "illdashboard.services.ocr.normalize_marker_names",
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=CANONICAL_UNIT_RESULT), patch(
+        "illdashboard.copilot.normalization.normalize_marker_names",
         new=AsyncMock(return_value={"Absolute CD4+ T-Helper Cell Count": "Absolute CD4+ T-Helper Cell Count"}),
     ), patch(
-        "illdashboard.services.ocr.choose_canonical_units",
+        "illdashboard.copilot.normalization.choose_canonical_units",
         new=AsyncMock(return_value={"Absolute CD4+ T-Helper Cell Count": "10^9/L"}),
     ), patch(
-        "illdashboard.services.ocr.infer_rescaling_factors",
+        "illdashboard.copilot.normalization.infer_rescaling_factors",
         new=AsyncMock(return_value={"zellen/ul=>10^9/l": 0.001}),
     ) as infer_mock:
         resp = await client.post(f"/api/files/{first_file_id}/ocr")
         assert resp.status_code == 200
         infer_mock.assert_awaited_once()
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=CANONICAL_UNIT_RESULT), patch(
-        "illdashboard.services.ocr.normalize_marker_names",
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=CANONICAL_UNIT_RESULT), patch(
+        "illdashboard.copilot.normalization.normalize_marker_names",
         new=AsyncMock(return_value={"Absolute CD4+ T-Helper Cell Count": "Absolute CD4+ T-Helper Cell Count"}),
     ), patch(
-        "illdashboard.services.ocr.choose_canonical_units",
+        "illdashboard.copilot.normalization.choose_canonical_units",
         new=AsyncMock(return_value={"Absolute CD4+ T-Helper Cell Count": "10^9/L"}),
     ), patch(
-        "illdashboard.services.ocr.infer_rescaling_factors",
+        "illdashboard.copilot.normalization.infer_rescaling_factors",
         new=AsyncMock(side_effect=AssertionError("stored rule should be reused before calling LLM")),
     ) as infer_mock:
         resp = await client.post(f"/api/files/{second_file_id}/ocr")
@@ -541,8 +541,8 @@ async def test_ocr_adds_normalized_source_tag_and_preserves_existing_tags(client
         "source": "Dr. Jaeger Lab",
     }
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=source_result), patch(
-        "illdashboard.services.ocr.normalize_source_name",
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=source_result), patch(
+        "illdashboard.copilot.normalization.normalize_source_name",
         new_callable=AsyncMock,
         return_value="jaeger",
     ):
@@ -568,7 +568,7 @@ async def test_ocr_persists_raw_and_translated_text_for_non_lab_documents(client
         "measurements": [],
     }
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=non_lab_result):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=non_lab_result):
         resp = await client.post(f"/api/files/{file_id}/ocr")
 
     assert resp.status_code == 200
@@ -613,7 +613,7 @@ async def test_search_finds_files_by_translated_text_tags_and_measurements(clien
         "measurements": [],
     }
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, side_effect=[ferritin_result, note_result]):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, side_effect=[ferritin_result, note_result]):
         first_resp = await client.post(f"/api/files/{lab_file_id}/ocr")
         second_resp = await client.post(f"/api/files/{note_file_id}/ocr")
 
@@ -671,8 +671,8 @@ async def test_ocr_source_normalization_uses_filename_and_seen_sources(client):
         "source": "Syn Lab CZ",
     }
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=source_result), patch(
-        "illdashboard.services.ocr.normalize_source_name",
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=source_result), patch(
+        "illdashboard.copilot.normalization.normalize_source_name",
         new_callable=AsyncMock,
         return_value="synlab",
     ) as normalize_source_mock:
@@ -729,16 +729,16 @@ async def test_ocr_persists_qualitative_measurements_and_excludes_them_from_nume
         ],
     }
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=qualitative_result), patch(
-        "illdashboard.services.ocr.normalize_marker_names",
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=qualitative_result), patch(
+        "illdashboard.copilot.normalization.normalize_marker_names",
         new_callable=AsyncMock,
         side_effect=lambda names, _existing: {name: name for name in names},
     ), patch(
-        "illdashboard.services.ocr.choose_canonical_units",
+        "illdashboard.copilot.normalization.choose_canonical_units",
         new_callable=AsyncMock,
         return_value={},
     ), patch(
-        "illdashboard.services.ocr.normalize_qualitative_values",
+        "illdashboard.copilot.normalization.normalize_qualitative_values",
         new_callable=AsyncMock,
         return_value={
             "negative": ("negative", False),
@@ -787,7 +787,7 @@ async def test_ocr_persists_qualitative_measurements_and_excludes_them_from_nume
 async def test_set_marker_tags_allows_extending_existing_tag_list(client):
     file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
         ocr_resp = await client.post(f"/api/files/{file_id}/ocr")
     assert ocr_resp.status_code == 200
 
@@ -813,16 +813,16 @@ async def test_batch_and_unprocessed_share_job_behavior(client):
     first_file_id = await _upload_pdf(client)
     second_file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT), patch(
-        "illdashboard.services.ocr.normalize_marker_names",
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT), patch(
+        "illdashboard.copilot.normalization.normalize_marker_names",
         new=AsyncMock(return_value={"Sodium": "Sodium", "Potassium": "Potassium"}),
     ), patch(
-        "illdashboard.services.ocr.choose_canonical_units",
+        "illdashboard.copilot.normalization.choose_canonical_units",
         new=AsyncMock(return_value={"Sodium": "mmol/l", "Potassium": "mmol/l"}),
     ), patch(
-        "illdashboard.services.ocr.infer_rescaling_factors",
+        "illdashboard.copilot.normalization.infer_rescaling_factors",
         new=AsyncMock(return_value={}),
-    ), patch("illdashboard.services.ocr.normalize_source_name", new=AsyncMock(return_value=None)):
+    ), patch("illdashboard.copilot.normalization.normalize_source_name", new=AsyncMock(return_value=None)):
         unprocessed_resp = await client.post("/api/files/ocr/unprocessed")
 
         assert unprocessed_resp.status_code == 200
@@ -845,16 +845,16 @@ async def test_batch_and_unprocessed_share_job_behavior(client):
             }
         ],
     }
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=batch_result), patch(
-        "illdashboard.services.ocr.normalize_marker_names",
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=batch_result), patch(
+        "illdashboard.copilot.normalization.normalize_marker_names",
         new=AsyncMock(return_value={"Sodium": "Sodium"}),
     ), patch(
-        "illdashboard.services.ocr.choose_canonical_units",
+        "illdashboard.copilot.normalization.choose_canonical_units",
         new=AsyncMock(return_value={"Sodium": "mmol/l"}),
     ), patch(
-        "illdashboard.services.ocr.infer_rescaling_factors",
+        "illdashboard.copilot.normalization.infer_rescaling_factors",
         new=AsyncMock(return_value={}),
-    ), patch("illdashboard.services.ocr.normalize_source_name", new=AsyncMock(return_value=None)):
+    ), patch("illdashboard.copilot.normalization.normalize_source_name", new=AsyncMock(return_value=None)):
         batch_resp = await client.post("/api/files/ocr/batch", json={"file_ids": [first_file_id]})
 
         assert batch_resp.status_code == 200
@@ -877,16 +877,16 @@ async def test_batch_ocr_job_reports_processing_before_completion(client):
         await asyncio.sleep(0.02)
         return OCR_RESULT
 
-    with patch("illdashboard.services.ocr.extract_ocr_result", side_effect=slow_extract), patch(
-        "illdashboard.services.ocr.normalize_marker_names",
+    with patch("illdashboard.services.ocr_workflow.extract_ocr_result", side_effect=slow_extract), patch(
+        "illdashboard.copilot.normalization.normalize_marker_names",
         new=AsyncMock(return_value={"Sodium": "Sodium", "Potassium": "Potassium"}),
     ), patch(
-        "illdashboard.services.ocr.choose_canonical_units",
+        "illdashboard.copilot.normalization.choose_canonical_units",
         new=AsyncMock(return_value={"Sodium": "mmol/l", "Potassium": "mmol/l"}),
     ), patch(
-        "illdashboard.services.ocr.infer_rescaling_factors",
+        "illdashboard.copilot.normalization.infer_rescaling_factors",
         new=AsyncMock(return_value={}),
-    ), patch("illdashboard.services.ocr.normalize_source_name", new=AsyncMock(return_value=None)):
+    ), patch("illdashboard.copilot.normalization.normalize_source_name", new=AsyncMock(return_value=None)):
         response = await client.post("/api/files/ocr/batch", json={"file_ids": [file_id]})
 
         assert response.status_code == 200
@@ -957,16 +957,16 @@ async def test_batch_ocr_persists_in_request_order_for_progressive_canonicalizat
             return {"Alias Marker": "Alias Marker"}
         return {name: name for name in new_names}
 
-    with patch("illdashboard.services.ocr.extract_ocr_result", side_effect=extract_side_effect), patch(
-        "illdashboard.services.ocr.normalize_marker_names",
+    with patch("illdashboard.services.ocr_workflow.extract_ocr_result", side_effect=extract_side_effect), patch(
+        "illdashboard.copilot.normalization.normalize_marker_names",
         new=AsyncMock(side_effect=normalize_side_effect),
     ), patch(
-        "illdashboard.services.ocr.choose_canonical_units",
+        "illdashboard.copilot.normalization.choose_canonical_units",
         new=AsyncMock(return_value={"Canonical Marker": "mmol/l"}),
     ), patch(
-        "illdashboard.services.ocr.infer_rescaling_factors",
+        "illdashboard.copilot.normalization.infer_rescaling_factors",
         new=AsyncMock(return_value={}),
-    ), patch("illdashboard.services.ocr.normalize_source_name", new=AsyncMock(return_value=None)):
+    ), patch("illdashboard.copilot.normalization.normalize_source_name", new=AsyncMock(return_value=None)):
         response = await client.post("/api/files/ocr/batch", json={"file_ids": [first_file_id, second_file_id]})
 
         assert response.status_code == 200
@@ -993,7 +993,7 @@ async def test_batch_ocr_persists_in_request_order_for_progressive_canonicalizat
 async def test_reprocessing_same_source_tag_does_not_fail_or_duplicate(client):
     file_id = await _upload_pdf(client, filename="jaeger.pdf")
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT_WITH_SOURCE):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT_WITH_SOURCE):
         first_resp = await client.post(f"/api/files/{file_id}/ocr")
         assert first_resp.status_code == 200
 
@@ -1027,7 +1027,7 @@ def test_get_ocr_job_status_prunes_expired_finished_jobs():
         ocr_service._ocr_jobs[old_job.job_id] = old_job
         ocr_service._ocr_jobs[fresh_job.job_id] = fresh_job
 
-        with patch("illdashboard.services.ocr.time.time", return_value=100 + ocr_service.OCR_JOB_TTL_SECONDS + 1):
+        with patch("illdashboard.services.ocr_workflow.time.time", return_value=100 + ocr_service.OCR_JOB_TTL_SECONDS + 1):
             with pytest.raises(ocr_service.HTTPException) as exc_info:
                 ocr_service.get_ocr_job_status(old_job.job_id)
 
@@ -1053,7 +1053,7 @@ def test_get_ocr_job_status_exposes_last_updated_at():
         ocr_service._ocr_jobs.clear()
         ocr_service._ocr_jobs[job.job_id] = job
 
-        with patch("illdashboard.services.ocr.time.time", return_value=now):
+        with patch("illdashboard.services.ocr_workflow.time.time", return_value=now):
             payload = ocr_service.get_ocr_job_status(job.job_id)
 
         assert payload["last_updated_at"] == now - 0.5
@@ -1067,11 +1067,11 @@ async def test_measurement_overview_groups_latest_and_previous_values(client):
     first_file_id = await _upload_pdf(client)
     second_file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_RESULT):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_RESULT):
         resp = await client.post(f"/api/files/{first_file_id}/ocr")
         assert resp.status_code == 200
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_UPDATED_RESULT):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_UPDATED_RESULT):
         resp = await client.post(f"/api/files/{second_file_id}/ocr")
         assert resp.status_code == 200
 
@@ -1092,7 +1092,7 @@ async def test_measurement_overview_groups_latest_and_previous_values(client):
 async def test_measurement_overview_groups_electrolytes_separately(client):
     file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
         resp = await client.post(f"/api/files/{file_id}/ocr")
         assert resp.status_code == 200
 
@@ -1109,7 +1109,7 @@ async def test_measurement_overview_groups_electrolytes_separately(client):
 async def test_measurement_overview_groups_magnesium_as_electrolyte(client):
     file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=MAGNESIUM_RESULT):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=MAGNESIUM_RESULT):
         resp = await client.post(f"/api/files/{file_id}/ocr")
         assert resp.status_code == 200
 
@@ -1127,11 +1127,11 @@ async def test_measurement_overview_exposes_and_filters_by_derived_tags(client):
     first_file_id = await _upload_pdf(client)
     second_file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_RESULT):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_RESULT):
         resp = await client.post(f"/api/files/{first_file_id}/ocr")
         assert resp.status_code == 200
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_UPDATED_RESULT):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_UPDATED_RESULT):
         resp = await client.post(f"/api/files/{second_file_id}/ocr")
         assert resp.status_code == 200
 
@@ -1175,11 +1175,11 @@ async def test_measurement_overview_and_detail_include_source_file_tags(client):
     )
     assert second_tag_resp.status_code == 200
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_RESULT):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_RESULT):
         resp = await client.post(f"/api/files/{first_file_id}/ocr")
         assert resp.status_code == 200
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_UPDATED_RESULT):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_UPDATED_RESULT):
         resp = await client.post(f"/api/files/{second_file_id}/ocr")
         assert resp.status_code == 200
 
@@ -1213,7 +1213,7 @@ async def test_marker_tags_endpoint_includes_derived_tags_and_does_not_persist_t
     file_tag_resp = await client.put(f"/api/files/{file_id}/tags", json={"tags": ["fasting"]})
     assert file_tag_resp.status_code == 200
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
         resp = await client.post(f"/api/files/{file_id}/ocr")
         assert resp.status_code == 200
 
@@ -1250,7 +1250,7 @@ async def test_marker_tags_endpoint_includes_derived_tags_and_does_not_persist_t
 async def test_measurements_persist_with_measurement_type_references(client):
     file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=OCR_RESULT):
         resp = await client.post(f"/api/files/{file_id}/ocr")
         assert resp.status_code == 200
 
@@ -1276,7 +1276,7 @@ async def test_measurement_detail_uses_cached_explanation_until_values_change(cl
     first_file_id = await _upload_pdf(client)
     second_file_id = await _upload_pdf(client)
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_RESULT):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_RESULT):
         resp = await client.post(f"/api/files/{first_file_id}/ocr")
         assert resp.status_code == 200
 
@@ -1337,7 +1337,7 @@ async def test_measurement_detail_uses_cached_explanation_until_values_change(cl
     assert cached_detail["explanation"] == "cached platelet explanation"
     assert cached_detail["explanation_cached"] is True
 
-    with patch("illdashboard.services.ocr.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_UPDATED_RESULT):
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=OVERVIEW_UPDATED_RESULT):
         resp = await client.post(f"/api/files/{second_file_id}/ocr")
         assert resp.status_code == 200
 

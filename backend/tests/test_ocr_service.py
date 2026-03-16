@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from illdashboard.services import ocr as ocr_service
+from illdashboard.services import ocr_workflow as ocr_service
 
 
 class DummyDB:
@@ -17,9 +17,9 @@ async def test_stream_ocr_for_labs_logs_file_context_on_extraction_failure():
     db = DummyDB()
 
     with patch(
-        "illdashboard.services.ocr.extract_ocr_result",
+        "illdashboard.services.ocr_workflow.extract_ocr_result",
         new=AsyncMock(side_effect=RuntimeError("ocr failed")),
-    ), patch("illdashboard.services.ocr.logger") as logger_mock:
+    ), patch("illdashboard.services.ocr_workflow.logger") as logger_mock:
         events = [event async for event in ocr_service.stream_ocr_for_labs([lab], db)]
 
     assert any('"status": "error"' in event for event in events)

@@ -21,7 +21,7 @@ from illdashboard.config import settings
 from illdashboard.database import get_db
 from illdashboard.models import LabFile, LabFileTag, Measurement
 from illdashboard.schemas import BatchOcrRequest, LabFileOut, MeasurementOut, OcrJobStartResponse, OcrJobStatusResponse
-from illdashboard.services import ocr as ocr_service
+from illdashboard.services import ocr_workflow as ocr_service
 from illdashboard.services import search as search_service
 
 
