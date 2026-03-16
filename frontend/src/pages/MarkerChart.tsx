@@ -106,15 +106,15 @@ function renderPreferredMeasurementValue(
 ) {
   const renderedValue = formatPreferredMeasurementScalarValue(measurement);
   if (renderedValue === "—" || measurement.qualitative_value) {
-    return <span className="measurement-value-primary">{renderedValue}</span>;
+    return renderedValue;
   }
 
   const renderedUnit = formatPreferredMeasurementUnit(measurement);
   return renderedUnit === "—"
-    ? <span className="measurement-value-primary">{renderedValue}</span>
+    ? renderedValue
     : (
         <>
-          <span className="measurement-value-primary">{renderedValue}</span>
+          {renderedValue}
           <span className="measurement-value-unit"> {renderedUnit}</span>
         </>
       );

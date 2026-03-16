@@ -257,16 +257,12 @@ tr:hover td {
   color: inherit;
 }
 
-.marker-row .measurement-value-primary,
-.marker-row .measurement-value-unit {
+.marker-row .measurement-value-unit,
+.history-measurement-primary .measurement-value-unit {
   font-size: inherit;
   white-space: inherit;
   overflow: visible;
   text-overflow: clip;
-}
-
-.marker-row .measurement-value-primary {
-  color: inherit;
 }
 
 .measurement-value-unit,
