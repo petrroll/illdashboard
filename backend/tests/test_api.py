@@ -240,6 +240,34 @@ CASE_ONLY_CANONICAL_UNIT_RESULT = {
     ],
 }
 
+EGFR_SECONDS_RESULT = {
+    "lab_date": "2024-11-25",
+    "measurements": [
+        {
+            "marker_name": "Estimated Glomerular Filtration Rate (eGFR)",
+            "value": 2.07,
+            "unit": "ml/s/1.73 m2",
+            "reference_low": None,
+            "reference_high": None,
+            "measured_at": "2024-11-25",
+        },
+    ],
+}
+
+EGFR_SECONDS_COMMA_RESULT = {
+    "lab_date": "2024-11-25",
+    "measurements": [
+        {
+            "marker_name": "Estimated Glomerular Filtration Rate (eGFR)",
+            "value": 2.07,
+            "unit": "ml/s/1,73 m2",
+            "reference_low": None,
+            "reference_high": None,
+            "measured_at": "2024-11-25",
+        },
+    ],
+}
+
 
 async def _upload_pdf(client, filename: str = "lab.pdf"):
     """Helper: upload a dummy PDF and return the file_id."""
@@ -487,6 +515,48 @@ async def test_ocr_persists_and_reuses_rescaling_rules(client):
             assert rules[0].scale_factor == 0.001
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ocr_reuses_rescaling_rule_for_decimal_comma_unit_variant(client):
+    first_file_id = await _upload_pdf(client, filename="synlab-first.pdf")
+    second_file_id = await _upload_pdf(client, filename="synlab-second.pdf")
+
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=EGFR_SECONDS_RESULT), patch(
+        "illdashboard.copilot.normalization.normalize_marker_names",
+        new=AsyncMock(return_value={"Estimated Glomerular Filtration Rate (eGFR)": "Estimated Glomerular Filtration Rate (eGFR)"}),
+    ), patch(
+        "illdashboard.copilot.normalization.choose_canonical_units",
+        new=AsyncMock(return_value={"Estimated Glomerular Filtration Rate (eGFR)": "mL/min/1.73 m²"}),
+    ), patch(
+        "illdashboard.copilot.normalization.infer_rescaling_factors",
+        new=AsyncMock(return_value={"ml/s/1.73m2=>ml/min/1.73m²": 60.0}),
+    ) as infer_mock:
+        resp = await client.post(f"/api/files/{first_file_id}/ocr")
+        assert resp.status_code == 200
+        infer_mock.assert_awaited_once()
+        first_payload = resp.json()
+        assert first_payload[0]["original_value"] == 2.07
+        assert first_payload[0]["canonical_value"] == pytest.approx(124.2)
+
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=EGFR_SECONDS_COMMA_RESULT), patch(
+        "illdashboard.copilot.normalization.normalize_marker_names",
+        new=AsyncMock(return_value={"Estimated Glomerular Filtration Rate (eGFR)": "Estimated Glomerular Filtration Rate (eGFR)"}),
+    ), patch(
+        "illdashboard.copilot.normalization.choose_canonical_units",
+        new=AsyncMock(return_value={"Estimated Glomerular Filtration Rate (eGFR)": "mL/min/1.73 m²"}),
+    ), patch(
+        "illdashboard.copilot.normalization.infer_rescaling_factors",
+        new=AsyncMock(side_effect=AssertionError("stored rule should be reused for decimal-comma unit variants")),
+    ) as infer_mock:
+        resp = await client.post(f"/api/files/{second_file_id}/ocr")
+        assert resp.status_code == 200
+        infer_mock.assert_not_awaited()
+        second_payload = resp.json()
+        assert second_payload[0]["original_value"] == 2.07
+        assert second_payload[0]["canonical_value"] == pytest.approx(124.2)
+        assert second_payload[0]["original_unit"] == "ml/s/1,73 m2"
+        assert second_payload[0]["canonical_unit"] == "mL/min/1.73 m²"
 
 
 @pytest.mark.asyncio

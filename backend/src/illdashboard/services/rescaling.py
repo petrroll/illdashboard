@@ -31,6 +31,9 @@ def normalize_unit_key(unit: str | None) -> str | None:
     if not normalized:
         return None
 
+    # OCR often flips 1.73-style body-surface-area units to 1,73, but they
+    # should still reuse the same persisted conversion rule.
+    normalized = re.sub(r"(?<=\d),(?=\d)", ".", normalized)
     normalized = re.sub(r"\s+", "", normalized)
     normalized = normalized.casefold()
     normalized = normalized.replace("μ", "u")
