@@ -22,7 +22,6 @@ from illdashboard.database import async_session, engine
 from illdashboard.models import Base, LabFile, Measurement, MeasurementType, QualitativeRule, RescalingRule
 from illdashboard.services.markers import backfill_measurement_type_aliases, ensure_marker_groups
 
-
 PRELOADABLE_MIME_TYPES = {
     ".pdf": "application/pdf",
     ".png": "image/png",
