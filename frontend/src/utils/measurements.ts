@@ -1,6 +1,10 @@
 import type { Measurement } from "../types";
 
 const DIMENSIONLESS_UNIT = "1";
+const SIGNIFICANT_VALUE_FORMATTER = new Intl.NumberFormat(undefined, {
+  maximumSignificantDigits: 6,
+  useGrouping: false,
+});
 
 export type MarkerStatus = "low" | "high" | "in_range" | "no_range";
 
@@ -23,6 +27,16 @@ function normalizeUnitKey(unit?: string | null) {
 
 export function getDisplayUnit(unit?: string | null) {
   return unit && unit !== DIMENSIONLESS_UNIT ? unit : null;
+}
+
+// Recharts uses raw tick numbers, so axis labels need significant-digit rounding
+// to hide floating-point noise from unit conversions such as 39.9999999997.
+export function formatSignificantValue(value?: number | null) {
+  if (value == null || !Number.isFinite(value)) {
+    return "—";
+  }
+
+  return SIGNIFICANT_VALUE_FORMATTER.format(Object.is(value, -0) ? 0 : value);
 }
 
 export function isUnitConversionMissing(

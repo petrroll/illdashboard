@@ -223,15 +223,25 @@ async def measurement_sparkline(
 
     await annotate_missing_rescaling_measurements(db, measurements)
 
-    signature = insight_service.marker_signature(measurements)
+    sparkline_measurements = [
+        measurement
+        for measurement in measurements
+        if measurement.canonical_value is not None and not getattr(measurement, "unit_conversion_missing", False)
+    ]
+    if not sparkline_measurements:
+        sparkline_measurements = [measurement for measurement in measurements if measurement.canonical_value is not None]
+    if not sparkline_measurements:
+        raise HTTPException(404, "Marker not found")
+
+    signature = insight_service.marker_signature(sparkline_measurements)
     cached = get_cached_sparkline(marker_name, signature)
     if cached:
         return Response(content=cached, media_type="image/png", headers={"Cache-Control": "no-store"})
 
     png_bytes = generate_sparkline(
-        values=[measurement.canonical_value for measurement in measurements],
-        ref_low=measurements[-1].canonical_reference_low,
-        ref_high=measurements[-1].canonical_reference_high,
+        values=[measurement.canonical_value for measurement in sparkline_measurements],
+        ref_low=sparkline_measurements[-1].canonical_reference_low,
+        ref_high=sparkline_measurements[-1].canonical_reference_high,
         signature=signature,
         marker_name=marker_name,
     )

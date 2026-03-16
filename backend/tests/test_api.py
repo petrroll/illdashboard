@@ -622,6 +622,39 @@ async def test_ocr_flags_measurements_with_missing_unit_conversion_rules(client)
 
 
 @pytest.mark.asyncio
+async def test_sparkline_ignores_measurements_with_missing_unit_conversion_rules(client):
+    file_id = await _upload_pdf(client, filename="missing-conversion-sparkline.pdf")
+
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=CANONICAL_UNIT_RESULT), patch(
+        "illdashboard.copilot.normalization.normalize_marker_names",
+        new=AsyncMock(return_value={"Absolute CD4+ T-Helper Cell Count": "Absolute CD4+ T-Helper Cell Count"}),
+    ), patch(
+        "illdashboard.copilot.normalization.choose_canonical_units",
+        new=AsyncMock(return_value={"Absolute CD4+ T-Helper Cell Count": "10^9/L"}),
+    ), patch(
+        "illdashboard.copilot.normalization.infer_rescaling_factors",
+        new=AsyncMock(return_value={}),
+    ):
+        resp = await client.post(f"/api/files/{file_id}/ocr")
+
+    assert resp.status_code == 200
+
+    with patch("illdashboard.api.measurements.get_cached_sparkline", return_value=None), patch(
+        "illdashboard.api.measurements.generate_sparkline",
+        return_value=b"png",
+    ) as generate_sparkline_mock:
+        sparkline_resp = await client.get(
+            "/api/measurements/sparkline",
+            params={"marker_name": "Absolute CD4+ T-Helper Cell Count"},
+        )
+
+    assert sparkline_resp.status_code == 200
+    assert sparkline_resp.content == b"png"
+    generate_sparkline_mock.assert_called_once()
+    assert generate_sparkline_mock.call_args.kwargs["values"] == [0.38]
+
+
+@pytest.mark.asyncio
 async def test_ocr_deterministically_converts_ml_per_l_to_percent(client):
     file_id = await _upload_pdf(client, filename="plateletcrit.pdf")
 

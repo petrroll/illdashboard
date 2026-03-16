@@ -34,6 +34,7 @@ import {
   formatPreferredMeasurementUnit,
   formatPreferredMeasurementValue,
   formatPreferredReferenceRange,
+  formatSignificantValue,
   getCanonicalTrendValue,
   getDisplayUnit,
   getMarkerStatusLabel,
@@ -233,27 +234,32 @@ export default function MarkerChart() {
   }, [filteredOverview, selectedMarker]);
 
   const measurements = useMemo(() => detail?.measurements ?? [], [detail]);
+  const chartMeasurements = useMemo(
+    () => measurements.filter((measurement) => getCanonicalTrendValue(measurement) != null),
+    [measurements],
+  );
   const chartData = useMemo(
     () =>
-      measurements.map((measurement) => ({
+      chartMeasurements.map((measurement) => ({
         dateLabel: formatDate(measurement.measured_at),
         measuredAt: measurement.measured_at ?? "",
         value: getCanonicalTrendValue(measurement),
         reference_low: measurement.unit_conversion_missing ? null : measurement.canonical_reference_low,
         reference_high: measurement.unit_conversion_missing ? null : measurement.canonical_reference_high,
       })),
-    [measurements],
+    [chartMeasurements],
   );
   const hasMissingUnitConversions = useMemo(
     () => measurements.some((measurement) => isUnitConversionMissing(measurement)),
     [measurements],
   );
+  const latestChartMeasurement = chartMeasurements.at(-1) ?? null;
 
-  const unit = getDisplayUnit(detail?.latest_measurement.canonical_unit) ?? "";
-  const refLow = detail?.latest_measurement.canonical_reference_low ?? null;
-  const refHigh = detail?.latest_measurement.canonical_reference_high ?? null;
+  const unit = getDisplayUnit(latestChartMeasurement?.canonical_unit) ?? "";
+  const refLow = latestChartMeasurement?.canonical_reference_low ?? null;
+  const refHigh = latestChartMeasurement?.canonical_reference_high ?? null;
   const yAxisDomain: [number, number] = useMemo(() => {
-    const yAxisValues = measurements.flatMap((measurement) => {
+    const yAxisValues = chartMeasurements.flatMap((measurement) => {
       const values = [
         measurement.canonical_value,
         measurement.canonical_reference_low,
@@ -275,7 +281,7 @@ export default function MarkerChart() {
     const padding = span === 0 ? Math.max(Math.abs(max) * 0.1, 1) : span * 0.1;
 
     return [min - padding, max + padding];
-  }, [measurements]);
+  }, [chartMeasurements]);
 
   const selectMarker = (markerName: string) => {
     startTransition(() => {
@@ -614,47 +620,54 @@ export default function MarkerChart() {
                     Some history points stay in their original units because no conversion rule exists yet.
                   </p>
                 )}
-                <div className="chart-wrapper mb-1">
-                  <ResponsiveContainer width="100%" height={320}>
-                    <LineChart data={chartData}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#303c4d" />
-                      <XAxis dataKey="dateLabel" stroke="#96a1ae" />
-                      <YAxis
-                        domain={yAxisDomain}
-                        stroke="#96a1ae"
-                        width={84}
-                        label={{
-                          value: unit,
-                          angle: -90,
-                          position: "insideLeft",
-                        }}
-                      />
-                      <Tooltip
-                        formatter={(value) => formatMeasurementValue(Number(value ?? 0), unit)}
-                        labelFormatter={(label) => `Date: ${label}`}
-                        contentStyle={{ background: "#161d27", border: "1px solid #303c4d", borderRadius: "8px", color: "#edf1f7" }}
-                      />
-                      {refLow != null && refHigh != null && (
-                        <ReferenceArea y1={refLow} y2={refHigh} fill="#12c78e" fillOpacity={0.1} />
-                      )}
-                      {refLow != null && (
-                        <ReferenceLine y={refLow} stroke="#12c78e" strokeDasharray="5 5" label="Low" />
-                      )}
-                      {refHigh != null && (
-                        <ReferenceLine y={refHigh} stroke="#f85149" strokeDasharray="5 5" label="High" />
-                      )}
-                      <Line
-                        type="monotone"
-                        dataKey="value"
-                        stroke="#b575ff"
-                        strokeWidth={3}
-                        dot={{ r: 5, strokeWidth: 2 }}
-                        activeDot={{ r: 7 }}
-                        name={detail.marker_name}
-                      />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </div>
+                {chartMeasurements.length > 0 ? (
+                  <div className="chart-wrapper mb-1">
+                    <ResponsiveContainer width="100%" height={320}>
+                      <LineChart data={chartData}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#303c4d" />
+                        <XAxis dataKey="dateLabel" stroke="#96a1ae" />
+                        <YAxis
+                          domain={yAxisDomain}
+                          stroke="#96a1ae"
+                          width={96}
+                          tickFormatter={formatSignificantValue}
+                          label={{
+                            value: unit,
+                            angle: -90,
+                            position: "insideLeft",
+                          }}
+                        />
+                        <Tooltip
+                          formatter={(value) => formatMeasurementValue(Number(value ?? 0), unit)}
+                          labelFormatter={(label) => `Date: ${label}`}
+                          contentStyle={{ background: "#161d27", border: "1px solid #303c4d", borderRadius: "8px", color: "#edf1f7" }}
+                        />
+                        {refLow != null && refHigh != null && (
+                          <ReferenceArea y1={refLow} y2={refHigh} fill="#12c78e" fillOpacity={0.1} />
+                        )}
+                        {refLow != null && (
+                          <ReferenceLine y={refLow} stroke="#12c78e" strokeDasharray="5 5" label="Low" />
+                        )}
+                        {refHigh != null && (
+                          <ReferenceLine y={refHigh} stroke="#f85149" strokeDasharray="5 5" label="High" />
+                        )}
+                        <Line
+                          type="monotone"
+                          dataKey="value"
+                          stroke="#b575ff"
+                          strokeWidth={3}
+                          dot={{ r: 5, strokeWidth: 2 }}
+                          activeDot={{ r: 7 }}
+                          name={detail.marker_name}
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                ) : (
+                  <div className="card-empty detail-loading-block">
+                    Trend chart unavailable until at least one value has a valid conversion rule.
+                  </div>
+                )}
 
                 <div className="detail-history card">
                   <h3>History</h3>
