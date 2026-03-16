@@ -1,25 +1,26 @@
 """FastAPI application entry point."""
 
-import fitz
+import asyncio
 import logging
-from logging.config import dictConfig
 import mimetypes
 import time
 from contextlib import asynccontextmanager
+from logging.config import dictConfig
 from pathlib import Path
 
+import fitz
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
 
+import illdashboard.services.search as search_service
+from illdashboard.api import router
 from illdashboard.config import settings
 from illdashboard.copilot.client import prewarm_client, shutdown_client
-from illdashboard.api import router
 from illdashboard.database import async_session, engine
 from illdashboard.models import Base, LabFile, Measurement, MeasurementType, QualitativeRule, RescalingRule
 from illdashboard.services.markers import backfill_measurement_type_aliases, ensure_marker_groups
-import illdashboard.services.search as search_service
 
 
 PRELOADABLE_MIME_TYPES = {
@@ -133,6 +134,7 @@ async def preload_uploaded_files() -> int:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    prewarm_task: asyncio.Task[bool] | None = None
     # Create tables on startup
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -143,7 +145,10 @@ async def lifespan(app: FastAPI):
         await backfill_measurement_type_aliases(session)
         await search_service.ensure_search_schema(session)
         logger.info(
-            "Startup dataset counts lab_files=%s measurements=%s measurement_types=%s qualitative_rules=%s rescaling_rules=%s",
+            (
+                "Startup dataset counts lab_files=%s measurements=%s measurement_types=%s "
+                "qualitative_rules=%s rescaling_rules=%s"
+            ),
             await session.scalar(select(func.count()).select_from(LabFile)),
             await session.scalar(select(func.count()).select_from(Measurement)),
             await session.scalar(select(func.count()).select_from(MeasurementType)),
@@ -162,8 +167,15 @@ async def lifespan(app: FastAPI):
         await search_service.rebuild_lab_search_index(session)
         await session.commit()
     logger.info("Startup search index rebuild finished duration=%.2fs", time.perf_counter() - search_rebuild_started_at)
-    await prewarm_client()
+    prewarm_task = asyncio.create_task(prewarm_client())
+    logger.info("Scheduled Copilot client prewarm in background")
     yield
+    if prewarm_task is not None and not prewarm_task.done():
+        prewarm_task.cancel()
+        try:
+            await prewarm_task
+        except asyncio.CancelledError:
+            pass
     # Shutdown Copilot SDK client
     await shutdown_client()
 
