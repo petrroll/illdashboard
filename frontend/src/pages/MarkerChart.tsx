@@ -1,4 +1,4 @@
-import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import {
   LineChart,
@@ -74,6 +74,8 @@ export default function MarkerChart() {
   const [listPaneWidth, setListPaneWidth] = useState(getStoredListPaneWidth);
   const deferredSearch = useDeferredValue(search.trim().toLowerCase());
   const markerBrowserRef = useRef<HTMLDivElement | null>(null);
+  const markerListPanelRef = useRef<HTMLElement | null>(null);
+  const markerRowRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const [allMarkerTags, setAllMarkerTags] = useState<string[]>([]);
   const [filterTags, setFilterTags] = useState<string[]>([]);
 
@@ -199,6 +201,32 @@ export default function MarkerChart() {
     [deferredSearch, overview],
   );
 
+  // Keep deep-linked markers visible inside the list without nudging the page scroll.
+  useLayoutEffect(() => {
+    if (!selectedMarker) {
+      return;
+    }
+
+    const listPanel = markerListPanelRef.current;
+    const selectedRow = markerRowRefs.current.get(selectedMarker);
+    if (!listPanel || !selectedRow) {
+      return;
+    }
+
+    const listRect = listPanel.getBoundingClientRect();
+    const rowRect = selectedRow.getBoundingClientRect();
+    const padding = 12;
+
+    if (rowRect.top < listRect.top + padding) {
+      listPanel.scrollTop -= listRect.top + padding - rowRect.top;
+      return;
+    }
+
+    if (rowRect.bottom > listRect.bottom - padding) {
+      listPanel.scrollTop += rowRect.bottom - (listRect.bottom - padding);
+    }
+  }, [filteredOverview, selectedMarker]);
+
   const measurements = useMemo(() => detail?.measurements ?? [], [detail]);
   const chartData = useMemo(
     () =>
@@ -244,8 +272,11 @@ export default function MarkerChart() {
     startTransition(() => {
       setSelectedMarker(markerName);
       const nextParams = new URLSearchParams(searchParams);
+      if (nextParams.get("marker") === markerName) {
+        return;
+      }
       nextParams.set("marker", markerName);
-      setSearchParams(nextParams, { replace: true });
+      setSearchParams(nextParams, { replace: true, preventScrollReset: true });
     });
   };
 
@@ -336,7 +367,7 @@ export default function MarkerChart() {
       className="marker-browser"
       style={{ ["--marker-list-width" as string]: `${listPaneWidth}px` }}
     >
-      <section className="marker-list-panel card">
+      <section ref={markerListPanelRef} className="marker-list-panel card">
         <div className="marker-browser-header">
           <div>
             <h2>Biomarkers</h2>
@@ -420,6 +451,14 @@ export default function MarkerChart() {
                     return (
                       <button
                         key={item.marker_name}
+                        ref={(node) => {
+                          if (node) {
+                            markerRowRefs.current.set(item.marker_name, node);
+                            return;
+                          }
+
+                          markerRowRefs.current.delete(item.marker_name);
+                        }}
                         type="button"
                         className={`marker-row ${selectedMarker === item.marker_name ? "active" : ""}`}
                         onClick={() => selectMarker(item.marker_name)}
