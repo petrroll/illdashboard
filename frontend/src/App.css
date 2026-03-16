@@ -257,6 +257,10 @@ tr:hover td {
   color: inherit;
 }
 
+.measurement-value-unit {
+  color: var(--text);
+}
+
 /* ── Explanation panel ────────────────────────────────────────── */
 
 .explanation-panel {

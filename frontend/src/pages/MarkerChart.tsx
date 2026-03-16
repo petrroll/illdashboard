@@ -27,6 +27,7 @@ import type {
   MarkerDetailResponse,
   MarkerOverviewGroup,
   MarkerOverviewItem,
+  Measurement,
 } from "../types";
 import {
   formatDate,
@@ -34,6 +35,8 @@ import {
   getMeasurementValueClass,
   getOriginalMeasurementReferenceHigh,
   getOriginalMeasurementReferenceLow,
+  formatPreferredMeasurementScalarValue,
+  formatPreferredMeasurementUnit,
   formatPreferredMeasurementValue,
   formatPreferredReferenceRange,
   formatReferenceRange,
@@ -88,6 +91,33 @@ function getQualitativeStatusClassName(item: MarkerOverviewItem) {
     return "status-negative";
   }
   return `status-${item.status}`;
+}
+
+function renderPreferredMeasurementValue(
+  measurement: Pick<
+    Measurement,
+    | "unit_conversion_missing"
+    | "canonical_value"
+    | "canonical_unit"
+    | "qualitative_value"
+    | "original_value"
+    | "original_unit"
+  >,
+) {
+  const renderedValue = formatPreferredMeasurementScalarValue(measurement);
+  if (renderedValue === "—" || measurement.qualitative_value) {
+    return <span>{renderedValue}</span>;
+  }
+
+  const renderedUnit = formatPreferredMeasurementUnit(measurement);
+  return renderedUnit === "—"
+    ? <span>{renderedValue}</span>
+    : (
+        <>
+          <span>{renderedValue}</span>
+          <span className="measurement-value-unit"> {renderedUnit}</span>
+        </>
+      );
 }
 
 export default function MarkerChart() {
@@ -598,7 +628,7 @@ export default function MarkerChart() {
                         </div>
 
                         <div className={`marker-row-value ${latestValueClassName}`}>
-                          <strong>{formatPreferredMeasurementValue(latest)}</strong>
+                          <strong>{renderPreferredMeasurementValue(latest)}</strong>
                           <span>{latestValueNote}</span>
                         </div>
 
@@ -606,7 +636,7 @@ export default function MarkerChart() {
 
                         <div className={`marker-row-previous ${previousValueClassName}`}>
                           <strong>
-                            {previous ? formatPreferredMeasurementValue(previous) : "—"}
+                            {previous ? renderPreferredMeasurementValue(previous) : "—"}
                           </strong>
                           {otherCount > 0 && item.value_min != null && item.value_max != null && (
                             <span className="marker-row-history-note">
@@ -813,7 +843,7 @@ export default function MarkerChart() {
                                 qualitative_bool: measurement.qualitative_bool,
                               })}>
                                 <StackedMeasurementValue
-                                  primary={formatPreferredMeasurementValue(measurement)}
+                                  primary={renderPreferredMeasurementValue(measurement)}
                                   secondary={conversionMissing
                                     ? conversionWarning ?? undefined
                                     : showOriginalValue
