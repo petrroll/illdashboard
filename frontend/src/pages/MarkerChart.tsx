@@ -139,6 +139,7 @@ export default function MarkerChart() {
   const markerRowRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const [allMarkerTags, setAllMarkerTags] = useState<string[]>([]);
   const [filterTags, setFilterTags] = useState<string[]>([]);
+  const [timeWeightedAxis, setTimeWeightedAxis] = useState(false);
 
   const clampListPaneWidth = (nextWidth: number) => {
     const browserWidth = markerBrowserRef.current?.clientWidth ?? window.innerWidth;
@@ -298,6 +299,7 @@ export default function MarkerChart() {
       chartMeasurements.map((measurement) => ({
         dateLabel: formatDate(measurement.measured_at),
         measuredAt: measurement.measured_at ?? "",
+        timestamp: measurement.measured_at ? new Date(measurement.measured_at).getTime() : 0,
         value: getCanonicalTrendValue(measurement),
         reference_low: measurement.unit_conversion_missing ? null : measurement.canonical_reference_low,
         reference_high: measurement.unit_conversion_missing ? null : measurement.canonical_reference_high,
@@ -741,10 +743,32 @@ export default function MarkerChart() {
                 )}
                 {!hideDetailTrendChart && chartMeasurements.length > 0 ? (
                   <div className="chart-wrapper mb-1">
+                    <div className="chart-toolbar">
+                      <label className="toggle-switch">
+                        <input
+                          type="checkbox"
+                          checked={timeWeightedAxis}
+                          onChange={(e) => setTimeWeightedAxis(e.target.checked)}
+                        />
+                        <span className="toggle-track" />
+                        Time-proportional axis
+                      </label>
+                    </div>
                     <ResponsiveContainer width="100%" height={320}>
                       <LineChart data={chartData}>
                         <CartesianGrid strokeDasharray="3 3" stroke="#303c4d" />
-                        <XAxis dataKey="dateLabel" stroke="#96a1ae" />
+                        {timeWeightedAxis ? (
+                          <XAxis
+                            dataKey="timestamp"
+                            type="number"
+                            scale="time"
+                            domain={["dataMin", "dataMax"]}
+                            stroke="#96a1ae"
+                            tickFormatter={(ts: number) => formatDate(new Date(ts).toISOString())}
+                          />
+                        ) : (
+                          <XAxis dataKey="dateLabel" stroke="#96a1ae" />
+                        )}
                         <YAxis
                           domain={yAxisDomain}
                           stroke="#96a1ae"

@@ -631,6 +631,56 @@ input[type="file"] {
   padding: 1.25rem;
 }
 
+.chart-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 0.5rem;
+}
+
+.toggle-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  user-select: none;
+}
+
+.toggle-switch input {
+  display: none;
+}
+
+.toggle-track {
+  position: relative;
+  width: 32px;
+  height: 18px;
+  border-radius: 9px;
+  background: var(--border);
+  transition: background 0.15s;
+}
+
+.toggle-track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  transition: transform 0.15s, background 0.15s;
+}
+
+.toggle-switch input:checked + .toggle-track {
+  background: #b575ff55;
+}
+
+.toggle-switch input:checked + .toggle-track::after {
+  transform: translateX(14px);
+  background: #b575ff;
+}
+
 .checkbox-row {
   display: flex;
   align-items: center;
