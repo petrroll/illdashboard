@@ -507,6 +507,52 @@ export default function MarkerChart() {
                     const latest = item.latest_measurement;
                     const previous = item.previous_measurement;
                     const latestWarning = getUnitConversionWarning(latest);
+                    const latestOriginalValue = getOriginalMeasurementValue(latest);
+                    const latestOriginalReferenceLow = getOriginalMeasurementReferenceLow(latest);
+                    const latestOriginalReferenceHigh = getOriginalMeasurementReferenceHigh(latest);
+                    const latestConversionMissing = isUnitConversionMissing(latest);
+                    const latestStatusValue = latestConversionMissing
+                      ? latestOriginalValue
+                      : latest.canonical_value;
+                    const latestStatusReferenceLow = latestConversionMissing
+                      ? latestOriginalReferenceLow
+                      : latest.canonical_reference_low ?? item.reference_low;
+                    const latestStatusReferenceHigh = latestConversionMissing
+                      ? latestOriginalReferenceHigh
+                      : latest.canonical_reference_high ?? item.reference_high;
+                    const latestValueClassName = getMeasurementValueClass({
+                      value: latestStatusValue,
+                      reference_low: latestStatusReferenceLow,
+                      reference_high: latestStatusReferenceHigh,
+                      qualitative_bool: latest.qualitative_bool,
+                    });
+                    const previousOriginalValue = previous ? getOriginalMeasurementValue(previous) : null;
+                    const previousOriginalReferenceLow = previous ? getOriginalMeasurementReferenceLow(previous) : null;
+                    const previousOriginalReferenceHigh = previous ? getOriginalMeasurementReferenceHigh(previous) : null;
+                    const previousConversionMissing = previous ? isUnitConversionMissing(previous) : false;
+                    const previousStatusValue = previous
+                      ? previousConversionMissing
+                        ? previousOriginalValue
+                        : previous.canonical_value
+                      : null;
+                    const previousStatusReferenceLow = previous
+                      ? previousConversionMissing
+                        ? previousOriginalReferenceLow
+                        : previous.canonical_reference_low ?? item.reference_low
+                      : null;
+                    const previousStatusReferenceHigh = previous
+                      ? previousConversionMissing
+                        ? previousOriginalReferenceHigh
+                        : previous.canonical_reference_high ?? item.reference_high
+                      : null;
+                    const previousValueClassName = previous
+                      ? getMeasurementValueClass({
+                          value: previousStatusValue,
+                          reference_low: previousStatusReferenceLow,
+                          reference_high: previousStatusReferenceHigh,
+                          qualitative_bool: previous.qualitative_bool,
+                        })
+                      : "value-neutral";
                     const latestTrendValue = getCanonicalTrendValue(latest);
                     const previousTrendValue = previous ? getCanonicalTrendValue(previous) : null;
                     const delta =
@@ -551,14 +597,14 @@ export default function MarkerChart() {
                           </span>
                         </div>
 
-                        <div className="marker-row-value">
+                        <div className={`marker-row-value ${latestValueClassName}`}>
                           <strong>{formatPreferredMeasurementValue(latest)}</strong>
                           <span>{latestValueNote}</span>
                         </div>
 
                         <div className="marker-row-range">{rangeMeter(item)}</div>
 
-                        <div className="marker-row-previous">
+                        <div className={`marker-row-previous ${previousValueClassName}`}>
                           <strong>
                             {previous ? formatPreferredMeasurementValue(previous) : "—"}
                           </strong>
