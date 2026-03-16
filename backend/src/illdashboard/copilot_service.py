@@ -1366,6 +1366,104 @@ async def normalize_qualitative_values(
     return merged_mapping
 
 
+MARKER_GROUP_CLASSIFICATION_BATCH_SIZE = 40
+MARKER_GROUP_CLASSIFICATION_CONCURRENCY = 2
+
+
+MARKER_GROUP_SYSTEM_PROMPT = """\
+You are a medical lab data classification assistant. The user will give you:
+1. A list of EXISTING marker group names already used in the database.
+2. A list of biomarker names to classify.
+
+For each biomarker name, decide which group it belongs to.
+- Reuse an existing group name when the biomarker clearly belongs to that category.
+- If a biomarker does not fit any existing group, you may suggest a new concise group name,
+    but strongly prefer reusing an existing group when reasonable.
+- Use concise English group names such as "Blood Function", "Electrolytes", "Liver Function",
+    "Thyroid", "Lipids", "Kidney Function", "Hormones", etc.
+- When the biomarker is ambiguous or does not clearly belong to any medical category,
+    assign it to "Other".
+
+Examples of correct classification:
+- Hemoglobin, Platelet Count, White Blood Cell (WBC) Count, Red Blood Cell (RBC) Count, \
+Hematocrit, MCV, MCH, MCHC, RDW, Reticulocyte Count → "Blood Function"
+- Ferritin, Serum Iron, Transferrin, TIBC, UIBC → "Iron Status"
+- CRP, ESR, Procalcitonin, Sedimentation Rate → "Inflammation & Infection"
+- Glucose, HbA1c, Insulin, C-Peptide → "Metabolic"
+- Creatinine, Urea, eGFR, Uric Acid, Albumin/Creatinine Ratio → "Kidney Function"
+- Sodium, Potassium, Chloride, Magnesium, Bicarbonate, Calcium, Phosphate → "Electrolytes"
+- Urine pH, Urine Protein, Leukocyte Esterase, Specific Gravity, Ketones → "Urinalysis"
+- Total Cholesterol, Triglycerides, HDL, LDL, Apolipoprotein B → "Lipids"
+- ALT, AST, GGT, ALP, Bilirubin, Albumin, Total Protein → "Liver Function"
+- TSH, Free T4, Free T3, Thyroid Peroxidase Antibodies → "Thyroid"
+- Vitamin D, Vitamin B12, Folate, Zinc, Selenium → "Vitamins & Minerals"
+- Testosterone, Estradiol, Progesterone, LH, FSH, Cortisol, Prolactin, DHEA-S → "Hormones"
+- IgG, IgM, IgA, IgE, Anti-dsDNA Antibodies → "Immunity & Serology"
+- Specific IgE Cow's Milk, Specific IgE Egg White, Specific IgE Peanut, Specific IgE Wheat, \
+Specific IgE Soy, Specific IgE Dust Mite, Specific IgE Cat Dander, Specific IgE Dog Dander, \
+Specific IgE Grass Pollen, Specific IgE Tree Pollen, Phadiatop, Food Allergen Panel → "Allergens"
+
+Return ONLY valid JSON: a mapping object where keys are the biomarker names \
+and values are the group names.
+Example: {"Hemoglobin": "Blood Function", "Sodium": "Electrolytes", "TSH": "Thyroid"}
+Do not include any commentary outside the JSON.\
+"""
+
+
+def _build_marker_group_classification_user_text(batch_names: list[str], existing_groups: list[str]) -> str:
+    user_text = "EXISTING marker group names:\n"
+    if existing_groups:
+        for name in existing_groups:
+            user_text += f"- {name}\n"
+    else:
+        user_text += "(none yet)\n"
+
+    user_text += "\nBiomarker names to classify:\n"
+    for name in batch_names:
+        user_text += f"- {name}\n"
+    return user_text
+
+
+def _parse_marker_group_response(payload: dict, batch_names: list[str]) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for name in batch_names:
+        group_name = payload.get(name) if isinstance(payload, dict) else None
+        if not isinstance(group_name, str) or not group_name.strip():
+            group_name = "Other"
+        normalized[name] = group_name.strip()
+    return normalized
+
+
+async def classify_marker_groups(new_names: list[str], existing_groups: list[str]) -> dict[str, str]:
+    """Use the LLM to classify biomarker names into groups.
+
+    Args:
+        new_names: Marker names to classify.
+        existing_groups: Group names already in the database.
+
+    Returns:
+        Dict mapping each marker name to a group name.
+    """
+    if not new_names:
+        return {}
+
+    merged_mapping: dict[str, str] = {}
+    for batch_mapping in await _run_json_batches(
+        new_names,
+        batch_size=MARKER_GROUP_CLASSIFICATION_BATCH_SIZE,
+        concurrency=MARKER_GROUP_CLASSIFICATION_CONCURRENCY,
+        system_prompt=MARKER_GROUP_SYSTEM_PROMPT,
+        build_user_text=lambda batch_names: _build_marker_group_classification_user_text(
+            batch_names,
+            existing_groups,
+        ),
+        parse_payload=_parse_marker_group_response,
+    ):
+        merged_mapping.update(batch_mapping)
+
+    return merged_mapping
+
+
 # ── Explanations ─────────────────────────────────────────────────────────────
 
 EXPLAIN_SYSTEM_PROMPT = """\

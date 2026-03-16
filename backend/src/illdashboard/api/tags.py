@@ -83,10 +83,11 @@ async def set_marker_tags(marker_name: str, body: TagsUpdate, db: AsyncSession =
         await db.delete(tag)
     await db.flush()
 
+    reserved_tags = await marker_service.all_reserved_marker_tags(db, measurement_type.group_name)
     unique_tags = [
         tag
         for tag in marker_service.normalize_unique_tags(body.tags)
-        if tag not in marker_service.all_reserved_marker_tags(measurement_type.group_name)
+        if tag not in reserved_tags
     ]
     for tag in unique_tags:
         db.add(MarkerTag(measurement_type_id=measurement_type.id, tag=tag))

@@ -40,6 +40,18 @@ class LabFile(Base):
     )
 
 
+class MarkerGroup(Base):
+    """A canonical marker group (e.g. Blood Function, Electrolytes)."""
+
+    __tablename__ = "marker_groups"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    measurement_types: Mapped[list[MeasurementType]] = relationship(back_populates="group")
+
+
 class MeasurementType(Base):
     """Canonical definition for a biomarker / measurement type."""
 
@@ -48,8 +60,14 @@ class MeasurementType(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
     group_name: Mapped[str] = mapped_column(String, nullable=False)
+    group_id: Mapped[int | None] = mapped_column(
+        ForeignKey("marker_groups.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     canonical_unit: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    group: Mapped[MarkerGroup | None] = relationship(back_populates="measurement_types")
     measurements: Mapped[list[Measurement]] = relationship(back_populates="measurement_type")
     tags: Mapped[list[MarkerTag]] = relationship(
         back_populates="measurement_type",

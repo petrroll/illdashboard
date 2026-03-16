@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 from collections import defaultdict
@@ -10,25 +11,60 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from illdashboard.models import BiomarkerInsight, LabFile, MarkerTag, Measurement, MeasurementAlias, MeasurementType
+from illdashboard.models import BiomarkerInsight, LabFile, MarkerGroup, MarkerTag, Measurement, MeasurementAlias, MeasurementType
 
 
-GROUP_ORDER = [
-    "Blood Function",
-    "Iron Status",
-    "Inflammation & Infection",
-    "Metabolic",
-    "Kidney Function",
-    "Electrolytes",
-    "Urinalysis",
-    "Lipids",
-    "Liver Function",
-    "Thyroid",
-    "Vitamins & Minerals",
-    "Hormones",
-    "Immunity & Serology",
-    "Other",
+logger = logging.getLogger(__name__)
+
+DEFAULT_GROUP_NAME = "Other"
+
+SEED_GROUPS: list[tuple[str, int]] = [
+    ("Blood Function", 10),
+    ("Iron Status", 20),
+    ("Inflammation & Infection", 30),
+    ("Metabolic", 40),
+    ("Kidney Function", 50),
+    ("Electrolytes", 60),
+    ("Urinalysis", 70),
+    ("Lipids", 80),
+    ("Liver Function", 90),
+    ("Thyroid", 100),
+    ("Vitamins & Minerals", 110),
+    ("Hormones", 120),
+    ("Immunity & Serology", 130),
+    ("Allergens", 140),
+    ("Other", 1000),
 ]
+
+
+async def ensure_marker_groups(db: AsyncSession) -> dict[str, MarkerGroup]:
+    """Seed canonical marker groups if they don't exist. Return all groups by name."""
+    result = await db.execute(select(MarkerGroup))
+    existing = {group.name: group for group in result.scalars().all()}
+
+    for name, display_order in SEED_GROUPS:
+        if name in existing:
+            if existing[name].display_order != display_order:
+                existing[name].display_order = display_order
+            continue
+        group = MarkerGroup(name=name, display_order=display_order)
+        db.add(group)
+        existing[name] = group
+
+    await db.flush()
+    return existing
+
+
+async def load_group_order(db: AsyncSession) -> list[str]:
+    """Return group names ordered by display_order."""
+    result = await db.execute(select(MarkerGroup).order_by(MarkerGroup.display_order.asc()))
+    return [group.name for group in result.scalars().all()]
+
+
+async def load_marker_groups(db: AsyncSession) -> dict[str, MarkerGroup]:
+    """Return all marker groups keyed by name."""
+    result = await db.execute(select(MarkerGroup))
+    return {group.name: group for group in result.scalars().all()}
 SINGLE_MEASUREMENT_TAG = "singlemeasurement"
 MULTIPLE_MEASUREMENTS_TAG = "multiplemeasurements"
 SOURCE_TAG_PREFIX = "source:"
@@ -105,11 +141,12 @@ def combine_marker_tags(stored_tags: list[str], group_name: str, measurement_cou
     return normalize_unique_tags([*stored_tags, *derived_marker_tags(group_name, measurement_count)])
 
 
-def all_reserved_marker_tags(group_name: str | None = None) -> set[str]:
+async def all_reserved_marker_tags(db: AsyncSession, group_name: str | None = None) -> set[str]:
+    group_names = await load_group_order(db)
     reserved_tags = {
         SINGLE_MEASUREMENT_TAG,
         MULTIPLE_MEASUREMENTS_TAG,
-        *(marker_group_tag(group) for group in GROUP_ORDER),
+        *(marker_group_tag(group) for group in group_names),
     }
     if group_name:
         reserved_tags.add(marker_group_tag(group_name))
@@ -216,86 +253,64 @@ async def backfill_measurement_type_aliases(db: AsyncSession) -> None:
     )
 
 
-def marker_matches(name: str, keywords: tuple[str, ...], patterns: tuple[str, ...] = ()) -> bool:
-    return any(keyword in name for keyword in keywords) or any(re.search(pattern, name) for pattern in patterns)
+async def classify_marker_groups(
+    names: list[str],
+    existing_groups: list[str],
+) -> dict[str, str]:
+    """Use the LLM to classify marker names into groups.
+
+    Falls back to DEFAULT_GROUP_NAME when the LLM is unavailable.
+    """
+    if not names:
+        return {}
+
+    from illdashboard.copilot_service import classify_marker_groups as llm_classify
+
+    try:
+        return await llm_classify(names, existing_groups)
+    except Exception:
+        logger.warning("LLM marker group classification failed; defaulting to '%s'", DEFAULT_GROUP_NAME)
+        return {name: DEFAULT_GROUP_NAME for name in names}
 
 
-def classify_marker_group(name: str) -> str:
-    marker = normalized_marker_key(name)
+async def _resolve_marker_group_names(
+    db: AsyncSession,
+    names: list[str],
+) -> dict[str, str]:
+    """Resolve group names for a list of marker names.
 
-    if marker_matches(
-        marker,
-        (
-            "wbc",
-            "white blood",
-            "neutroph",
-            "lymph",
-            "monocyt",
-            "eosinoph",
-            "basoph",
-            "platelet",
-            "hemoglobin",
-            "hematocrit",
-            "mcv",
-            "mch",
-            "mchc",
-            "rdw",
-            "reticul",
-            "red blood",
-            "rbc",
-            "lymfocyt",
-            "neutrofil",
-            "bazofil",
-            "eozinofil",
-            "hematokrit",
-            "tromb",
-            "granulocyt",
-        ),
-    ):
-        return "Blood Function"
-    if marker_matches(marker, ("ferritin", "iron", "transferrin", "tibc", "uibc")):
-        return "Iron Status"
-    if marker_matches(marker, ("crp", "sedimentation", "procalcitonin", "esr")):
-        return "Inflammation & Infection"
-    if marker_matches(marker, ("glucose", "hba1c", "insulin", "c peptide", "c-peptide")):
-        return "Metabolic"
-    if marker_matches(marker, ("creatin", "urea", "egfr", "uric acid", "albumin/creatinine")):
-        return "Kidney Function"
-    if marker_matches(
-        marker,
-        (
-            "sodium",
-            "potassium",
-            "chloride",
-            "bicarbonate",
-            "carbon dioxide",
-            "anion gap",
-            "osmolality",
-            "bicarb",
-            "magnesium",
-            "horcik",
-        ),
-        (r"\bna(?:\+)?\b", r"\bk(?:\+)?\b", r"\bcl(?:-)?\b", r"\bhco3(?:-)??\b", r"\bco2\b", r"\bmg\b"),
-    ):
-        return "Electrolytes"
-    if marker_matches(marker, ("urine", "leukocyte esterase", "nitrite", "specific gravity", "ketone", "proteinuria", "moci")):
-        return "Urinalysis"
-    if marker_matches(marker, ("cholesterol", "triglycer", "hdl", "ldl", "apolipoprotein", "lipoprotein")):
-        return "Lipids"
-    if marker_matches(marker, ("alt", "ast", "ggt", "alp", "bilirubin", "albumin", "protein")):
-        return "Liver Function"
-    if marker_matches(marker, ("tsh", "ft4", "free t4", "ft3", "free t3", "thyroid")):
-        return "Thyroid"
-    if marker_matches(
-        marker,
-        ("vitamin", "folate", "folic", "b12", "zinc", "selenium", "calcium", "phosphate", "phosphorus", "vapnik"),
-    ):
-        return "Vitamins & Minerals"
-    if marker_matches(marker, ("testosterone", "estradiol", "progesterone", "lh", "fsh", "cortisol", "prolactin", "dhea", "hcg")):
-        return "Hormones"
-    if marker_matches(marker, ("igg", "igm", "iga", "ige", "antibod", "protilatk")):
-        return "Immunity & Serology"
-    return "Other"
+    Uses existing MeasurementType assignments first, then falls back to LLM.
+    """
+    result = await db.execute(
+        select(MeasurementType.name, MeasurementType.group_name)
+        .where(MeasurementType.name.in_(names))
+    )
+    known = {row[0]: row[1] for row in result.all()}
+
+    unclassified = [name for name in names if name not in known]
+    if not unclassified:
+        return known
+
+    group_names = await load_group_order(db)
+    llm_groups = await classify_marker_groups(unclassified, group_names)
+    return {**known, **llm_groups}
+
+
+async def _ensure_group_exists(db: AsyncSession, group_name: str, groups_by_name: dict[str, MarkerGroup]) -> MarkerGroup:
+    """Return an existing MarkerGroup or create a new one."""
+    group = groups_by_name.get(group_name)
+    if group is not None:
+        return group
+
+    max_order_result = await db.execute(
+        select(MarkerGroup.display_order).order_by(MarkerGroup.display_order.desc()).limit(1)
+    )
+    max_order = max_order_result.scalar_one_or_none() or 0
+    group = MarkerGroup(name=group_name, display_order=max_order + 10)
+    db.add(group)
+    await db.flush()
+    groups_by_name[group_name] = group
+    return group
 
 
 async def ensure_measurement_types(db: AsyncSession, names: list[str]) -> dict[str, MeasurementType]:
@@ -306,19 +321,20 @@ async def ensure_measurement_types(db: AsyncSession, names: list[str]) -> dict[s
     result = await db.execute(select(MeasurementType).where(MeasurementType.name.in_(unique_names)))
     by_name = {measurement_type.name: measurement_type for measurement_type in result.scalars().all()}
 
-    for name in unique_names:
-        if name in by_name:
-            measurement_type = by_name[name]
-            expected_group = classify_marker_group(name)
-            if measurement_type.group_name != expected_group:
-                measurement_type.group_name = expected_group
-            continue
+    new_names = [name for name in unique_names if name not in by_name]
+    if new_names:
+        group_assignments = await _resolve_marker_group_names(db, new_names)
+        groups_by_name = await load_marker_groups(db)
 
-        measurement_type = MeasurementType(name=name, group_name=classify_marker_group(name))
-        db.add(measurement_type)
-        by_name[name] = measurement_type
+        for name in new_names:
+            group_name = group_assignments.get(name, DEFAULT_GROUP_NAME)
+            group = await _ensure_group_exists(db, group_name, groups_by_name)
+            measurement_type = MeasurementType(name=name, group_name=group_name, group_id=group.id)
+            db.add(measurement_type)
+            by_name[name] = measurement_type
 
-    await db.flush()
+        await db.flush()
+
     await ensure_measurement_type_aliases(db, [(name, by_name[name]) for name in unique_names])
     return by_name
 
@@ -353,8 +369,6 @@ async def load_measurements_for_marker(db: AsyncSession, marker_name: str) -> li
 async def merge_measurement_types(source: MeasurementType, target: MeasurementType, db: AsyncSession) -> None:
     if source.id == target.id:
         return
-
-    target.group_name = classify_marker_group(target.name)
 
     measurements_result = await db.execute(select(Measurement).where(Measurement.measurement_type_id == source.id))
     for measurement in measurements_result.scalars().all():

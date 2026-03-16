@@ -89,10 +89,19 @@ async def measurement_overview(
         payload["file_tags"] = marker_file_tag_map.get(marker_name, [])
         grouped_items[payload["group_name"]].append(MarkerOverviewItem(**payload))
 
+    group_order = await marker_service.load_group_order(db)
+    group_order_set = set(group_order)
     groups: list[MarkerOverviewGroup] = []
-    for group_name in marker_service.GROUP_ORDER:
+    for group_name in group_order:
         if group_name not in grouped_items:
             continue
+        groups.append(
+            MarkerOverviewGroup(
+                group_name=group_name,
+                markers=sorted(grouped_items[group_name], key=lambda item: item.marker_name),
+            )
+        )
+    for group_name in sorted(grouped_items.keys() - group_order_set):
         groups.append(
             MarkerOverviewGroup(
                 group_name=group_name,
