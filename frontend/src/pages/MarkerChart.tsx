@@ -595,7 +595,7 @@ export default function MarkerChart() {
                       ? "First result"
                       : delta != null
                       ? `${delta > 0 ? "+" : ""}${formatMeasurementValue(delta, latest.canonical_unit)}`
-                      : `Previous on ${formatDate(previous.measured_at)}`;
+                      : "";
                     const otherCount = item.total_count - 1 - (previous ? 1 : 0);
 
                     return (
@@ -615,16 +615,7 @@ export default function MarkerChart() {
                       >
                         <div className="marker-row-name">
                           <strong>{item.marker_name}</strong>
-                          <span>
-                            {formatDate(latest.measured_at)}
-                            {item.tags.length > 0 && (
-                              <span className="tag-list" style={{ marginLeft: "0.3rem" }}>
-                                {item.tags.map((t) => (
-                                  <span key={t} className="tag-pill" style={{ fontSize: "0.7rem" }}>{t}</span>
-                                ))}
-                              </span>
-                            )}
-                          </span>
+                          <span className="marker-row-date">{formatDate(latest.measured_at)}</span>
                         </div>
 
                         <div className={`marker-row-value ${latestValueClassName}`}>
