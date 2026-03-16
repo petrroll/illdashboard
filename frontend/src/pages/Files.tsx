@@ -23,14 +23,53 @@ interface OcrSummary {
   errorCount: number;
 }
 
+const ACTIVE_STATUS_PRIORITY: Record<OcrProgress["status"], number> = {
+  persisting: 0,
+  extracting: 1,
+  extracted: 2,
+  queued: 3,
+  done: 4,
+  error: 4,
+};
+
+function isActiveOcrStatus(status: OcrProgress["status"]) {
+  return status !== "done" && status !== "error";
+}
+
+function formatOcrStatusLabel(status: OcrProgress["status"]) {
+  switch (status) {
+    case "queued":
+      return "Queued";
+    case "extracting":
+      return "Extracting";
+    case "extracted":
+      return "Extracted";
+    case "persisting":
+      return "Persisting";
+    case "done":
+      return "Processed";
+    case "error":
+      return "Error";
+  }
+}
+
 function summarizeOcrProgress(progressByFile: Map<number, OcrProgress>): OcrSummary | null {
-  const entries = Array.from(progressByFile.values());
+  const entries = Array.from(progressByFile.values()).sort((left, right) => left.index - right.index);
   if (entries.length === 0) {
     return null;
   }
 
+  const activeEntries = entries.filter((entry) => isActiveOcrStatus(entry.status));
+  const latest = activeEntries.sort((left, right) => {
+    const priorityDelta = ACTIVE_STATUS_PRIORITY[left.status] - ACTIVE_STATUS_PRIORITY[right.status];
+    if (priorityDelta !== 0) {
+      return priorityDelta;
+    }
+    return left.index - right.index;
+  })[0] ?? entries[entries.length - 1];
+
   return {
-    latest: entries[entries.length - 1],
+    latest,
     completedCount: entries.filter((entry) => entry.status === "done").length,
     errorCount: entries.filter((entry) => entry.status === "error").length,
   };
@@ -186,10 +225,26 @@ export default function Files() {
   const renderOcrStatus = (file: LabFile) => {
     const progress = fileProgress.get(file.id);
 
-    if (progress?.status === "processing") {
+    if (progress?.status === "queued") {
+      return <span className="badge badge-warning">Queued</span>;
+    }
+
+    if (progress?.status === "extracting") {
       return (
         <span className="badge badge-info">
-          <span className="spinner" style={{ width: 12, height: 12 }} /> Processing…
+          <span className="spinner" style={{ width: 12, height: 12 }} /> Extracting…
+        </span>
+      );
+    }
+
+    if (progress?.status === "extracted") {
+      return <span className="badge badge-info">Extracted</span>;
+    }
+
+    if (progress?.status === "persisting") {
+      return (
+        <span className="badge badge-info">
+          <span className="spinner" style={{ width: 12, height: 12 }} /> Persisting…
         </span>
       );
     }
@@ -200,6 +255,10 @@ export default function Files() {
           Error
         </span>
       );
+    }
+
+    if (progress?.status === "done") {
+      return <span className="badge badge-success">Done</span>;
     }
 
     if (file.ocr_raw) {
@@ -258,8 +317,8 @@ export default function Files() {
                   marginBottom: "0.25rem",
                 }}
               >
-                {ocrSummary.latest.status === "processing"
-                  ? `Processing ${ocrSummary.latest.filename}… (${ocrSummary.completedCount + ocrSummary.errorCount}/${ocrSummary.latest.total})`
+                {isActiveOcrStatus(ocrSummary.latest.status)
+                  ? `${formatOcrStatusLabel(ocrSummary.latest.status)} ${ocrSummary.latest.filename}… (${ocrSummary.completedCount + ocrSummary.errorCount}/${ocrSummary.latest.total})`
                   : `Processed ${ocrSummary.completedCount + ocrSummary.errorCount}/${ocrSummary.latest.total}`}
               </div>
               <div

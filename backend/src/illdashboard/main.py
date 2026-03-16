@@ -1,21 +1,23 @@
 """FastAPI application entry point."""
 
+import fitz
 import logging
 from logging.config import dictConfig
 import mimetypes
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from illdashboard.config import settings
-from illdashboard.copilot.client import shutdown_client
+from illdashboard.copilot.client import prewarm_client, shutdown_client
 from illdashboard.api import router
 from illdashboard.database import async_session, engine
-from illdashboard.models import Base, LabFile
+from illdashboard.models import Base, LabFile, Measurement, MeasurementType, QualitativeRule, RescalingRule
 from illdashboard.services.markers import backfill_measurement_type_aliases, ensure_marker_groups
 import illdashboard.services.search as search_service
 
@@ -71,6 +73,18 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 
+def _preload_page_count(file_path: Path, mime_type: str) -> int | None:
+    if mime_type != "application/pdf":
+        return 1
+
+    try:
+        with fitz.open(str(file_path)) as document:
+            return document.page_count
+    except Exception:
+        logger.exception("Unable to inspect preload file page count path=%s", file_path.name)
+        return None
+
+
 async def preload_uploaded_files() -> int:
     """Seed missing lab file rows from files already present in the upload folder."""
     upload_dir = Path(settings.UPLOAD_DIR)
@@ -91,6 +105,15 @@ async def preload_uploaded_files() -> int:
                 if guessed_mime_type not in PRELOADABLE_MIME_TYPES.values():
                     continue
                 mime_type = guessed_mime_type
+
+            logger.info(
+                "Startup preload file filepath=%s mime_type=%s size_kb=%.1f page_count=%s position=%s",
+                file_path.name,
+                mime_type,
+                file_path.stat().st_size / 1024,
+                _preload_page_count(file_path, mime_type),
+                added + 1,
+            )
 
             session.add(
                 LabFile(
@@ -114,19 +137,32 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     # Create FTS5 virtual table for search (not handled by SQLAlchemy metadata)
+    startup_counts_started_at = time.perf_counter()
     async with async_session() as session:
         await ensure_marker_groups(session)
         await backfill_measurement_type_aliases(session)
         await search_service.ensure_search_schema(session)
+        logger.info(
+            "Startup dataset counts lab_files=%s measurements=%s measurement_types=%s qualitative_rules=%s rescaling_rules=%s",
+            await session.scalar(select(func.count()).select_from(LabFile)),
+            await session.scalar(select(func.count()).select_from(Measurement)),
+            await session.scalar(select(func.count()).select_from(MeasurementType)),
+            await session.scalar(select(func.count()).select_from(QualitativeRule)),
+            await session.scalar(select(func.count()).select_from(RescalingRule)),
+        )
         await session.commit()
+    logger.info("Startup schema preparation finished duration=%.2fs", time.perf_counter() - startup_counts_started_at)
     # Ensure upload directory exists
     Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
     preloaded_files = await preload_uploaded_files()
     if preloaded_files:
         logger.info("Preloaded %s uploaded files from disk", preloaded_files)
+    search_rebuild_started_at = time.perf_counter()
     async with async_session() as session:
         await search_service.rebuild_lab_search_index(session)
         await session.commit()
+    logger.info("Startup search index rebuild finished duration=%.2fs", time.perf_counter() - search_rebuild_started_at)
+    await prewarm_client()
     yield
     # Shutdown Copilot SDK client
     await shutdown_client()

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import re
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
@@ -12,6 +14,9 @@ from illdashboard.copilot.client import _ask
 from illdashboard.services.markers import normalize_marker_alias_key
 from illdashboard.services.qualitative_values import normalize_qualitative_key
 from illdashboard.services.rescaling import normalize_unit_key
+
+
+logger = logging.getLogger(__name__)
 
 
 MARKER_NORMALIZATION_BATCH_SIZE = 40
@@ -43,10 +48,17 @@ async def _ask_json(
     attachments: list[dict] | None = None,
     timeout: float = 120,
     default: dict | None = None,
+    request_name: str = "normalization_json_request",
 ) -> dict:
     from illdashboard.copilot.client import _parse_json_response
 
-    raw = await _ask(system_prompt, user_prompt, attachments=attachments, timeout=timeout)
+    raw = await _ask(
+        system_prompt,
+        user_prompt,
+        attachments=attachments,
+        timeout=timeout,
+        request_name=request_name,
+    )
     try:
         return _parse_json_response(raw)
     except Exception:
@@ -117,12 +129,18 @@ async def _run_json_batches(
     *,
     batch_size: int,
     concurrency: int,
+    request_name: str,
     system_prompt: str,
     build_user_text: Callable[[list], str],
     parse_payload: Callable[[dict, list], dict],
 ) -> list[dict]:
     async def _run_batch(batch_items: list) -> dict:
-        payload = await _ask_json(system_prompt, build_user_text(batch_items), default={})
+        payload = await _ask_json(
+            system_prompt,
+            build_user_text(batch_items),
+            default={},
+            request_name=request_name,
+        )
         return parse_payload(payload, batch_items)
 
     return await _run_batched_tasks(
@@ -555,6 +573,15 @@ async def normalize_marker_names(new_names: list[str], existing_canonical: list[
     if not new_names:
         return {}
 
+    started_at = time.perf_counter()
+    logger.info(
+        "Normalize marker names start new_names=%s existing_canonical=%s batch_size=%s concurrency=%s",
+        len(new_names),
+        len(existing_canonical),
+        MARKER_NORMALIZATION_BATCH_SIZE,
+        MARKER_NORMALIZATION_CONCURRENCY,
+    )
+
     existing_by_key: dict[str, str] = {}
     for canonical_name in existing_canonical:
         normalized_key = _normalize_marker_lookup_key(canonical_name)
@@ -588,6 +615,7 @@ async def normalize_marker_names(new_names: list[str], existing_canonical: list[
         representative_names,
         batch_size=MARKER_NORMALIZATION_BATCH_SIZE,
         concurrency=MARKER_NORMALIZATION_CONCURRENCY,
+        request_name="normalize_marker_names",
         system_prompt=NORMALIZE_SYSTEM_PROMPT,
         build_user_text=lambda batch_names: _build_marker_name_normalization_user_text(batch_names, existing_canonical),
         parse_payload=_parse_marker_name_response,
@@ -597,6 +625,13 @@ async def normalize_marker_names(new_names: list[str], existing_canonical: list[
             for original_name in names_by_key.get(normalized_key, [representative_name]):
                 merged_mapping[original_name] = canonical_name
 
+    logger.info(
+        "Normalize marker names finished input_names=%s representative_names=%s resolved=%s duration=%.2fs",
+        len(new_names),
+        len(representative_names),
+        len(merged_mapping),
+        time.perf_counter() - started_at,
+    )
     return merged_mapping
 
 
@@ -619,19 +654,46 @@ async def normalize_source_name(
     user_text += f"\nOCR-detected source: {source_name or '(none)'}\n"
     user_text += f"Original filename: {filename or '(none)'}\n"
 
-    payload = await _ask_json(SOURCE_NORMALIZE_SYSTEM_PROMPT, user_text, default={})
+    started_at = time.perf_counter()
+    logger.info(
+        "Normalize source start source_present=%s filename_present=%s existing_canonical=%s",
+        bool(source_name),
+        bool(filename),
+        len(existing_canonical),
+    )
+    payload = await _ask_json(
+        SOURCE_NORMALIZE_SYSTEM_PROMPT,
+        user_text,
+        default={},
+        request_name="normalize_source_name",
+    )
     normalized_source = payload.get("source")
     if normalized_source is None or not isinstance(normalized_source, str):
+        logger.info("Normalize source finished normalized=%s duration=%.2fs", False, time.perf_counter() - started_at)
         return None
 
     normalized_source = normalized_source.strip()
-    return normalized_source or None
+    result = normalized_source or None
+    logger.info(
+        "Normalize source finished normalized=%s duration=%.2fs",
+        bool(result),
+        time.perf_counter() - started_at,
+    )
+    return result
 
 
 async def choose_canonical_units(marker_groups: list[MarkerUnitGroup]) -> dict[str, str | None]:
     """Choose canonical units for numeric marker groups."""
     if not marker_groups:
         return {}
+
+    started_at = time.perf_counter()
+    logger.info(
+        "Choose canonical units start marker_groups=%s batch_size=%s concurrency=%s",
+        len(marker_groups),
+        UNIT_NORMALIZATION_BATCH_SIZE,
+        UNIT_NORMALIZATION_CONCURRENCY,
+    )
 
     canonical_units: dict[str, str | None] = {}
     unresolved_groups: list[MarkerUnitGroup] = []
@@ -649,12 +711,20 @@ async def choose_canonical_units(marker_groups: list[MarkerUnitGroup]) -> dict[s
         unresolved_groups,
         batch_size=UNIT_NORMALIZATION_BATCH_SIZE,
         concurrency=UNIT_NORMALIZATION_CONCURRENCY,
+        request_name="choose_canonical_units",
         system_prompt=UNIT_CANONICAL_SYSTEM_PROMPT,
         build_user_text=_build_marker_group_user_text,
         parse_payload=_parse_canonical_unit_response,
     ):
         merged_mapping.update(batch_mapping)
 
+    logger.info(
+        "Choose canonical units finished marker_groups=%s unresolved_groups=%s resolved=%s duration=%.2fs",
+        len(marker_groups),
+        len(unresolved_groups),
+        len(merged_mapping),
+        time.perf_counter() - started_at,
+    )
     return merged_mapping
 
 
@@ -662,6 +732,14 @@ async def infer_rescaling_factors(conversion_requests: list[UnitConversionReques
     """Infer multiplicative scale factors for unit pairs."""
     if not conversion_requests:
         return {}
+
+    started_at = time.perf_counter()
+    logger.info(
+        "Infer rescaling factors start conversion_requests=%s batch_size=%s concurrency=%s",
+        len(conversion_requests),
+        UNIT_NORMALIZATION_BATCH_SIZE,
+        UNIT_NORMALIZATION_CONCURRENCY,
+    )
 
     merged_mapping: dict[str, float | None] = {}
     unresolved_requests: list[UnitConversionRequest] = []
@@ -679,11 +757,21 @@ async def infer_rescaling_factors(conversion_requests: list[UnitConversionReques
         unresolved_requests,
         batch_size=UNIT_NORMALIZATION_BATCH_SIZE,
         concurrency=UNIT_NORMALIZATION_CONCURRENCY,
+        request_name="infer_rescaling_factors",
         system_prompt=UNIT_SCALE_SYSTEM_PROMPT,
         build_user_text=_build_conversion_request_user_text,
         parse_payload=_parse_scale_factor_response,
     ):
         merged_mapping.update(batch_mapping)
+
+    logger.info(
+        "Infer rescaling factors finished conversion_requests=%s deterministic_resolved=%s llm_requests=%s resolved=%s duration=%.2fs",
+        len(conversion_requests),
+        len(conversion_requests) - len(unresolved_requests),
+        len(unresolved_requests),
+        len(merged_mapping),
+        time.perf_counter() - started_at,
+    )
     return merged_mapping
 
 
@@ -695,17 +783,33 @@ async def normalize_qualitative_values(
     if not requests:
         return {}
 
+    started_at = time.perf_counter()
+    logger.info(
+        "Normalize qualitative values start requests=%s existing_canonical=%s batch_size=%s concurrency=%s",
+        len(requests),
+        len(existing_canonical),
+        QUALITATIVE_NORMALIZATION_BATCH_SIZE,
+        QUALITATIVE_NORMALIZATION_CONCURRENCY,
+    )
+
     merged_mapping: dict[str, tuple[str | None, bool | None]] = {}
     for batch_mapping in await _run_json_batches(
         requests,
         batch_size=QUALITATIVE_NORMALIZATION_BATCH_SIZE,
         concurrency=QUALITATIVE_NORMALIZATION_CONCURRENCY,
+        request_name="normalize_qualitative_values",
         system_prompt=QUALITATIVE_NORMALIZATION_SYSTEM_PROMPT,
         build_user_text=lambda batch_requests: _build_qualitative_request_user_text(batch_requests, existing_canonical),
         parse_payload=_parse_qualitative_response,
     ):
         merged_mapping.update(batch_mapping)
 
+    logger.info(
+        "Normalize qualitative values finished requests=%s resolved=%s duration=%.2fs",
+        len(requests),
+        len(merged_mapping),
+        time.perf_counter() - started_at,
+    )
     return merged_mapping
 
 
@@ -714,15 +818,31 @@ async def classify_marker_groups(new_names: list[str], existing_groups: list[str
     if not new_names:
         return {}
 
+    started_at = time.perf_counter()
+    logger.info(
+        "Classify marker groups start new_names=%s existing_groups=%s batch_size=%s concurrency=%s",
+        len(new_names),
+        len(existing_groups),
+        MARKER_GROUP_CLASSIFICATION_BATCH_SIZE,
+        MARKER_GROUP_CLASSIFICATION_CONCURRENCY,
+    )
+
     merged_mapping: dict[str, str] = {}
     for batch_mapping in await _run_json_batches(
         new_names,
         batch_size=MARKER_GROUP_CLASSIFICATION_BATCH_SIZE,
         concurrency=MARKER_GROUP_CLASSIFICATION_CONCURRENCY,
+        request_name="classify_marker_groups",
         system_prompt=MARKER_GROUP_SYSTEM_PROMPT,
         build_user_text=lambda batch_names: _build_marker_group_classification_user_text(batch_names, existing_groups),
         parse_payload=_parse_marker_group_response,
     ):
         merged_mapping.update(batch_mapping)
 
+    logger.info(
+        "Classify marker groups finished new_names=%s resolved=%s duration=%.2fs",
+        len(new_names),
+        len(merged_mapping),
+        time.perf_counter() - started_at,
+    )
     return merged_mapping

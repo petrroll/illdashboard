@@ -517,9 +517,10 @@ async def sync_lab_source_tag(lab: LabFile, source_value: str | None, db: AsyncS
     await db.flush()
 
 
-async def _sync_ocr_source(lab: LabFile, result: dict, db: AsyncSession) -> None:
+async def _sync_ocr_source(lab: LabFile, result: dict, db: AsyncSession) -> str | None:
     source_value = await normalize_lab_source(lab, result, db)
     await sync_lab_source_tag(lab, source_value, db)
+    return source_value
 
 
 async def _prepare_measurements_for_lab(result: dict, db: AsyncSession) -> PreparedMeasurements:
@@ -561,38 +562,116 @@ async def _clear_persisted_ocr_result(lab: LabFile, db: AsyncSession) -> None:
     await db.flush()
 
 
-async def apply_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list[Measurement]:
+async def apply_ocr_result(
+    lab: LabFile,
+    result: dict,
+    db: AsyncSession,
+    *,
+    job_id: str | None = None,
+) -> list[Measurement]:
+    started_at = time.perf_counter()
+    raw_measurement_count = len(result.get("measurements", []))
     logger.info(
-        "Applying OCR result file_id=%s filename=%s measurements=%s",
+        "Applying OCR result start job_id=%s file_id=%s filename=%s raw_measurements=%s",
+        job_id,
         lab.id,
         lab.filename,
-        len(result.get("measurements", [])),
+        raw_measurement_count,
     )
     _apply_ocr_metadata(lab, result)
-    await _sync_ocr_source(lab, result, db)
-
-    prepared = await _prepare_measurements_for_lab(result, db)
-    rule_map = await _resolve_rescaling_rule_map(
-        db,
-        prepared.build_conversion_requests(),
-        prepared.measurement_types,
+    source_sync_started_at = time.perf_counter()
+    source_value = await _sync_ocr_source(lab, result, db)
+    logger.info(
+        "Applying OCR result source synced job_id=%s file_id=%s filename=%s source=%s duration=%.2fs",
+        job_id,
+        lab.id,
+        lab.filename,
+        source_value,
+        time.perf_counter() - source_sync_started_at,
     )
 
+    prepare_started_at = time.perf_counter()
+    prepared = await _prepare_measurements_for_lab(result, db)
+    conversion_requests = prepared.build_conversion_requests()
+    qualitative_request_count = sum(
+        1 for parsed in prepared.parsed_measurements if parsed.original_qualitative_value is not None
+    )
+    logger.info(
+        "Applying OCR result prepared measurements job_id=%s file_id=%s filename=%s parsed_measurements=%s measurement_types=%s conversion_requests=%s qualitative_requests=%s duration=%.2fs",
+        job_id,
+        lab.id,
+        lab.filename,
+        len(prepared.parsed_measurements),
+        len(prepared.measurement_types),
+        len(conversion_requests),
+        qualitative_request_count,
+        time.perf_counter() - prepare_started_at,
+    )
+
+    rescaling_started_at = time.perf_counter()
+    rule_map = await _resolve_rescaling_rule_map(
+        db,
+        conversion_requests,
+        prepared.measurement_types,
+    )
+    logger.info(
+        "Applying OCR result resolved rescaling job_id=%s file_id=%s filename=%s conversion_requests=%s resolved_rules=%s duration=%.2fs",
+        job_id,
+        lab.id,
+        lab.filename,
+        len(conversion_requests),
+        len(rule_map),
+        time.perf_counter() - rescaling_started_at,
+    )
+
+    flush_started_at = time.perf_counter()
     new_measurements = _build_measurement_models(lab=lab, prepared=prepared, rule_map=rule_map)
     db.add_all(new_measurements)
     await db.flush()
+    logger.info(
+        "Applying OCR result flushed measurements job_id=%s file_id=%s filename=%s saved_measurements=%s flush_duration=%.2fs total_duration=%.2fs",
+        job_id,
+        lab.id,
+        lab.filename,
+        len(new_measurements),
+        time.perf_counter() - flush_started_at,
+        time.perf_counter() - started_at,
+    )
     return new_measurements
 
 
-async def persist_ocr_result(lab: LabFile, result: dict, db: AsyncSession) -> list[Measurement]:
+async def persist_ocr_result(
+    lab: LabFile,
+    result: dict,
+    db: AsyncSession,
+    *,
+    job_id: str | None = None,
+) -> list[Measurement]:
     started_at = time.perf_counter()
-    logger.info("Persist OCR result start file_id=%s filename=%s", lab.id, lab.filename)
+    logger.info("Persist OCR result start job_id=%s file_id=%s filename=%s", job_id, lab.id, lab.filename)
+    clear_started_at = time.perf_counter()
     await _clear_persisted_ocr_result(lab, db)
+    logger.info(
+        "Persist OCR result cleared previous job_id=%s file_id=%s filename=%s duration=%.2fs",
+        job_id,
+        lab.id,
+        lab.filename,
+        time.perf_counter() - clear_started_at,
+    )
 
-    new_measurements = await apply_ocr_result(lab, result, db)
+    new_measurements = await apply_ocr_result(lab, result, db, job_id=job_id)
+    search_started_at = time.perf_counter()
     await search_service.refresh_lab_search_document(lab.id, db)
     logger.info(
-        "Persist OCR result finished file_id=%s filename=%s duration=%.2fs saved_measurements=%s",
+        "Persist OCR result refreshed search job_id=%s file_id=%s filename=%s duration=%.2fs",
+        job_id,
+        lab.id,
+        lab.filename,
+        time.perf_counter() - search_started_at,
+    )
+    logger.info(
+        "Persist OCR result finished job_id=%s file_id=%s filename=%s duration=%.2fs saved_measurements=%s",
+        job_id,
         lab.id,
         lab.filename,
         time.perf_counter() - started_at,
@@ -605,16 +684,39 @@ async def persist_ocr_result_with_fresh_session(
     file_id: int,
     result: dict,
     session_factory: async_sessionmaker[AsyncSession],
+    *,
+    job_id: str | None = None,
 ) -> list[int]:
+    lock_wait_started_at = time.perf_counter()
+    logger.info("Persist OCR session waiting for lock job_id=%s file_id=%s", job_id, file_id)
     async with _ocr_persist_lock:
+        lock_acquired_at = time.perf_counter()
+        logger.info(
+            "Persist OCR session acquired lock job_id=%s file_id=%s wait_ms=%.1f",
+            job_id,
+            file_id,
+            (lock_acquired_at - lock_wait_started_at) * 1000,
+        )
         async with session_factory() as session:
+            session_started_at = time.perf_counter()
             persistent_lab = await session.get(LabFile, file_id)
             if persistent_lab is None:
                 raise HTTPException(404, f"File {file_id} not found")
 
-            new_measurements = await persist_ocr_result(persistent_lab, result, session)
+            new_measurements = await persist_ocr_result(persistent_lab, result, session, job_id=job_id)
             measurement_ids = [measurement.id for measurement in new_measurements if measurement.id is not None]
+            commit_started_at = time.perf_counter()
             await session.commit()
+            logger.info(
+                "Persist OCR session committed job_id=%s file_id=%s filename=%s commit_ms=%.1f lock_hold_ms=%.1f total_session_ms=%.1f saved_measurements=%s",
+                job_id,
+                file_id,
+                persistent_lab.filename,
+                (time.perf_counter() - commit_started_at) * 1000,
+                (time.perf_counter() - lock_acquired_at) * 1000,
+                (time.perf_counter() - session_started_at) * 1000,
+                len(measurement_ids),
+            )
             return measurement_ids
 
 

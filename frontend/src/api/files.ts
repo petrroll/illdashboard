@@ -1,6 +1,8 @@
 import { apiClient } from "./client";
 import type { LabFile, Measurement } from "../types";
 
+export type OcrProgressStatus = "queued" | "extracting" | "extracted" | "persisting" | "done" | "error";
+
 export interface PageInfo {
   page_count: number;
   mime_type: string;
@@ -11,7 +13,7 @@ export interface OcrProgress {
   filename: string;
   index: number;
   total: number;
-  status: "processing" | "done" | "error";
+  status: OcrProgressStatus;
   error?: string;
 }
 

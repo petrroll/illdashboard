@@ -218,6 +218,7 @@ async def _extract_structured_medical_data_from_attachments(
         prompt,
         attachments=attachments,
         timeout=OCR_ASK_TIMEOUT,
+        request_name="structured_medical_extraction",
     )
 
 
@@ -231,6 +232,7 @@ async def _extract_document_text_from_attachments(attachments: list[dict], *, fi
         prompt,
         attachments=attachments,
         timeout=OCR_ASK_TIMEOUT,
+        request_name="document_text_extraction",
     )
 
 
@@ -240,6 +242,13 @@ async def _generate_medical_summary(
     *,
     filename: str | None = None,
 ) -> str | None:
+    started_at = time.perf_counter()
+    logger.info(
+        "Medical summary start filename=%s measurements=%s translated_text=%s",
+        filename,
+        len(medical_result.get("measurements", [])),
+        bool((text_result or {}).get("translated_text_english")),
+    )
     user_payload = {
         "filename": filename,
         "translated_text_english": (text_result or {}).get("translated_text_english"),
@@ -248,9 +257,17 @@ async def _generate_medical_summary(
     parsed = await _ask_json(
         MEDICAL_SUMMARY_SYSTEM_PROMPT,
         json.dumps(user_payload, ensure_ascii=False, indent=2),
+        request_name="medical_summary",
     )
     summary = parsed.get("summary_english")
-    return summary.strip() if isinstance(summary, str) and summary.strip() else None
+    cleaned_summary = summary.strip() if isinstance(summary, str) and summary.strip() else None
+    logger.info(
+        "Medical summary finished filename=%s has_summary=%s duration=%.2fs",
+        filename,
+        bool(cleaned_summary),
+        time.perf_counter() - started_at,
+    )
+    return cleaned_summary
 
 
 def _offset_result_page_numbers(result: dict, page_offset: int) -> dict:
@@ -533,10 +550,23 @@ async def _extract_file(
     logger.info("%s start path=%s filename=%s", kind.label, file_path, filename)
 
     if Path(file_path).suffix.lower() != ".pdf":
+        logger.info("%s single-image path=%s filename=%s", kind.label, file_path, filename)
         result = await kind.extract_fn([{"type": "file", "path": file_path}], filename=filename)
     else:
         with fitz.open(file_path) as document:
             page_count = document.page_count
+
+        batch_count = math.ceil(page_count / OCR_PDF_BATCH_SIZE)
+        logger.info(
+            "%s pdf batches path=%s filename=%s page_count=%s batch_size=%s batch_count=%s concurrency=%s",
+            kind.label,
+            file_path,
+            filename,
+            page_count,
+            OCR_PDF_BATCH_SIZE,
+            batch_count,
+            OCR_PDF_BATCH_CONCURRENCY,
+        )
 
         semaphore = asyncio.Semaphore(OCR_PDF_BATCH_CONCURRENCY)
 
@@ -614,6 +644,13 @@ async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
         raise medical_result_or_error
 
     medical_result = medical_result_or_error
+    logger.info(
+        "OCR pipeline medical extraction ready path=%s filename=%s measurements=%s elapsed=%.2fs",
+        file_path,
+        filename,
+        len(medical_result.get("measurements", [])),
+        time.perf_counter() - started_at,
+    )
 
     usable_text_result: dict | None
     if isinstance(text_result_or_error, BaseException):
@@ -626,6 +663,14 @@ async def ocr_extract(file_path: str, *, filename: str | None = None) -> dict:
         usable_text_result = None
     else:
         usable_text_result = text_result_or_error
+        logger.info(
+            "OCR pipeline document text ready path=%s filename=%s has_raw_text=%s has_translated_text=%s elapsed=%.2fs",
+            file_path,
+            filename,
+            bool(usable_text_result.get("raw_text")),
+            bool(usable_text_result.get("translated_text_english")),
+            time.perf_counter() - started_at,
+        )
 
     summary_english: str | None = None
     try:

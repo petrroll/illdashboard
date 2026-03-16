@@ -1322,7 +1322,7 @@ async def test_batch_ocr_job_reports_processing_before_completion(client):
         assert status_resp.status_code == 200
         status_payload = status_resp.json()
         assert status_payload["status"] in {"queued", "running"}
-        assert any(item["status"] == "processing" for item in status_payload["progress"])
+        assert any(item["status"] in {"queued", "extracting", "extracted", "persisting"} for item in status_payload["progress"])
 
         final_payload = await _wait_for_ocr_job(client, job_id)
         assert final_payload["status"] == "completed"
