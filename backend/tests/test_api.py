@@ -697,6 +697,82 @@ async def test_sparkline_ignores_measurements_with_missing_unit_conversion_rules
 
 
 @pytest.mark.asyncio
+async def test_sparkline_uses_boolean_scale_for_qualitative_marker_history(client):
+    file_id = await _upload_pdf(client, filename="qualitative-trend.pdf")
+
+    qualitative_trend_result = {
+        "lab_date": "2024-10-29",
+        "measurements": [
+            {
+                "marker_name": "ANA Screening",
+                "value": False,
+                "unit": None,
+                "reference_low": None,
+                "reference_high": None,
+                "measured_at": "2023-01-20",
+            },
+            {
+                "marker_name": "ANA Screening",
+                "value": True,
+                "unit": None,
+                "reference_low": None,
+                "reference_high": None,
+                "measured_at": "2024-10-29",
+            },
+        ],
+    }
+
+    with patch("illdashboard.copilot.extraction.ocr_extract", new_callable=AsyncMock, return_value=qualitative_trend_result), patch(
+        "illdashboard.copilot.normalization.normalize_marker_names",
+        new_callable=AsyncMock,
+        side_effect=lambda names, _existing: {name: name for name in names},
+    ), patch(
+        "illdashboard.copilot.normalization.choose_canonical_units",
+        new_callable=AsyncMock,
+        return_value={},
+    ), patch(
+        "illdashboard.copilot.normalization.normalize_qualitative_values",
+        new_callable=AsyncMock,
+        return_value={
+            "false": ("negative", False),
+            "true": ("positive", True),
+        },
+    ):
+        resp = await client.post(f"/api/files/{file_id}/ocr")
+
+    assert resp.status_code == 200
+
+    overview_resp = await client.get("/api/measurements/overview")
+    assert overview_resp.status_code == 200
+    overview = overview_resp.json()
+    ana_overview = next(
+        marker
+        for group in overview
+        for marker in group["markers"]
+        if marker["marker_name"] == "ANA Screening"
+    )
+    assert ana_overview["has_numeric_history"] is False
+    assert ana_overview["has_qualitative_trend"] is True
+    assert ana_overview["latest_measurement"]["qualitative_bool"] is True
+
+    with patch("illdashboard.api.measurements.get_cached_sparkline", return_value=None), patch(
+        "illdashboard.api.measurements.generate_sparkline",
+        return_value=b"png",
+    ) as generate_sparkline_mock:
+        sparkline_resp = await client.get(
+            "/api/measurements/sparkline",
+            params={"marker_name": "ANA Screening"},
+        )
+
+    assert sparkline_resp.status_code == 200
+    assert sparkline_resp.content == b"png"
+    generate_sparkline_mock.assert_called_once()
+    assert generate_sparkline_mock.call_args.kwargs["values"] == [0.0, 1.0]
+    assert generate_sparkline_mock.call_args.kwargs["ref_low"] is None
+    assert generate_sparkline_mock.call_args.kwargs["ref_high"] == 0.5
+
+
+@pytest.mark.asyncio
 async def test_marker_views_reuse_latest_known_reference_range_across_history(client):
     first_file_id = await _upload_pdf(client, filename="ferritin-initial.pdf")
     second_file_id = await _upload_pdf(client, filename="ferritin-range.pdf")
@@ -1097,6 +1173,7 @@ async def test_ocr_persists_qualitative_measurements_and_includes_them_in_biomar
     )
     assert chlamydia_overview["latest_measurement"]["qualitative_value"] == "negative"
     assert chlamydia_overview["has_numeric_history"] is False
+    assert chlamydia_overview["has_qualitative_trend"] is False
     assert chlamydia_overview["status"] == "no_range"
 
     markers_resp = await client.get("/api/measurements/markers")
@@ -1111,6 +1188,7 @@ async def test_ocr_persists_qualitative_measurements_and_includes_them_in_biomar
     detail = detail_resp.json()
     assert detail["marker_name"] == "Chlamydia psittaci IgG"
     assert detail["has_numeric_history"] is False
+    assert detail["has_qualitative_trend"] is False
     assert detail["latest_measurement"]["qualitative_value"] == "negative"
     assert len(detail["measurements"]) == 1
 
