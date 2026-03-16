@@ -204,6 +204,48 @@ OVERVIEW_UPDATED_RESULT = {
     ],
 }
 
+LATE_RANGELESS_RESULT = {
+    "lab_date": "2023-01-10",
+    "measurements": [
+        {
+            "marker_name": "Ferritin",
+            "value": 280,
+            "unit": "ug/l",
+            "reference_low": None,
+            "reference_high": None,
+            "measured_at": "2023-01-10",
+        },
+    ],
+}
+
+LATE_RANGE_RESULT = {
+    "lab_date": "2023-02-10",
+    "measurements": [
+        {
+            "marker_name": "Ferritin",
+            "value": 320,
+            "unit": "ug/l",
+            "reference_low": 30,
+            "reference_high": 400,
+            "measured_at": "2023-02-10",
+        },
+    ],
+}
+
+FOLLOWUP_WITHOUT_RANGE_RESULT = {
+    "lab_date": "2023-03-10",
+    "measurements": [
+        {
+            "marker_name": "Ferritin",
+            "value": 414,
+            "unit": "ug/l",
+            "reference_low": None,
+            "reference_high": None,
+            "measured_at": "2023-03-10",
+        },
+    ],
+}
+
 CANONICAL_UNIT_RESULT = {
     "lab_date": "2024-10-29",
     "measurements": [
@@ -652,6 +694,67 @@ async def test_sparkline_ignores_measurements_with_missing_unit_conversion_rules
     assert sparkline_resp.content == b"png"
     generate_sparkline_mock.assert_called_once()
     assert generate_sparkline_mock.call_args.kwargs["values"] == [0.38]
+
+
+@pytest.mark.asyncio
+async def test_marker_views_reuse_latest_known_reference_range_across_history(client):
+    first_file_id = await _upload_pdf(client, filename="ferritin-initial.pdf")
+    second_file_id = await _upload_pdf(client, filename="ferritin-range.pdf")
+    third_file_id = await _upload_pdf(client, filename="ferritin-followup.pdf")
+
+    with patch(
+        "illdashboard.copilot.extraction.ocr_extract",
+        new_callable=AsyncMock,
+        side_effect=[LATE_RANGELESS_RESULT, LATE_RANGE_RESULT, FOLLOWUP_WITHOUT_RANGE_RESULT],
+    ), patch(
+        "illdashboard.copilot.normalization.normalize_marker_names",
+        new_callable=AsyncMock,
+        side_effect=lambda names, _existing: {name: name for name in names},
+    ), patch(
+        "illdashboard.copilot.normalization.choose_canonical_units",
+        new_callable=AsyncMock,
+        return_value={"Ferritin": "ug/l"},
+    ):
+        for file_id in (first_file_id, second_file_id, third_file_id):
+            resp = await client.post(f"/api/files/{file_id}/ocr")
+            assert resp.status_code == 200
+
+    detail_resp = await client.get(
+        "/api/measurements/detail",
+        params={"marker_name": "Ferritin"},
+    )
+    assert detail_resp.status_code == 200
+    detail = detail_resp.json()
+    assert detail["reference_low"] == 30
+    assert detail["reference_high"] == 400
+    assert detail["status"] == "high"
+    assert detail["latest_measurement"]["canonical_reference_low"] is None
+    assert detail["latest_measurement"]["canonical_reference_high"] is None
+    assert detail["measurements"][-1]["canonical_reference_low"] is None
+    assert detail["measurements"][-1]["canonical_reference_high"] is None
+
+    overview_resp = await client.get("/api/measurements/overview")
+    assert overview_resp.status_code == 200
+    overview = overview_resp.json()
+    ferritin = next(item for group in overview for item in group["markers"] if item["marker_name"] == "Ferritin")
+    assert ferritin["reference_low"] == 30
+    assert ferritin["reference_high"] == 400
+    assert ferritin["status"] == "high"
+
+    with patch("illdashboard.api.measurements.get_cached_sparkline", return_value=None), patch(
+        "illdashboard.api.measurements.generate_sparkline",
+        return_value=b"png",
+    ) as generate_sparkline_mock:
+        sparkline_resp = await client.get(
+            "/api/measurements/sparkline",
+            params={"marker_name": "Ferritin"},
+        )
+
+    assert sparkline_resp.status_code == 200
+    assert sparkline_resp.content == b"png"
+    generate_sparkline_mock.assert_called_once()
+    assert generate_sparkline_mock.call_args.kwargs["ref_low"] == 30
+    assert generate_sparkline_mock.call_args.kwargs["ref_high"] == 400
 
 
 @pytest.mark.asyncio

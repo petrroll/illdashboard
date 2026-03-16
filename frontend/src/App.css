@@ -1030,8 +1030,18 @@ input[type="file"] {
   background: rgba(70, 209, 96, 0.15);
 }
 
+.status-negative {
+  color: #46d160;
+  background: rgba(70, 209, 96, 0.15);
+}
+
 .status-low,
 .status-high {
+  color: #f5a254;
+  background: rgba(245, 162, 84, 0.15);
+}
+
+.status-positive {
   color: #f5a254;
   background: rgba(245, 162, 84, 0.15);
 }

@@ -34,9 +34,9 @@ import {
   getMeasurementValueClass,
   getOriginalMeasurementReferenceHigh,
   getOriginalMeasurementReferenceLow,
-  formatPreferredMeasurementUnit,
   formatPreferredMeasurementValue,
   formatPreferredReferenceRange,
+  formatReferenceRange,
   formatSignificantValue,
   getCanonicalTrendValue,
   getDisplayUnit,
@@ -66,6 +66,28 @@ function getStoredListPaneWidth() {
   const rawValue = window.localStorage.getItem(LIST_PANE_STORAGE_KEY);
   const parsed = rawValue ? Number(rawValue) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : DEFAULT_LIST_PANE_WIDTH;
+}
+
+function formatQualitativeStatusLabel(item: MarkerOverviewItem) {
+  const latest = item.latest_measurement;
+  if (latest.qualitative_bool === true) {
+    return "Positive";
+  }
+  if (latest.qualitative_bool === false) {
+    return "Negative";
+  }
+  return latest.qualitative_value || getMarkerStatusLabel(item.status);
+}
+
+function getQualitativeStatusClassName(item: MarkerOverviewItem) {
+  const latest = item.latest_measurement;
+  if (latest.qualitative_bool === true) {
+    return "status-positive";
+  }
+  if (latest.qualitative_bool === false) {
+    return "status-negative";
+  }
+  return `status-${item.status}`;
 }
 
 export default function MarkerChart() {
@@ -259,8 +281,6 @@ export default function MarkerChart() {
   const latestChartMeasurement = chartMeasurements.at(-1) ?? null;
 
   const unit = getDisplayUnit(latestChartMeasurement?.canonical_unit) ?? "";
-  const refLow = latestChartMeasurement?.canonical_reference_low ?? null;
-  const refHigh = latestChartMeasurement?.canonical_reference_high ?? null;
   const yAxisDomain: [number, number] = useMemo(() => {
     const yAxisValues = chartMeasurements.flatMap((measurement) => {
       const values = [
@@ -307,13 +327,30 @@ export default function MarkerChart() {
     [overview, selectedMarker],
   );
   const summarySource = detail ?? selectedOverviewItem ?? null;
+  const refLow = summarySource?.reference_low ?? null;
+  const refHigh = summarySource?.reference_high ?? null;
+  const hideDetailTrendChart = Boolean(
+    detail
+      && !detail.has_numeric_history
+      && detail.measurements.some((measurement) => measurement.qualitative_value != null),
+  );
 
   const rangeMeter = (item: MarkerOverviewItem) => {
     if (!item.has_numeric_history) {
       return (
         <div className="range-meter">
-          <span className={`status-pill status-${item.status}`}>{getMarkerStatusLabel(item.status)}</span>
-          <span className="range-meter-note">Qualitative only</span>
+          <span className={`status-pill ${getQualitativeStatusClassName(item)}`}>
+            {formatQualitativeStatusLabel(item)}
+          </span>
+          {item.has_qualitative_trend && (
+            <img
+              className="sparkline-img"
+              src={`/api/measurements/sparkline?marker_name=${encodeURIComponent(item.marker_name)}&v=6`}
+              alt={`Sparkline for ${item.marker_name}`}
+              loading="lazy"
+              decoding="async"
+            />
+          )}
         </div>
       );
     }
@@ -323,7 +360,7 @@ export default function MarkerChart() {
         <span className={`status-pill status-${item.status}`}>{getMarkerStatusLabel(item.status)}</span>
         <img
           className="sparkline-img"
-          src={`/api/measurements/sparkline?marker_name=${encodeURIComponent(item.marker_name)}&v=4`}
+          src={`/api/measurements/sparkline?marker_name=${encodeURIComponent(item.marker_name)}&v=6`}
           alt={`Sparkline for ${item.marker_name}`}
           loading="lazy"
           decoding="async"
@@ -615,9 +652,9 @@ export default function MarkerChart() {
               <div className="detail-stat-card">
                 <span>Reference range</span>
                 <strong>
-                  {formatPreferredReferenceRange(summarySource.latest_measurement)}
+                  {formatReferenceRange(summarySource.reference_low, summarySource.reference_high)}
                 </strong>
-                <small>{formatPreferredMeasurementUnit(summarySource.latest_measurement)}</small>
+                <small>{getDisplayUnit(summarySource.canonical_unit) ?? "—"}</small>
                 {getUnitConversionWarning(summarySource.latest_measurement) && (
                   <small className="measurement-warning-note">{getUnitConversionWarning(summarySource.latest_measurement)}</small>
                 )}
@@ -635,7 +672,7 @@ export default function MarkerChart() {
                     Some history points stay in their original units because no conversion rule exists yet.
                   </p>
                 )}
-                {chartMeasurements.length > 0 ? (
+                {!hideDetailTrendChart && chartMeasurements.length > 0 ? (
                   <div className="chart-wrapper mb-1">
                     <ResponsiveContainer width="100%" height={320}>
                       <LineChart data={chartData}>
@@ -678,13 +715,11 @@ export default function MarkerChart() {
                       </LineChart>
                     </ResponsiveContainer>
                   </div>
-                ) : (
+                ) : !hideDetailTrendChart ? (
                   <div className="card-empty detail-loading-block">
-                    {!detail.has_numeric_history && detail.measurements.some((measurement) => measurement.qualitative_value != null)
-                      ? "Trend chart unavailable for qualitative-only markers."
-                      : "Trend chart unavailable until at least one value has a valid conversion rule."}
+                    Trend chart unavailable until at least one value has a valid conversion rule.
                   </div>
-                )}
+                ) : null}
 
                 <div className="detail-history card">
                   <h3>History</h3>

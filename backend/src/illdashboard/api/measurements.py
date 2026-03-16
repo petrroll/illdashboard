@@ -213,7 +213,6 @@ async def measurement_sparkline(
     db: AsyncSession = Depends(get_db),
 ):
     measurements = await marker_service.load_measurements_for_marker(db, marker_name)
-    measurements = [measurement for measurement in measurements if measurement.qualitative_value is None]
     if not measurements:
         raise HTTPException(404, "Marker not found")
 
@@ -226,18 +225,39 @@ async def measurement_sparkline(
     ]
     if not sparkline_measurements:
         sparkline_measurements = [measurement for measurement in measurements if measurement.canonical_value is not None]
-    if not sparkline_measurements:
+    if sparkline_measurements:
+        signature = insight_service.marker_signature(sparkline_measurements)
+        cached = get_cached_sparkline(marker_name, signature)
+        if cached:
+            return Response(content=cached, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+        ref_low, ref_high = marker_service.latest_reference_range_for_history(sparkline_measurements)
+        png_bytes = generate_sparkline(
+            values=[measurement.canonical_value for measurement in sparkline_measurements if measurement.canonical_value is not None],
+            ref_low=ref_low,
+            ref_high=ref_high,
+            signature=signature,
+            marker_name=marker_name,
+        )
+        return Response(content=png_bytes, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+    qualitative_sparkline_measurements = [
+        measurement
+        for measurement in measurements
+        if measurement.qualitative_bool is not None
+    ]
+    if len(qualitative_sparkline_measurements) < 2:
         raise HTTPException(404, "Marker not found")
 
-    signature = insight_service.marker_signature(sparkline_measurements)
+    signature = insight_service.marker_signature(qualitative_sparkline_measurements)
     cached = get_cached_sparkline(marker_name, signature)
     if cached:
         return Response(content=cached, media_type="image/png", headers={"Cache-Control": "no-store"})
 
     png_bytes = generate_sparkline(
-        values=[measurement.canonical_value for measurement in sparkline_measurements if measurement.canonical_value is not None],
-        ref_low=sparkline_measurements[-1].canonical_reference_low,
-        ref_high=sparkline_measurements[-1].canonical_reference_high,
+        values=[1.0 if measurement.qualitative_bool else 0.0 for measurement in qualitative_sparkline_measurements],
+        ref_low=None,
+        ref_high=0.5,
         signature=signature,
         marker_name=marker_name,
     )

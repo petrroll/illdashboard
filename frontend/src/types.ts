@@ -40,9 +40,12 @@ export interface MarkerOverviewItem {
   canonical_unit?: string | null;
   latest_measurement: Measurement;
   previous_measurement: Measurement | null;
+  reference_low: number | null;
+  reference_high: number | null;
   status: "low" | "high" | "in_range" | "no_range";
   range_position: number | null;
   has_numeric_history: boolean;
+  has_qualitative_trend: boolean;
   total_count: number;
   value_min: number | null;
   value_max: number | null;
@@ -62,9 +65,12 @@ export interface MarkerDetailResponse {
   canonical_unit?: string | null;
   latest_measurement: Measurement;
   previous_measurement: Measurement | null;
+  reference_low: number | null;
+  reference_high: number | null;
   status: "low" | "high" | "in_range" | "no_range";
   range_position: number | null;
   has_numeric_history: boolean;
+  has_qualitative_trend: boolean;
   measurements: Measurement[];
   explanation: string | null;
   explanation_cached: boolean;

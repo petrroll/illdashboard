@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from illdashboard.copilot.explanations import explain_marker_history
 from illdashboard.models import BiomarkerInsight, Measurement, MeasurementType
-from illdashboard.services.markers import measurement_status
+from illdashboard.services.markers import latest_reference_range_for_history, measurement_status_for_range
 
 
 def _measurement_snapshot(measurement: Measurement | None) -> dict | None:
@@ -53,22 +53,27 @@ def _measurement_display_value(measurement: Measurement) -> str:
 def marker_signature(measurements: list[Measurement]) -> str:
     latest = measurements[-1]
     previous = measurements[-2] if len(measurements) > 1 else None
+    effective_reference_low, effective_reference_high = latest_reference_range_for_history(measurements)
     payload = {
         "count": len(measurements),
         "latest": _measurement_snapshot(latest),
         "previous": _measurement_snapshot(previous),
+        "effective_reference_low": effective_reference_low,
+        "effective_reference_high": effective_reference_high,
     }
     return json.dumps(payload, sort_keys=True)
 
 
 def serialize_history_for_ai(measurements: list[Measurement]) -> list[dict]:
+    latest = measurements[-1]
+    effective_reference_low, effective_reference_high = latest_reference_range_for_history(measurements)
     return [
         {
             "date": measurement.measured_at.date().isoformat() if measurement.measured_at else "unknown date",
             "value": _measurement_value_for_ai(measurement),
             "unit": _measurement_display_unit(measurement),
-            "reference_low": measurement.canonical_reference_low,
-            "reference_high": measurement.canonical_reference_high,
+            "reference_low": effective_reference_low if measurement is latest else measurement.canonical_reference_low,
+            "reference_high": effective_reference_high if measurement is latest else measurement.canonical_reference_high,
         }
         for measurement in measurements[-8:]
     ]
@@ -77,7 +82,8 @@ def serialize_history_for_ai(measurements: list[Measurement]) -> list[dict]:
 def fallback_marker_explanation(marker_name: str, measurements: list[Measurement]) -> str:
     latest = measurements[-1]
     previous = measurements[-2] if len(measurements) > 1 else None
-    status = measurement_status(latest).replace("_", " ")
+    effective_reference_low, effective_reference_high = latest_reference_range_for_history(measurements)
+    status = measurement_status_for_range(latest, effective_reference_low, effective_reference_high).replace("_", " ")
     latest_value = _measurement_display_value(latest)
     parts = [f"## {marker_name}"]
 
@@ -106,9 +112,9 @@ def fallback_marker_explanation(marker_name: str, measurements: list[Measurement
     unit_suffix = f" {unit}" if unit else ""
     parts.append(f"Latest value: **{latest_value}**. Status: **{status}**.")
 
-    if latest.canonical_reference_low is not None and latest.canonical_reference_high is not None:
+    if effective_reference_low is not None and effective_reference_high is not None:
         parts.append(
-            f"Reference range from the report: **{latest.canonical_reference_low:g} to {latest.canonical_reference_high:g}{unit_suffix}**."
+            f"Reference range from the report: **{effective_reference_low:g} to {effective_reference_high:g}{unit_suffix}**."
         )
 
     if status == "low":

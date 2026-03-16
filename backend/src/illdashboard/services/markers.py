@@ -423,13 +423,22 @@ async def merge_measurement_types(source: MeasurementType, target: MeasurementTy
 
 
 def measurement_status(measurement: Measurement) -> str:
+    return measurement_status_for_range(
+        measurement,
+        measurement.canonical_reference_low,
+        measurement.canonical_reference_high,
+    )
+
+
+def measurement_status_for_range(
+    measurement: Measurement,
+    reference_low: float | None,
+    reference_high: float | None,
+) -> str:
     if getattr(measurement, "unit_conversion_missing", False):
         return "no_range"
 
-    reference_low = measurement.canonical_reference_low
-    reference_high = measurement.canonical_reference_high
     value = measurement.canonical_value
-
     if value is None:
         return "no_range"
 
@@ -443,11 +452,21 @@ def measurement_status(measurement: Measurement) -> str:
 
 
 def range_position(measurement: Measurement) -> float | None:
+    return range_position_for_range(
+        measurement,
+        measurement.canonical_reference_low,
+        measurement.canonical_reference_high,
+    )
+
+
+def range_position_for_range(
+    measurement: Measurement,
+    reference_low: float | None,
+    reference_high: float | None,
+) -> float | None:
     if getattr(measurement, "unit_conversion_missing", False):
         return None
 
-    reference_low = measurement.canonical_reference_low
-    reference_high = measurement.canonical_reference_high
     value = measurement.canonical_value
 
     if value is None or reference_low is None or reference_high is None or reference_high <= reference_low:
@@ -455,10 +474,31 @@ def range_position(measurement: Measurement) -> float | None:
     return (value - reference_low) / (reference_high - reference_low)
 
 
+def latest_reference_range_for_history(measurements: list[Measurement]) -> tuple[float | None, float | None]:
+    if not measurements:
+        return None, None
+
+    latest = measurements[-1]
+    if latest.canonical_value is None or getattr(latest, "unit_conversion_missing", False):
+        return None, None
+
+    # Follow-up reports often omit the range even though the biomarker still has a
+    # stable canonical interval, so marker-level views reuse the newest usable one.
+    for measurement in reversed(measurements):
+        if getattr(measurement, "unit_conversion_missing", False):
+            continue
+        if measurement.canonical_reference_low is not None or measurement.canonical_reference_high is not None:
+            return measurement.canonical_reference_low, measurement.canonical_reference_high
+
+    return None, None
+
+
 def build_marker_payload(measurements: list[Measurement]) -> dict:
     latest = measurements[-1]
     previous = measurements[-2] if len(measurements) > 1 else None
+    reference_low, reference_high = latest_reference_range_for_history(measurements)
     has_numeric_history = any(measurement.canonical_value is not None for measurement in measurements)
+    has_qualitative_trend = sum(measurement.qualitative_bool is not None for measurement in measurements) > 1
     values = [
         measurement.canonical_value
         for measurement in measurements
@@ -470,9 +510,12 @@ def build_marker_payload(measurements: list[Measurement]) -> dict:
         "canonical_unit": latest.canonical_unit,
         "latest_measurement": latest,
         "previous_measurement": previous,
-        "status": measurement_status(latest),
-        "range_position": range_position(latest),
+        "reference_low": reference_low,
+        "reference_high": reference_high,
+        "status": measurement_status_for_range(latest, reference_low, reference_high),
+        "range_position": range_position_for_range(latest, reference_low, reference_high),
         "has_numeric_history": has_numeric_history,
+        "has_qualitative_trend": has_qualitative_trend,
         "total_count": len(measurements),
         "value_min": min(values) if values else None,
         "value_max": max(values) if values else None,

@@ -108,9 +108,12 @@ class MarkerOverviewItem(BaseModel):
     canonical_unit: str | None = None
     latest_measurement: MeasurementOut
     previous_measurement: MeasurementOut | None = None
+    reference_low: float | None = None
+    reference_high: float | None = None
     status: str
     range_position: float | None = None
     has_numeric_history: bool = False
+    has_qualitative_trend: bool = False
     total_count: int = 1
     value_min: float | None = None
     value_max: float | None = None
@@ -130,9 +133,12 @@ class MarkerDetailResponse(BaseModel):
     canonical_unit: str | None = None
     latest_measurement: MeasurementOut
     previous_measurement: MeasurementOut | None = None
+    reference_low: float | None = None
+    reference_high: float | None = None
     status: str
     range_position: float | None = None
     has_numeric_history: bool = False
+    has_qualitative_trend: bool = False
     measurements: list[MeasurementOut]
     explanation: str | None = None
     explanation_cached: bool = False
