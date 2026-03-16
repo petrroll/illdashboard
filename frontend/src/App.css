@@ -706,7 +706,8 @@ input[type="file"] {
 .marker-browser {
   display: flex;
   gap: 0;
-  align-items: start;
+  /* stretch so both panels share the same height even when one has little content */
+  align-items: stretch;
   min-width: 0;
   --marker-list-width: 420px;
 }
