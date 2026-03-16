@@ -13,7 +13,7 @@ SPARKLINE_CACHE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "
 SPARKLINE_WIDTH = 180  # px
 SPARKLINE_HEIGHT = 40  # px
 DPI = 72
-STYLE_VERSION = "v5"  # bump when changing sparkline colors/styling
+STYLE_VERSION = "v7"  # bump when changing sparkline colors/styling
 
 
 def _cache_path(marker_name: str, signature: str) -> Path:
@@ -122,6 +122,7 @@ def generate_sparkline(
     ref_high: float | None,
     signature: str,
     marker_name: str,
+    qualitative_mode: bool = False,
 ) -> bytes:
     """Render a tiny sparkline PNG and cache it."""
     fig_w = SPARKLINE_WIDTH / DPI

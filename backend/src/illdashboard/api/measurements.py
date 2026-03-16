@@ -260,5 +260,6 @@ async def measurement_sparkline(
         ref_high=0.5,
         signature=signature,
         marker_name=marker_name,
+        qualitative_mode=True,
     )
     return Response(content=png_bytes, media_type="image/png", headers={"Cache-Control": "no-store"})

@@ -1174,7 +1174,7 @@ async def test_ocr_persists_qualitative_measurements_and_includes_them_in_biomar
     assert chlamydia_overview["latest_measurement"]["qualitative_value"] == "negative"
     assert chlamydia_overview["has_numeric_history"] is False
     assert chlamydia_overview["has_qualitative_trend"] is False
-    assert chlamydia_overview["status"] == "no_range"
+    assert chlamydia_overview["status"] == "negative"
 
     markers_resp = await client.get("/api/measurements/markers")
     assert markers_resp.status_code == 200

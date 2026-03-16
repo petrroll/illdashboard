@@ -42,7 +42,7 @@ export interface MarkerOverviewItem {
   previous_measurement: Measurement | null;
   reference_low: number | null;
   reference_high: number | null;
-  status: "low" | "high" | "in_range" | "no_range";
+  status: "low" | "high" | "in_range" | "no_range" | "positive" | "negative";
   range_position: number | null;
   has_numeric_history: boolean;
   has_qualitative_trend: boolean;
@@ -67,7 +67,7 @@ export interface MarkerDetailResponse {
   previous_measurement: Measurement | null;
   reference_low: number | null;
   reference_high: number | null;
-  status: "low" | "high" | "in_range" | "no_range";
+  status: "low" | "high" | "in_range" | "no_range" | "positive" | "negative";
   range_position: number | null;
   has_numeric_history: boolean;
   has_qualitative_trend: boolean;

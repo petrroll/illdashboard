@@ -435,6 +435,11 @@ def measurement_status_for_range(
     reference_low: float | None,
     reference_high: float | None,
 ) -> str:
+    if measurement.qualitative_bool is True:
+        return "positive"
+    if measurement.qualitative_bool is False:
+        return "negative"
+
     if getattr(measurement, "unit_conversion_missing", False):
         return "no_range"
 

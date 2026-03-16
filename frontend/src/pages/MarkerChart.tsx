@@ -747,23 +747,23 @@ export default function MarkerChart() {
                           const showOriginalValue = !conversionMissing
                             && measurement.qualitative_value == null
                             && hasRescaledMeasurementValue(measurement);
+                          const fallbackReferenceLow = conversionMissing
+                            ? originalReferenceLow
+                            : measurement.canonical_reference_low ?? detail.reference_low;
+                          const fallbackReferenceHigh = conversionMissing
+                            ? originalReferenceHigh
+                            : measurement.canonical_reference_high ?? detail.reference_high;
                           const statusValue = conversionMissing
                             ? originalValue
                             : measurement.canonical_value;
-                          const statusReferenceLow = conversionMissing
-                            ? originalReferenceLow
-                            : measurement.canonical_reference_low;
-                          const statusReferenceHigh = conversionMissing
-                            ? originalReferenceHigh
-                            : measurement.canonical_reference_high;
 
                           return (
                             <tr key={measurement.id}>
                               <td>{formatDate(measurement.measured_at)}</td>
                               <td className={getMeasurementValueClass({
                                 value: statusValue,
-                                reference_low: statusReferenceLow,
-                                reference_high: statusReferenceHigh,
+                                reference_low: fallbackReferenceLow,
+                                reference_high: fallbackReferenceHigh,
                                 qualitative_bool: measurement.qualitative_bool,
                               })}>
                                 <StackedMeasurementValue

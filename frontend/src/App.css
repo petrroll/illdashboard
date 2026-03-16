@@ -237,6 +237,10 @@ tr:hover td {
   color: var(--value-ok);
 }
 
+.value-neutral {
+  color: var(--text-muted);
+}
+
 .value-high {
   color: var(--value-attention);
 }
@@ -247,6 +251,7 @@ tr:hover td {
 
 .value-low .history-measurement-primary,
 .value-normal .history-measurement-primary,
+.value-neutral .history-measurement-primary,
 .value-high .history-measurement-primary,
 .value-positive .history-measurement-primary {
   color: inherit;
@@ -1035,6 +1040,11 @@ input[type="file"] {
   background: rgba(70, 209, 96, 0.15);
 }
 
+.status-no_range {
+  color: #aeb8c6;
+  background: rgba(150, 161, 174, 0.18);
+}
+
 .status-low,
 .status-high {
   color: #f5a254;
@@ -1044,11 +1054,6 @@ input[type="file"] {
 .status-positive {
   color: #f5a254;
   background: rgba(245, 162, 84, 0.15);
-}
-
-.status-no_range {
-  color: #96a1ae;
-  background: rgba(150, 161, 174, 0.15);
 }
 
 .detail-header {

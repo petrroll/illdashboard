@@ -6,7 +6,7 @@ const SIGNIFICANT_VALUE_FORMATTER = new Intl.NumberFormat(undefined, {
   useGrouping: false,
 });
 
-export type MarkerStatus = "low" | "high" | "in_range" | "no_range";
+export type MarkerStatus = "low" | "high" | "in_range" | "no_range" | "positive" | "negative";
 
 function normalizeUnitKey(unit?: string | null) {
   if (unit == null) {
@@ -247,7 +247,7 @@ export function getMeasurementValueClass(measurement: {
   }
 
   if (measurement.value == null) {
-    return "value-normal";
+    return "value-neutral";
   }
 
   if (measurement.reference_low != null && measurement.value < measurement.reference_low) {
@@ -258,11 +258,19 @@ export function getMeasurementValueClass(measurement: {
     return "value-high";
   }
 
+   if (measurement.reference_low == null && measurement.reference_high == null) {
+    return "value-neutral";
+  }
+
   return "value-normal";
 }
 
 export function getMarkerStatusLabel(status: MarkerStatus) {
   switch (status) {
+    case "positive":
+      return "Positive";
+    case "negative":
+      return "Negative";
     case "in_range":
       return "In range";
     case "low":
