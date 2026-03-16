@@ -1,4 +1,4 @@
-"""OCR extraction orchestration and background job helpers."""
+"""OCR workflow orchestration and background job helpers."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from illdashboard.config import settings
-from illdashboard.copilot import extraction as copilot_ocr
+from illdashboard.copilot import extraction as copilot_extraction
 from illdashboard.models import LabFile, Measurement
 from illdashboard.services.ocr_ingestion import persist_ocr_result, persist_ocr_result_with_fresh_session
 
@@ -91,7 +91,7 @@ async def extract_ocr_result(lab: LabFile) -> dict:
     )
     # The Copilot OCR pipeline keeps structured extraction separate from
     # free-form OCR + translation. That split is intentional and must remain.
-    result = await copilot_ocr.ocr_extract(resolved_path, filename=lab.filename)
+    result = await copilot_extraction.ocr_extract(resolved_path, filename=lab.filename)
     logger.info(
         "OCR extraction finished file_id=%s filename=%s duration=%.2fs measurements=%s",
         lab.id,

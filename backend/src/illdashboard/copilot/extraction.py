@@ -1,4 +1,4 @@
-"""Copilot OCR extraction pipeline."""
+"""Copilot-backed document extraction pipeline."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Persistence and normalization for OCR extraction results."""
+"""OCR result ingestion and normalization."""
 
 from __future__ import annotations
 
