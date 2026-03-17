@@ -16,7 +16,7 @@ import { formatDate } from "../utils/measurements";
 
 type SortField = "lab_date" | "uploaded_at";
 
-const FILE_POLL_INTERVAL_MS = 1500;
+const FILE_POLL_INTERVAL_MS = 3000;
 
 function isFileActive(file: LabFile) {
   return file.status === "queued" || file.status === "processing";
@@ -114,10 +114,31 @@ export default function Files() {
       return;
     }
 
-    const intervalId = window.setInterval(() => {
-      void loadFiles();
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    const poll = async () => {
+      try {
+        await loadFiles();
+      } finally {
+        if (!cancelled) {
+          timeoutId = window.setTimeout(() => {
+            void poll();
+          }, FILE_POLL_INTERVAL_MS);
+        }
+      }
+    };
+
+    timeoutId = window.setTimeout(() => {
+      void poll();
     }, FILE_POLL_INTERVAL_MS);
-    return () => window.clearInterval(intervalId);
+
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
   }, [hasActiveFiles, loadFiles]);
 
   const handleUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -174,9 +195,7 @@ export default function Files() {
       await run();
       await loadFiles();
     } finally {
-      if (!files.some(isFileActive)) {
-        setProcessing(false);
-      }
+      setProcessing(false);
     }
   };
 
@@ -354,7 +373,7 @@ export default function Files() {
                       <td>{formatDate(file.lab_date)}</td>
                       <td>{formatDate(file.uploaded_at)}</td>
                       <td>{renderStatusBadge(file)}</td>
-                      <td style={{ minWidth: 260 }}>
+                      <td style={{ minWidth: 160 }}>
                         {editingTagsFileId === file.id ? (
                           <TagInput
                             tags={file.tags}
@@ -367,21 +386,25 @@ export default function Files() {
                                 ),
                               );
                               setAllFileTags(await fetchFileTags());
-                              setEditingTagsFileId(null);
                             }}
                             placeholder="Add tag…"
                           />
                         ) : (
-                          <div className="flex-row" style={{ gap: "0.35rem", flexWrap: "wrap", alignItems: "center" }}>
-                            {file.tags.map((tag) => (
-                              <span key={tag} className="tag-pill">{tag}</span>
-                            ))}
-                            <button
-                              className="btn btn-outline btn-sm"
-                              onClick={() => setEditingTagsFileId(file.id)}
-                            >
-                              Edit tags
-                            </button>
+                          <div
+                            className="tag-list"
+                            onClick={() => setEditingTagsFileId(file.id)}
+                            style={{ cursor: "pointer", minHeight: "1.5rem" }}
+                            title="Click to edit tags"
+                          >
+                            {file.tags.length > 0 ? (
+                              file.tags.map((tag) => (
+                                <span key={tag} className="tag-pill">{tag}</span>
+                              ))
+                            ) : (
+                              <span style={{ color: "var(--text-muted)", fontSize: "0.8rem" }}>
+                                + tag
+                              </span>
+                            )}
                           </div>
                         )}
                       </td>

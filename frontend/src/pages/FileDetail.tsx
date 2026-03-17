@@ -35,7 +35,7 @@ import {
   isUnitConversionMissing,
 } from "../utils/measurements";
 
-const FILE_POLL_INTERVAL_MS = 1500;
+const FILE_POLL_INTERVAL_MS = 3000;
 
 function isFileActive(file: LabFile | null) {
   return file?.status === "queued" || file?.status === "processing";
@@ -135,10 +135,32 @@ export default function FileDetail() {
     if (!isFileActive(file)) {
       return;
     }
-    const intervalId = window.setInterval(() => {
-      void load();
+
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    const poll = async () => {
+      try {
+        await load();
+      } finally {
+        if (!cancelled) {
+          timeoutId = window.setTimeout(() => {
+            void poll();
+          }, FILE_POLL_INTERVAL_MS);
+        }
+      }
+    };
+
+    timeoutId = window.setTimeout(() => {
+      void poll();
     }, FILE_POLL_INTERVAL_MS);
-    return () => window.clearInterval(intervalId);
+
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
   }, [file, load]);
 
   useEffect(() => {
