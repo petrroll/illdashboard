@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import re
@@ -10,21 +11,28 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
-from illdashboard.copilot.client import _ask
+from illdashboard.copilot.client import COPILOT_REQUEST_TIMEOUT, _ask
 from illdashboard.services.markers import normalize_marker_alias_key
 from illdashboard.services.rescaling import normalize_unit_key
 
 logger = logging.getLogger(__name__)
 
 
-MARKER_NORMALIZATION_BATCH_SIZE = 120
-MARKER_NORMALIZATION_CONCURRENCY = 2
-UNIT_NORMALIZATION_BATCH_SIZE = 40
-UNIT_NORMALIZATION_CONCURRENCY = 2
-QUALITATIVE_NORMALIZATION_BATCH_SIZE = 40
-QUALITATIVE_NORMALIZATION_CONCURRENCY = 2
-MARKER_GROUP_CLASSIFICATION_BATCH_SIZE = 40
-MARKER_GROUP_CLASSIFICATION_CONCURRENCY = 2
+# Real marker normalization runs can still exceed 180s, and this lane stays
+# serialized on purpose, so use the full request budget instead of crashing the
+# worker while the canonical-name pass is still in flight.
+NORMALIZATION_ASK_TIMEOUT = COPILOT_REQUEST_TIMEOUT
+# Large name batches are acceptable here because the lane is serialized and the
+# prompt carries forward canonical choices between batches when splitting is
+# needed elsewhere.
+MARKER_NORMALIZATION_BATCH_SIZE = 100
+MARKER_NORMALIZATION_CONCURRENCY = 1
+UNIT_NORMALIZATION_BATCH_SIZE = 80
+UNIT_NORMALIZATION_CONCURRENCY = 1
+QUALITATIVE_NORMALIZATION_BATCH_SIZE = 120
+QUALITATIVE_NORMALIZATION_CONCURRENCY = 1
+MARKER_GROUP_CLASSIFICATION_BATCH_SIZE = 200
+MARKER_GROUP_CLASSIFICATION_CONCURRENCY = 1
 
 _METRIC_PREFIX_FACTORS = {
     "n": 1e-9,
@@ -44,22 +52,27 @@ async def _ask_json(
     user_prompt: str,
     *,
     attachments: list[dict] | None = None,
-    timeout: float = 120,
+    timeout: float = NORMALIZATION_ASK_TIMEOUT,
     default: dict | None = None,
     request_name: str = "normalization_json_request",
 ) -> dict:
-    from illdashboard.copilot.client import _parse_json_response
+    from illdashboard.copilot.client import _format_json_user_prompt, _parse_json_response, _repair_json_response
 
     raw = await _ask(
         system_prompt,
-        user_prompt,
+        _format_json_user_prompt(user_prompt),
         attachments=attachments,
         timeout=timeout,
         request_name=request_name,
     )
     try:
         return _parse_json_response(raw)
-    except Exception:
+    except (json.JSONDecodeError, TypeError, ValueError):
+        try:
+            repaired = await _repair_json_response(raw, request_name=request_name)
+            return _parse_json_response(repaired)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
         if default is None:
             raise
         return default
@@ -607,19 +620,45 @@ async def normalize_marker_names(new_names: list[str], existing_canonical: list[
         names_by_key[normalized_key].append(new_name)
 
     merged_mapping: dict[str, str] = dict(direct_mapping)
-    for batch_mapping in await _run_json_batches(
-        representative_names,
-        batch_size=MARKER_NORMALIZATION_BATCH_SIZE,
-        concurrency=MARKER_NORMALIZATION_CONCURRENCY,
-        request_name="normalize_marker_names",
-        system_prompt=NORMALIZE_SYSTEM_PROMPT,
-        build_user_text=lambda batch_names: _build_marker_name_normalization_user_text(batch_names, existing_canonical),
-        parse_payload=_parse_marker_name_response,
-    ):
+    evolving_canonical = list(existing_canonical)
+    evolving_canonical_keys = {
+        normalized_key
+        for canonical_name in evolving_canonical
+        if (normalized_key := _normalize_marker_lookup_key(canonical_name))
+    }
+    batches = _chunk_items(representative_names, MARKER_NORMALIZATION_BATCH_SIZE)
+    for batch_index, batch_names in enumerate(batches, start=1):
+        logger.info(
+            "Normalize marker names batch start batch=%s/%s batch_names=%s existing_canonical=%s",
+            batch_index,
+            len(batches),
+            len(batch_names),
+            len(evolving_canonical),
+        )
+        payload = await _ask_json(
+            NORMALIZE_SYSTEM_PROMPT,
+            _build_marker_name_normalization_user_text(batch_names, evolving_canonical),
+            default={},
+            request_name="normalize_marker_names",
+        )
+        batch_mapping = _parse_marker_name_response(payload, batch_names)
+        # Smaller batches only stay consistent if later prompts can see the
+        # canonical names chosen earlier in the same call.
         for representative_name, canonical_name in batch_mapping.items():
             normalized_key = _normalize_marker_lookup_key(representative_name) or representative_name
             for original_name in names_by_key.get(normalized_key, [representative_name]):
                 merged_mapping[original_name] = canonical_name
+            canonical_key = _normalize_marker_lookup_key(canonical_name)
+            if canonical_key and canonical_key not in evolving_canonical_keys:
+                evolving_canonical_keys.add(canonical_key)
+                evolving_canonical.append(canonical_name)
+        logger.info(
+            "Normalize marker names batch finished batch=%s/%s resolved=%s existing_canonical=%s",
+            batch_index,
+            len(batches),
+            len(merged_mapping),
+            len(evolving_canonical),
+        )
 
     logger.info(
         "Normalize marker names finished input_names=%s representative_names=%s resolved=%s duration=%.2fs",

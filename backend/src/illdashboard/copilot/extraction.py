@@ -15,20 +15,66 @@ from pathlib import Path
 
 import fitz
 
-from illdashboard.copilot.client import _ask_json, get_copilot_request_load
+from illdashboard.copilot.client import COPILOT_REQUEST_TIMEOUT, _ask_json, get_copilot_request_load
 
 logger = logging.getLogger(__name__)
 
+# Earlier 300s validation forced single-page OCR. With the larger request
+# budget and the existing retry path still ready to split or lower DPI, start
+# from two-page batches again to reduce request overhead.
 OCR_PDF_BATCH_SIZE = 2
-OCR_PDF_MAX_BATCH_SIZE = 4
+OCR_PDF_MAX_BATCH_SIZE = 2
 OCR_PDF_RENDER_DPI = 144
-OCR_PDF_MIN_RENDER_DPI = 96
-OCR_ASK_TIMEOUT = 180
+OCR_PDF_MIN_RENDER_DPI = 72
+OCR_ASK_TIMEOUT = COPILOT_REQUEST_TIMEOUT
 OCR_RETRY_DELAY = 3
 OCR_PDF_BATCH_CONCURRENCY = 4
 OCR_PDF_BACKPRESSURE_BATCH_CONCURRENCY = 2
 OCR_PDF_BACKPRESSURE_MIN_PAGE_COUNT = 8
 OCR_PDF_BACKPRESSURE_QUEUE_THRESHOLD = 6
+A4_WIDTH_INCHES = 210 / 25.4
+A4_HEIGHT_INCHES = 297 / 25.4
+
+
+def _unlink_paths(paths: list[str]) -> None:
+    for path in paths:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _a4_pixel_bounds(*, dpi: int, landscape: bool) -> tuple[int, int]:
+    short_edge = max(1, round(A4_WIDTH_INCHES * dpi))
+    long_edge = max(1, round(A4_HEIGHT_INCHES * dpi))
+    return (long_edge, short_edge) if landscape else (short_edge, long_edge)
+
+
+def _resize_scale_for_bounds(width: int, height: int, *, max_width: int, max_height: int) -> float:
+    if width <= 0 or height <= 0:
+        return 1.0
+    return min(1.0, max_width / width, max_height / height)
+
+
+def _a4_capped_dimensions(width: int, height: int, *, dpi: int) -> tuple[int, int]:
+    max_width, max_height = _a4_pixel_bounds(dpi=dpi, landscape=width >= height)
+    resize_scale = _resize_scale_for_bounds(width, height, max_width=max_width, max_height=max_height)
+    return (
+        max(1, min(max_width, round(width * resize_scale))),
+        max(1, min(max_height, round(height * resize_scale))),
+    )
+
+
+def _new_temp_png_path() -> str:
+    temp_file = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    temp_file.close()
+    return temp_file.name
+
+
+def _save_pixmap_to_temp_png(pixmap: fitz.Pixmap) -> str:
+    temp_path = _new_temp_png_path()
+    pixmap.save(temp_path)
+    return temp_path
 
 
 class _PdfRenderCache:
@@ -51,11 +97,29 @@ class _PdfRenderCache:
             cached_paths = [path for paths in self._images_by_batch.values() for path in paths]
             self._images_by_batch.clear()
 
-        for path in cached_paths:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        _unlink_paths(cached_paths)
+
+
+class _ImageRenderCache:
+    def __init__(self, image_path: str):
+        self.image_path = image_path
+        self._lock = asyncio.Lock()
+        self._images_by_dpi: dict[int, str] = {}
+
+    async def attachments_for_dpi(self, *, dpi: int) -> list[dict]:
+        async with self._lock:
+            path = self._images_by_dpi.get(dpi)
+            if path is None:
+                path = _image_to_png(self.image_path, dpi=dpi)
+                self._images_by_dpi[dpi] = path
+        return [{"type": "file", "path": path}]
+
+    async def aclose(self) -> None:
+        async with self._lock:
+            cached_paths = list(self._images_by_dpi.values())
+            self._images_by_dpi.clear()
+
+        _unlink_paths(cached_paths)
 
 
 @dataclass(frozen=True)
@@ -208,6 +272,45 @@ Do not include any commentary outside the JSON.\
 """
 
 
+def _render_pdf_page_to_temp_png(page: fitz.Page, *, dpi: int) -> str:
+    requested_width = max(1, round(page.rect.width * dpi / 72))
+    requested_height = max(1, round(page.rect.height * dpi / 72))
+    target_width, target_height = _a4_capped_dimensions(requested_width, requested_height, dpi=dpi)
+    # Cap every OCR attachment to an A4-sized pixel budget so retries reduce
+    # payload size predictably without warping the underlying page geometry.
+    render_scale = min(target_width / requested_width, target_height / requested_height) * (dpi / 72)
+    pixmap = page.get_pixmap(matrix=fitz.Matrix(render_scale, render_scale), colorspace=fitz.csGRAY, alpha=False)
+    return _save_pixmap_to_temp_png(pixmap)
+
+
+def _image_to_png(image_path: str, *, dpi: int) -> str:
+    source = fitz.Pixmap(image_path)
+    source_width = source.width
+    source_height = source.height
+    target_width, target_height = _a4_capped_dimensions(source_width, source_height, dpi=dpi)
+    resize_scale = min(target_width / source_width, target_height / source_height)
+
+    with fitz.open(image_path) as document:
+        page = document.load_page(0)
+        native_scale = min(source_width / page.rect.width, source_height / page.rect.height)
+        pixmap = page.get_pixmap(
+            matrix=fitz.Matrix(native_scale * resize_scale, native_scale * resize_scale),
+            colorspace=fitz.csGRAY,
+            alpha=False,
+        )
+
+    logger.info(
+        "Rendered image path=%s dpi=%s source_pixels=%sx%s output_pixels=%sx%s",
+        image_path,
+        dpi,
+        source_width,
+        source_height,
+        pixmap.width,
+        pixmap.height,
+    )
+    return _save_pixmap_to_temp_png(pixmap)
+
+
 def _pdf_to_images(
     pdf_path: str, *, start_page: int = 0, stop_page: int | None = None, dpi: int = OCR_PDF_RENDER_DPI
 ) -> list[str]:
@@ -228,11 +331,7 @@ def _pdf_to_images(
     try:
         for page_index in range(start_page, page_stop):
             page = document.load_page(page_index)
-            pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY, alpha=False)
-            temp_file = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-            temp_file.close()
-            pix.save(temp_file.name)
-            paths.append(temp_file.name)
+            paths.append(_render_pdf_page_to_temp_png(page, dpi=dpi))
     finally:
         document.close()
 
@@ -439,11 +538,50 @@ async def _pdf_batch_extract(
         )
         raise
     finally:
-        for path in temp_images:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        _unlink_paths(temp_images)
+
+
+async def _image_extract(
+    image_path: str,
+    kind: _ExtractionKind,
+    *,
+    dpi: int,
+    filename: str | None = None,
+    render_cache: _ImageRenderCache | None = None,
+) -> dict:
+    temp_images: list[str] = []
+    started_at = time.perf_counter()
+    logger.info("%s image extract start path=%s filename=%s dpi=%s", kind.label, image_path, filename, dpi)
+
+    try:
+        if render_cache is None:
+            temp_images = [_image_to_png(image_path, dpi=dpi)]
+            attachments = [{"type": "file", "path": temp_images[0]}]
+        else:
+            attachments = await render_cache.attachments_for_dpi(dpi=dpi)
+
+        result = await kind.extract_fn(attachments, filename=filename)
+        logger.info(
+            "%s image extract done path=%s filename=%s dpi=%s duration=%.2fs",
+            kind.label,
+            image_path,
+            filename,
+            dpi,
+            time.perf_counter() - started_at,
+        )
+        return result
+    except Exception:
+        logger.exception(
+            "%s image extract failed path=%s filename=%s dpi=%s after %.2fs",
+            kind.label,
+            image_path,
+            filename,
+            dpi,
+            time.perf_counter() - started_at,
+        )
+        raise
+    finally:
+        _unlink_paths(temp_images)
 
 
 async def _pdf_range_with_retries(
@@ -558,8 +696,7 @@ async def _pdf_range_with_retries(
             right = await _retry(start_page=midpoint, stop_page=stop_page)
             return kind.merge_fn([left, right])
 
-        smaller_dpi = max(OCR_PDF_MIN_RENDER_DPI, dpi - 24)
-        if smaller_dpi != dpi:
+        if dpi != OCR_PDF_MIN_RENDER_DPI:
             logger.warning(
                 "%s page request failed for %s (filename=%s, page=%s, dpi=%s, reason=%s); retrying at dpi=%s",
                 kind.label,
@@ -568,9 +705,9 @@ async def _pdf_range_with_retries(
                 start_page + 1,
                 dpi,
                 retry_reason,
-                smaller_dpi,
+                OCR_PDF_MIN_RENDER_DPI,
             )
-            return await _retry(dpi=smaller_dpi)
+            return await _retry(dpi=OCR_PDF_MIN_RENDER_DPI)
 
         logger.exception(
             "%s extraction failed at minimum DPI for %s (filename=%s, page=%s, dpi=%s)",
@@ -583,12 +720,75 @@ async def _pdf_range_with_retries(
         raise
 
 
+async def _image_with_retries(
+    image_path: str,
+    kind: _ExtractionKind,
+    *,
+    dpi: int = OCR_PDF_RENDER_DPI,
+    filename: str | None = None,
+    render_cache: _ImageRenderCache | None = None,
+) -> dict:
+    started_at = time.perf_counter()
+    logger.info("%s image start path=%s filename=%s dpi=%s", kind.label, image_path, filename, dpi)
+
+    try:
+        result = await _image_extract(
+            image_path,
+            kind,
+            dpi=dpi,
+            filename=filename,
+            render_cache=render_cache,
+        )
+        logger.info(
+            "%s image success path=%s filename=%s dpi=%s duration=%.2fs",
+            kind.label,
+            image_path,
+            filename,
+            dpi,
+            time.perf_counter() - started_at,
+        )
+        return kind.post_process_fn(result, 0) if kind.post_process_fn else result
+    except Exception as exc:
+        retry_reason = _retryable_pdf_error_reason(exc)
+        if not _is_retryable_pdf_error(exc):
+            logger.exception("%s extraction failed for %s (filename=%s, dpi=%s)", kind.label, image_path, filename, dpi)
+            raise
+
+        if dpi != OCR_PDF_MIN_RENDER_DPI:
+            logger.warning(
+                "%s image request failed for %s (filename=%s, dpi=%s, reason=%s); retrying at dpi=%s",
+                kind.label,
+                image_path,
+                filename,
+                dpi,
+                retry_reason,
+                OCR_PDF_MIN_RENDER_DPI,
+            )
+            await asyncio.sleep(OCR_RETRY_DELAY)
+            return await _image_with_retries(
+                image_path,
+                kind,
+                dpi=OCR_PDF_MIN_RENDER_DPI,
+                filename=filename,
+                render_cache=render_cache,
+            )
+
+        logger.exception(
+            "%s extraction failed at minimum DPI for %s (filename=%s, dpi=%s)",
+            kind.label,
+            image_path,
+            filename,
+            dpi,
+        )
+        raise
+
+
 async def _extract_file(
     file_path: str,
     kind: _ExtractionKind,
     *,
     filename: str | None = None,
-    render_cache: _PdfRenderCache | None = None,
+    render_cache: _PdfRenderCache | _ImageRenderCache | None = None,
 ) -> dict:
     """Extract data from a file using the given extraction kind."""
     started_at = time.perf_counter()
@@ -620,7 +820,7 @@ async def _extract_file_batches(
     kind: _ExtractionKind,
     *,
     filename: str | None = None,
-    render_cache: _PdfRenderCache | None = None,
+    render_cache: _PdfRenderCache | _ImageRenderCache | None = None,
 ):
     """Yield finished extraction batches as soon as they complete.
 
@@ -630,12 +830,18 @@ async def _extract_file_batches(
 
     if Path(file_path).suffix.lower() != ".pdf":
         logger.info("%s single-image path=%s filename=%s", kind.label, file_path, filename)
-        result = await kind.extract_fn([{"type": "file", "path": file_path}], filename=filename)
+        image_cache = render_cache if isinstance(render_cache, _ImageRenderCache) else None
+        result = await _image_with_retries(
+            file_path,
+            kind,
+            filename=filename,
+            render_cache=image_cache,
+        )
         yield _ExtractionBatch(
             batch_index=0,
             start_page=0,
             stop_page=1,
-            result=kind.post_process_fn(result, 0) if kind.post_process_fn else result,
+            result=result,
         )
         return
 
@@ -715,11 +921,14 @@ async def ocr_extract(
     """Run the full OCR extraction pipeline for one uploaded file."""
     started_at = time.perf_counter()
     logger.info("OCR pipeline start path=%s filename=%s", file_path, filename)
-    render_cache = _PdfRenderCache(file_path) if Path(file_path).suffix.lower() == ".pdf" else None
+    render_cache = (
+        _PdfRenderCache(file_path)
+        if Path(file_path).suffix.lower() == ".pdf"
+        else _ImageRenderCache(file_path)
+    )
+    usable_text_result: dict | None = None
+    summary_english: str | None = None
 
-    # Keep structured extraction and free-form OCR + translation as separate
-    # stages. Do not merge them. They intentionally serve different prompts and
-    # failure modes even when they reuse the same rendered pages.
     async def _extract_medical_result() -> dict:
         if on_medical_batch is None:
             return await _extract_file(file_path, _MEDICAL_EXTRACTION, filename=filename, render_cache=render_cache)
@@ -738,69 +947,63 @@ async def ocr_extract(
             [batch.result for batch in sorted(medical_batches, key=lambda current: current.batch_index)]
         )
 
-    medical_task = asyncio.create_task(_extract_medical_result())
-    text_task = asyncio.create_task(
-        _extract_file(file_path, _TEXT_EXTRACTION, filename=filename, render_cache=render_cache)
-    )
-
     try:
-        medical_result_or_error, text_result_or_error = await asyncio.gather(
-            medical_task,
-            text_task,
-            return_exceptions=True,
+        medical_result = await _extract_medical_result()
+        logger.info(
+            "OCR pipeline medical extraction ready path=%s filename=%s measurements=%s elapsed=%.2fs",
+            file_path,
+            filename,
+            len(medical_result.get("measurements", [])),
+            time.perf_counter() - started_at,
         )
+
+        try:
+            usable_text_result = await extract_text(
+                file_path,
+                filename=filename,
+                render_cache=render_cache,
+            )
+        except Exception as exc:
+            logger.error(
+                "Document text extraction failed for %s (filename=%s): %s",
+                file_path,
+                filename,
+                exc,
+            )
+            usable_text_result = None
+        else:
+            logger.info(
+                "OCR pipeline text extraction ready path=%s filename=%s has_raw_text=%s "
+                "has_translated_text=%s elapsed=%.2fs",
+                file_path,
+                filename,
+                bool(usable_text_result.get("raw_text")),
+                bool(usable_text_result.get("translated_text_english")),
+                time.perf_counter() - started_at,
+            )
+            try:
+                # Keep text OCR and summarization in separate calls so each text
+                # batch stays small and summary sees the fully merged document.
+                summary_english = await generate_summary(medical_result, usable_text_result, filename=filename)
+            except Exception as exc:
+                logger.error(
+                    "Medical summary generation failed for %s (filename=%s): %s",
+                    file_path,
+                    filename,
+                    exc,
+                )
+                summary_english = None
+            else:
+                logger.info(
+                    "OCR pipeline summary ready path=%s filename=%s has_summary=%s elapsed=%.2fs",
+                    file_path,
+                    filename,
+                    bool(summary_english),
+                    time.perf_counter() - started_at,
+                )
     finally:
         if render_cache is not None:
             await render_cache.aclose()
-
-    if isinstance(medical_result_or_error, BaseException):
-        logger.warning(
-            "OCR pipeline medical extraction failed path=%s filename=%s after %.2fs error=%s",
-            file_path,
-            filename,
-            time.perf_counter() - started_at,
-            medical_result_or_error,
-        )
-        raise medical_result_or_error
-
-    medical_result = medical_result_or_error
-    logger.info(
-        "OCR pipeline medical extraction ready path=%s filename=%s measurements=%s elapsed=%.2fs",
-        file_path,
-        filename,
-        len(medical_result.get("measurements", [])),
-        time.perf_counter() - started_at,
-    )
-
-    usable_text_result: dict | None
-    if isinstance(text_result_or_error, BaseException):
-        logger.error(
-            "Document text extraction failed for %s (filename=%s): %s",
-            file_path,
-            filename,
-            text_result_or_error,
-        )
-        usable_text_result = None
-    else:
-        usable_text_result = text_result_or_error
-        logger.info(
-            "OCR pipeline document text ready path=%s filename=%s has_raw_text=%s has_translated_text=%s elapsed=%.2fs",
-            file_path,
-            filename,
-            bool(usable_text_result.get("raw_text")),
-            bool(usable_text_result.get("translated_text_english")),
-            time.perf_counter() - started_at,
-        )
-
-    summary_english: str | None = None
-    try:
-        summary_english = await _generate_medical_summary(
-            medical_result,
-            usable_text_result,
-            filename=filename,
-        )
-    except Exception:
-        logger.exception("Medical summary generation failed for %s (filename=%s)", file_path, filename)
 
     logger.info(
         "OCR pipeline finished path=%s filename=%s measurements=%s raw_text=%s summary=%s duration=%.2fs",
@@ -812,6 +1015,41 @@ async def ocr_extract(
         time.perf_counter() - started_at,
     )
     return _combine_ocr_outputs(medical_result, usable_text_result, summary_english)
+
+
+async def extract_text(
+    file_path: str,
+    *,
+    filename: str | None = None,
+    render_cache: _PdfRenderCache | _ImageRenderCache | None = None,
+) -> dict:
+    started_at = time.perf_counter()
+    logger.info(
+        "Document text extraction start path=%s filename=%s",
+        file_path,
+        filename,
+    )
+
+    try:
+        result = await _extract_file(file_path, _TEXT_EXTRACTION, filename=filename, render_cache=render_cache)
+        logger.info(
+            "Document text extraction finished path=%s filename=%s has_raw_text=%s has_translated_text=%s "
+            "duration=%.2fs",
+            file_path,
+            filename,
+            bool(result.get("raw_text")),
+            bool(result.get("translated_text_english")),
+            time.perf_counter() - started_at,
+        )
+        return result
+    except Exception:
+        logger.exception(
+            "Document text extraction failed path=%s filename=%s after %.2fs",
+            file_path,
+            filename,
+            time.perf_counter() - started_at,
+        )
+        raise
 
 
 def page_count_for_file(file_path: str) -> int:
@@ -839,8 +1077,12 @@ async def extract_measurement_batch(
     filename: str | None = None,
 ) -> dict:
     if Path(file_path).suffix.lower() != ".pdf":
-        result = await _MEDICAL_EXTRACTION.extract_fn([{"type": "file", "path": file_path}], filename=filename)
-        return _offset_result_page_numbers(result, 0)
+        return await _image_with_retries(
+            file_path,
+            _MEDICAL_EXTRACTION,
+            dpi=dpi,
+            filename=filename,
+        )
 
     # The DB-backed pipeline calls this wrapper directly for each durable OCR
     # job, so it must go through the retry/split/lower-DPI path instead of the
@@ -864,7 +1106,12 @@ async def extract_text_batch(
     filename: str | None = None,
 ) -> dict:
     if Path(file_path).suffix.lower() != ".pdf":
-        return await _TEXT_EXTRACTION.extract_fn([{"type": "file", "path": file_path}], filename=filename)
+        return await _image_with_retries(
+            file_path,
+            _TEXT_EXTRACTION,
+            dpi=dpi,
+            filename=filename,
+        )
 
     # Keep the durable text-extraction jobs on the same resilient path as the
     # full OCR flow so oversized or slow batches fan out instead of failing the

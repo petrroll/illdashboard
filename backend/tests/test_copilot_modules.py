@@ -1,15 +1,18 @@
 import asyncio
 import json
 from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import fitz
 import pytest
 
 from illdashboard.copilot import client as copilot_client
 from illdashboard.copilot import explanations as copilot_explanations
 from illdashboard.copilot import extraction as copilot_ocr
 from illdashboard.copilot import normalization as copilot_normalization
+from illdashboard.services import pipeline
 
 
 class DummySession:
@@ -43,6 +46,34 @@ class DummySession:
         return self._response
 
 
+class BlockingSession(DummySession):
+    def __init__(self, release_event: asyncio.Event):
+        super().__init__(response=SimpleNamespace(data=SimpleNamespace(content="ok")))
+        self._release_event = release_event
+
+    async def send_and_wait(self, *_args, **_kwargs):
+        await self._release_event.wait()
+        return await super().send_and_wait(*_args, **_kwargs)
+
+
+class WarningSession(DummySession):
+    async def send_and_wait(self, *_args, **_kwargs):
+        if self._handler is not None:
+            self._handler(
+                SimpleNamespace(
+                    type=copilot_client.SessionEventType.SESSION_WARNING,
+                    data=SimpleNamespace(
+                        message="rate limited",
+                        warning_type="rate_limit",
+                        status_code=429,
+                        reason="too_many_requests",
+                        error_reason=None,
+                    ),
+                )
+            )
+        return await super().send_and_wait(*_args, **_kwargs)
+
+
 class DummyDoc:
     def __init__(self, page_count: int):
         self.page_count = page_count
@@ -60,8 +91,34 @@ def _no_retry_delay():
         yield
 
 
+def test_ocr_and_normalization_share_the_longer_request_budget():
+    assert copilot_client.COPILOT_REQUEST_TIMEOUT == 900
+    assert copilot_ocr.OCR_ASK_TIMEOUT == copilot_client.COPILOT_REQUEST_TIMEOUT
+    assert copilot_normalization.NORMALIZATION_ASK_TIMEOUT == copilot_client.COPILOT_REQUEST_TIMEOUT
+    assert copilot_normalization.MARKER_NORMALIZATION_BATCH_SIZE == 100
+    assert pipeline.JOB_LEASE_SECONDS == copilot_client.COPILOT_REQUEST_TIMEOUT
+
+
+def test_normalization_requests_use_separate_serialized_lanes():
+    assert copilot_client._request_lane_name("structured_medical_extraction") == "extraction"
+    assert copilot_client._request_lane_name("medical_summary") == "summary"
+    assert copilot_client._request_lane_name("normalize_source_name") == "normalize_source_name"
+    assert copilot_client._request_lane_name("normalize_qualitative_values") == "normalize_qualitative_values"
+    assert copilot_client._request_lane_limit("normalize_source_name") == 1
+    assert copilot_client._request_lane_limit("normalize_qualitative_values") == 1
+    assert copilot_client._request_lane_limit("classify_marker_groups") == 1
+
+
 def _medical_calls(mock) -> list:
     return [args for args in mock.await_args_list if args.args[1] is copilot_ocr._MEDICAL_EXTRACTION]
+
+
+async def _wait_for(condition, *, timeout: float = 1.0):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not condition():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("timed out waiting for condition")
+        await asyncio.sleep(0.01)
 
 
 @pytest.mark.asyncio
@@ -98,14 +155,17 @@ async def test_ocr_extract_splits_oversized_batches_and_preserves_page_numbers()
 
     with (
         patch("illdashboard.copilot.extraction.fitz.open", return_value=DummyDoc(page_count=4)),
+        patch.object(copilot_ocr, "OCR_PDF_BATCH_SIZE", 2),
+        patch.object(copilot_ocr, "OCR_PDF_MAX_BATCH_SIZE", 2),
         patch(
             "illdashboard.copilot.extraction._pdf_batch_extract",
             new=AsyncMock(side_effect=fake_batch),
         ) as batch_mock,
         patch(
-            "illdashboard.copilot.extraction._generate_medical_summary",
-            new=AsyncMock(return_value=None),
+            "illdashboard.copilot.extraction.extract_text",
+            new=AsyncMock(return_value={"raw_text": "text", "translated_text_english": "text"}),
         ),
+        patch("illdashboard.copilot.extraction.generate_summary", new=AsyncMock(return_value=None)),
     ):
         result = await copilot_ocr.ocr_extract("/tmp/report.pdf")
 
@@ -174,9 +234,15 @@ async def test_ocr_extract_retries_single_page_at_lower_dpi_after_413():
             new=AsyncMock(side_effect=fake_batch),
         ) as batch_mock,
         patch(
-            "illdashboard.copilot.extraction._generate_medical_summary",
-            new=AsyncMock(return_value=None),
+            "illdashboard.copilot.extraction.extract_text",
+            new=AsyncMock(
+                return_value={
+                    "raw_text": "Sodium 141 mmol/l",
+                    "translated_text_english": "Sodium 141 mmol/l",
+                }
+            ),
         ),
+        patch("illdashboard.copilot.extraction.generate_summary", new=AsyncMock(return_value=None)),
     ):
         result = await copilot_ocr.ocr_extract("/tmp/report.pdf")
 
@@ -209,8 +275,100 @@ async def test_ocr_extract_retries_single_page_at_lower_dpi_after_413():
         for call in medical
     ] == [
         ("/tmp/report.pdf", 0, 1, 144, None),
-        ("/tmp/report.pdf", 0, 1, 120, None),
+        ("/tmp/report.pdf", 0, 1, 72, None),
     ]
+
+
+@pytest.mark.asyncio
+async def test_extract_measurement_batch_retries_image_at_lower_dpi_after_413():
+    async def fake_image_extract(
+        image_path: str,
+        kind: copilot_ocr._ExtractionKind,
+        *,
+        dpi: int,
+        filename: str | None = None,
+        render_cache=None,
+    ):
+        assert image_path == "/tmp/report.png"
+        assert kind is copilot_ocr._MEDICAL_EXTRACTION
+        if dpi == copilot_ocr.OCR_PDF_RENDER_DPI:
+            raise Exception("CAPIError: 413 failed to parse request")
+        return {
+            "lab_date": None,
+            "source": None,
+            "measurements": [
+                {
+                    "marker_name": "Sodium",
+                    "value": 141,
+                    "unit": "mmol/l",
+                    "reference_low": 136,
+                    "reference_high": 145,
+                    "measured_at": None,
+                    "page_number": 1,
+                }
+            ],
+        }
+
+    with patch(
+        "illdashboard.copilot.extraction._image_extract",
+        new=AsyncMock(side_effect=fake_image_extract),
+    ) as image_mock:
+        result = await copilot_ocr.extract_measurement_batch(
+            "/tmp/report.png",
+            start_page=0,
+            stop_page=1,
+            dpi=144,
+        )
+
+    assert result["measurements"][0]["page_number"] == 1
+    assert [
+        (
+            call.args[0],
+            call.kwargs["dpi"],
+            call.kwargs["filename"],
+        )
+        for call in image_mock.await_args_list
+    ] == [
+        ("/tmp/report.png", 144, None),
+        ("/tmp/report.png", 72, None),
+    ]
+
+
+def test_pdf_to_images_caps_render_to_a4_pixels(tmp_path):
+    pdf_path = tmp_path / "oversized.pdf"
+    document = fitz.open()
+    document.new_page(width=1200, height=1600)
+    document.save(pdf_path)
+    document.close()
+
+    paths = copilot_ocr._pdf_to_images(str(pdf_path), dpi=copilot_ocr.OCR_PDF_RENDER_DPI)
+    try:
+        assert len(paths) == 1
+        rendered = fitz.Pixmap(paths[0])
+        max_width, max_height = copilot_ocr._a4_pixel_bounds(dpi=copilot_ocr.OCR_PDF_RENDER_DPI, landscape=False)
+        assert rendered.width <= max_width
+        assert rendered.height <= max_height
+        assert abs((rendered.width / rendered.height) - (1200 / 1600)) < 0.02
+    finally:
+        for path in paths:
+            Path(path).unlink(missing_ok=True)
+
+
+def test_image_to_png_caps_render_to_a4_pixels(tmp_path):
+    image_path = tmp_path / "oversized.png"
+    pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 3000, 2000), False)
+    pixmap.clear_with(200)
+    pixmap.save(image_path)
+
+    rendered_path = copilot_ocr._image_to_png(str(image_path), dpi=copilot_ocr.OCR_PDF_RENDER_DPI)
+    try:
+        rendered = fitz.Pixmap(rendered_path)
+        max_width, max_height = copilot_ocr._a4_pixel_bounds(dpi=copilot_ocr.OCR_PDF_RENDER_DPI, landscape=True)
+        assert rendered.width <= max_width
+        assert rendered.height <= max_height
+        assert abs((rendered.width / rendered.height) - (3000 / 2000)) < 0.02
+    finally:
+        Path(rendered_path).unlink(missing_ok=True)
 
 
 @pytest.mark.asyncio
@@ -366,6 +524,8 @@ async def test_extract_file_processes_page_batches_in_parallel():
 
     with (
         patch("illdashboard.copilot.extraction.fitz.open", return_value=DummyDoc(page_count=4)),
+        patch.object(copilot_ocr, "OCR_PDF_BATCH_SIZE", 2),
+        patch.object(copilot_ocr, "OCR_PDF_MAX_BATCH_SIZE", 2),
         patch.object(
             copilot_ocr,
             "OCR_PDF_BATCH_CONCURRENCY",
@@ -436,15 +596,13 @@ async def test_ocr_extract_streams_medical_batches_before_combining_result():
             },
         )
 
-    async def fake_extract_file(
+    async def fake_extract_text(
         file_path: str,
-        kind: copilot_ocr._ExtractionKind,
         *,
         filename: str | None = None,
         render_cache=None,
     ):
         assert file_path == "/tmp/report.pdf"
-        assert kind is copilot_ocr._TEXT_EXTRACTION
         return {"raw_text": "text", "translated_text_english": "text"}
 
     async def on_medical_batch(batch_index: int, batch_result: dict) -> None:
@@ -459,10 +617,10 @@ async def test_ocr_extract_streams_medical_batches_before_combining_result():
         patch.object(copilot_ocr, "_extract_file_batches", side_effect=fake_extract_batches),
         patch.object(
             copilot_ocr,
-            "_extract_file",
-            side_effect=fake_extract_file,
+            "extract_text",
+            side_effect=fake_extract_text,
         ),
-        patch.object(copilot_ocr, "_generate_medical_summary", new=AsyncMock(return_value=None)),
+        patch.object(copilot_ocr, "generate_summary", new=AsyncMock(return_value=None)),
     ):
         result = await copilot_ocr.ocr_extract(
             "/tmp/report.pdf",
@@ -502,6 +660,36 @@ async def test_normalize_marker_names_splits_large_batches():
         "Marker 3": "Canonical 3",
     }
     assert ask_mock.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_normalize_marker_names_reuses_new_canonical_names_across_batches():
+    responses = [
+        '{"HbA1c": "HbA1c"}',
+        '{"Glykovaný hemoglobin": "HbA1c"}',
+    ]
+
+    with (
+        patch.object(copilot_normalization, "MARKER_NORMALIZATION_BATCH_SIZE", 1),
+        patch.object(
+            copilot_normalization,
+            "MARKER_NORMALIZATION_CONCURRENCY",
+            1,
+        ),
+        patch("illdashboard.copilot.normalization._ask", new=AsyncMock(side_effect=responses)) as ask_mock,
+    ):
+        result = await copilot_normalization.normalize_marker_names(
+            ["HbA1c", "Glykovaný hemoglobin"],
+            [],
+        )
+
+    assert result == {
+        "HbA1c": "HbA1c",
+        "Glykovaný hemoglobin": "HbA1c",
+    }
+    assert ask_mock.await_count == 2
+    assert ask_mock.await_args_list[0].args[1].startswith("EXISTING canonical marker names:\n(none yet)")
+    assert "\n- HbA1c\n" in ask_mock.await_args_list[1].args[1]
 
 
 @pytest.mark.asyncio
@@ -659,6 +847,89 @@ async def test_ask_adds_observed_premium_usage_cost():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_name", "expected_model", "expected_reasoning_effort"),
+    [
+        ("structured_medical_extraction", "measurement-model", None),
+        ("document_text_extraction", "text-model", None),
+        ("normalize_marker_names", "normalization-model", "high"),
+        ("medical_summary", "default-model", None),
+    ],
+)
+async def test_ask_uses_request_specific_session_settings(
+    request_name: str,
+    expected_model: str,
+    expected_reasoning_effort: str | None,
+):
+    session = DummySession(response=SimpleNamespace(data=SimpleNamespace(content="ok")))
+    client = SimpleNamespace(create_session=AsyncMock(return_value=session))
+
+    with (
+        patch.object(copilot_client.settings, "COPILOT_DEFAULT_MODEL", "default-model"),
+        patch.object(copilot_client.settings, "COPILOT_MEASUREMENT_EXTRACTION_MODEL", "measurement-model"),
+        patch.object(copilot_client.settings, "COPILOT_MEASUREMENT_EXTRACTION_REASONING_EFFORT", None),
+        patch.object(copilot_client.settings, "COPILOT_TEXT_EXTRACTION_MODEL", "text-model"),
+        patch.object(copilot_client.settings, "COPILOT_TEXT_EXTRACTION_REASONING_EFFORT", None),
+        patch.object(copilot_client.settings, "COPILOT_NORMALIZATION_MODEL", "normalization-model"),
+        patch.object(copilot_client.settings, "COPILOT_NORMALIZATION_REASONING_EFFORT", "high"),
+        patch("illdashboard.copilot.client._get_client", new=AsyncMock(return_value=client)),
+    ):
+        result = await copilot_client._ask("system", "user", request_name=request_name)
+
+    assert result == "ok"
+    session_config = client.create_session.await_args.args[0]
+    assert session_config["model"] == expected_model
+    assert session_config.get("reasoning_effort") == expected_reasoning_effort
+
+
+@pytest.mark.asyncio
+async def test_ask_logs_session_warning_payloads():
+    session = WarningSession(response=SimpleNamespace(data=SimpleNamespace(content="ok")))
+    client = SimpleNamespace(create_session=AsyncMock(return_value=session))
+
+    with (
+        patch("illdashboard.copilot.client._get_client", new=AsyncMock(return_value=client)),
+        patch.object(copilot_client.logger, "warning") as warning_mock,
+    ):
+        result = await copilot_client._ask("system", "user")
+
+    assert result == "ok"
+    warning_calls = [
+        call for call in warning_mock.call_args_list if call.args and call.args[0].startswith("Copilot session warning")
+    ]
+    assert warning_calls
+    assert "rate_limit" in warning_calls[0].args
+    assert 429 in warning_calls[0].args
+    assert "rate limited" in warning_calls[0].args
+    session.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ask_logs_heartbeat_while_waiting_for_idle():
+    release_event = asyncio.Event()
+    client = SimpleNamespace(
+        create_session=AsyncMock(side_effect=lambda *_args, **_kwargs: BlockingSession(release_event))
+    )
+
+    with (
+        patch("illdashboard.copilot.client._get_client", new=AsyncMock(return_value=client)),
+        patch.object(copilot_client, "COPILOT_REQUEST_PROGRESS_INTERVAL", 0.01),
+        patch.object(copilot_client.logger, "info") as info_mock,
+    ):
+        task = asyncio.create_task(copilot_client._ask("system", "user"))
+        await _wait_for(
+            lambda: any(
+                call.args and call.args[0].startswith("Copilot request still running")
+                for call in info_mock.call_args_list
+            )
+        )
+        release_event.set()
+        result = await task
+
+    assert result == "ok"
+
+
+@pytest.mark.asyncio
 async def test_ask_adds_observed_usage_even_when_send_fails():
     session = DummySession(
         send_error=RuntimeError("boom"),
@@ -675,6 +946,117 @@ async def test_ask_adds_observed_usage_even_when_send_fails():
 
     add_mock.assert_called_once_with(1.0)
     session.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ask_retries_failed_to_list_models_with_fresh_client():
+    failing_session = DummySession(
+        send_error=Exception("Session error: Execution failed: Error: Failed to list models")
+    )
+    success_session = DummySession(response=SimpleNamespace(data=SimpleNamespace(content="ok")))
+    client = SimpleNamespace(create_session=AsyncMock(side_effect=[failing_session, success_session]))
+
+    with (
+        patch("illdashboard.copilot.client._get_client", new=AsyncMock(return_value=client)),
+        patch("illdashboard.copilot.client.shutdown_client", new=AsyncMock()) as shutdown_mock,
+        patch.object(copilot_client, "COPILOT_TRANSIENT_RETRY_DELAY", 0),
+    ):
+        result = await copilot_client._ask("system", "user")
+
+    assert result == "ok"
+    assert client.create_session.await_count == 2
+    shutdown_mock.assert_awaited_once()
+    failing_session.disconnect.assert_awaited_once()
+    success_session.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ask_json_adds_strict_json_instructions():
+    with patch("illdashboard.copilot.client._ask", new=AsyncMock(return_value='{"ok": true}')) as ask_mock:
+        result = await copilot_client._ask_json("system", "user", request_name="document_text_extraction")
+
+    assert result == {"ok": True}
+    assert ask_mock.await_args is not None
+    assert "Return exactly one valid JSON object" in ask_mock.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_ask_json_repairs_malformed_json_responses():
+    with patch(
+        "illdashboard.copilot.client._ask",
+        new=AsyncMock(side_effect=['{"raw_text": "hello', '{"raw_text": "hello"}']),
+    ) as ask_mock:
+        result = await copilot_client._ask_json("system", "user", request_name="document_text_extraction")
+
+    assert result == {"raw_text": "hello"}
+    assert ask_mock.await_count == 2
+    assert ask_mock.await_args_list[1].kwargs["request_name"] == "repair_json_response"
+    assert "Malformed response" in ask_mock.await_args_list[1].args[1]
+
+
+@pytest.mark.asyncio
+async def test_ask_allows_distinct_normalization_lanes_while_extraction_is_busy():
+    release_event = asyncio.Event()
+    client = SimpleNamespace(
+        create_session=AsyncMock(side_effect=lambda *_args, **_kwargs: BlockingSession(release_event))
+    )
+
+    copilot_client._request_semaphore = None
+    copilot_client._request_semaphore_limit = 0
+    copilot_client._lane_semaphores.clear()
+    copilot_client._lane_semaphore_limits.clear()
+    copilot_client._queued_request_count = 0
+    copilot_client._active_request_count = 0
+
+    with patch("illdashboard.copilot.client._get_client", new=AsyncMock(return_value=client)):
+        extraction_tasks = []
+        source_normalization_task = None
+        qualitative_normalization_task = None
+        blocked_same_lane_task = None
+        summary_task = None
+        try:
+            extraction_tasks = [
+                asyncio.create_task(
+                    copilot_client._ask("system", "user", request_name="structured_medical_extraction")
+                )
+                for _ in range(copilot_client.COPILOT_EXTRACTION_CONCURRENCY + 1)
+            ]
+            await _wait_for(lambda: client.create_session.await_count == copilot_client.COPILOT_EXTRACTION_CONCURRENCY)
+
+            source_normalization_task = asyncio.create_task(
+                copilot_client._ask("system", "user", request_name="normalize_source_name")
+            )
+            qualitative_normalization_task = asyncio.create_task(
+                copilot_client._ask("system", "user", request_name="normalize_qualitative_values")
+            )
+            blocked_same_lane_task = asyncio.create_task(
+                copilot_client._ask("system", "user", request_name="normalize_qualitative_values")
+            )
+            summary_task = asyncio.create_task(copilot_client._ask("system", "user", request_name="medical_summary"))
+
+            await _wait_for(
+                lambda: client.create_session.await_count == copilot_client.COPILOT_EXTRACTION_CONCURRENCY + 3
+            )
+            assert not extraction_tasks[-1].done()
+            assert not blocked_same_lane_task.done()
+        finally:
+            release_event.set()
+
+        results = await asyncio.gather(
+            *extraction_tasks,
+            *(
+                task
+                for task in [
+                    source_normalization_task,
+                    qualitative_normalization_task,
+                    blocked_same_lane_task,
+                    summary_task,
+                ]
+                if task is not None
+            ),
+        )
+
+    assert results == ["ok"] * (copilot_client.COPILOT_EXTRACTION_CONCURRENCY + 5)
 
 
 @pytest.mark.asyncio

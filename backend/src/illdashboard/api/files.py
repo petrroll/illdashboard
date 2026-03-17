@@ -143,17 +143,24 @@ async def get_file_page_image(file_id: int, page_num: int, db: AsyncSession = De
 
 @router.post("/files/{file_id}/ocr", response_model=QueueFilesResponse, tags=["ocr"])
 async def run_ocr(file_id: int, db: AsyncSession = Depends(get_db)):
-    queued_file_ids = await pipeline.queue_files(db, [file_id])
-    return QueueFilesResponse(queued_file_ids=queued_file_ids)
+    file = await pipeline.queue_file(db, file_id)
+    await db.commit()
+    return QueueFilesResponse(queued_file_ids=[file.id])
 
 
 @router.post("/files/ocr/batch", response_model=QueueFilesResponse, tags=["ocr"])
 async def batch_ocr(req: BatchOcrRequest, db: AsyncSession = Depends(get_db)):
-    queued_file_ids = await pipeline.queue_files(db, req.file_ids)
+    queued_file_ids = await pipeline.queue_files_from_clean_runtime(db, req.file_ids)
     return QueueFilesResponse(queued_file_ids=queued_file_ids)
 
 
 @router.post("/files/ocr/unprocessed", response_model=QueueFilesResponse, tags=["ocr"])
 async def ocr_unprocessed(db: AsyncSession = Depends(get_db)):
-    queued_file_ids = await pipeline.queue_unprocessed_files(db)
+    queued_file_ids = await pipeline.queue_unprocessed_files_from_clean_runtime(db)
     return QueueFilesResponse(queued_file_ids=queued_file_ids)
+
+
+@router.post("/files/ocr/cancel", tags=["ocr"])
+async def cancel_ocr(db: AsyncSession = Depends(get_db)):
+    await pipeline.cancel_processing_from_clean_runtime(db)
+    return {"ok": True}

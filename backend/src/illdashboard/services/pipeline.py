@@ -6,9 +6,12 @@ import logging
 import math
 import mimetypes
 import re
+import time
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TypeVar
 
 import fitz
 from sqlalchemy import delete, select
@@ -18,6 +21,7 @@ from sqlalchemy.orm import selectinload
 from illdashboard.config import settings
 from illdashboard.copilot import extraction as copilot_extraction
 from illdashboard.copilot import normalization as copilot_normalization
+from illdashboard.copilot.client import COPILOT_REQUEST_TIMEOUT, get_copilot_request_load, shutdown_client
 from illdashboard.models import (
     DEFAULT_GROUP_NAME,
     READY_FILE_STATUS,
@@ -72,13 +76,21 @@ TASK_NORMALIZE_UNIT_CONVERSION = "normalize.unit_conversion"
 TASK_NORMALIZE_QUALITATIVE = "normalize.qualitative_value"
 TASK_NORMALIZE_SOURCE = "normalize.source"
 
-MEASUREMENT_BATCH_SIZE = 3
-TEXT_BATCH_SIZE = 6
+# Earlier 300s validation forced durable OCR jobs to stay per-page. With the
+# longer request budget and the retry/split path still in place, queue two-page
+# chunks by default to reduce request overhead without losing the fallback.
+MEASUREMENT_BATCH_SIZE = 2
 DEFAULT_OCR_DPI = 144
 MIN_OCR_DPI = 96
 MAX_JOB_ATTEMPTS = 3
-JOB_LEASE_SECONDS = 300
+# Durable workers hold a lease for the lifetime of a single Copilot request, so
+# keep the lease aligned with the maximum request timeout to avoid mid-flight
+# reclaims of still-running jobs.
+JOB_LEASE_SECONDS = COPILOT_REQUEST_TIMEOUT
 WORKER_IDLE_SECONDS = 1.0
+MEASUREMENT_EXTRACT_WORKER_CONCURRENCY = 4
+TEXT_EXTRACT_WORKER_CONCURRENCY = 2
+TEXT_BATCH_SIZE = 2
 
 PRIORITY_RECONCILE = 5
 PRIORITY_MEASUREMENT_EXTRACT = 10
@@ -88,6 +100,8 @@ PRIORITY_SUMMARY = 70
 PRIORITY_PUBLISH = 80
 
 _runtime: PipelineRuntime | None = None
+_runtime_reset_lock = asyncio.Lock()
+_T = TypeVar("_T")
 
 _PRELOADABLE_MIME_TYPES: dict[str, str] = {
     ".pdf": "application/pdf",
@@ -180,24 +194,72 @@ class PipelineRuntime:
                 await enqueue_file_reconcile(session, file.id)
             await session.commit()
 
-        self._spawn_workers("measurement-extract", [TASK_EXTRACT_MEASUREMENT], 1, 4, self._handle_measurement_jobs)
-        self._spawn_workers("text-extract", [TASK_EXTRACT_TEXT], 1, 2, self._handle_text_jobs)
+        # Scale durable OCR workers to match the wider extraction lane, but rely
+        # on Copilot lane reservations in the client so extraction does not
+        # starve normalization and summary work.
+        self._spawn_workers(
+            "measurement-extract",
+            [TASK_EXTRACT_MEASUREMENT],
+            1,
+            MEASUREMENT_EXTRACT_WORKER_CONCURRENCY,
+            self._handle_measurement_jobs,
+        )
+        self._spawn_workers(
+            "text-extract",
+            [TASK_EXTRACT_TEXT],
+            1,
+            TEXT_EXTRACT_WORKER_CONCURRENCY,
+            self._handle_text_jobs,
+        )
         self._spawn_workers("reconcile", [TASK_RECONCILE_FILE], 1, 2, self._handle_reconcile_jobs)
         self._spawn_workers("summary", [TASK_GENERATE_SUMMARY], 1, 1, self._handle_summary_jobs)
         self._spawn_workers("publish", [TASK_PUBLISH_FILE], 1, 1, self._handle_publish_jobs)
         self._spawn_workers("normalize-source", [TASK_NORMALIZE_SOURCE], 8, 2, self._handle_source_jobs)
-        self._spawn_workers("normalize-marker", [TASK_NORMALIZE_MARKER], 48, 1, self._handle_marker_jobs)
-        self._spawn_workers("normalize-group", [TASK_NORMALIZE_GROUP], 48, 1, self._handle_group_jobs)
-        self._spawn_workers("normalize-unit", [TASK_NORMALIZE_CANONICAL_UNIT], 32, 1, self._handle_canonical_unit_jobs)
         self._spawn_workers(
-            "normalize-conversion", [TASK_NORMALIZE_UNIT_CONVERSION], 32, 1, self._handle_conversion_jobs
+            "normalize-marker",
+            [TASK_NORMALIZE_MARKER],
+            copilot_normalization.MARKER_NORMALIZATION_BATCH_SIZE,
+            1,
+            self._handle_marker_jobs,
         )
-        self._spawn_workers("normalize-qualitative", [TASK_NORMALIZE_QUALITATIVE], 32, 1, self._handle_qualitative_jobs)
+        self._spawn_workers(
+            "normalize-group",
+            [TASK_NORMALIZE_GROUP],
+            copilot_normalization.MARKER_GROUP_CLASSIFICATION_BATCH_SIZE,
+            1,
+            self._handle_group_jobs,
+        )
+        self._spawn_workers(
+            "normalize-unit",
+            [TASK_NORMALIZE_CANONICAL_UNIT],
+            copilot_normalization.UNIT_NORMALIZATION_BATCH_SIZE,
+            1,
+            self._handle_canonical_unit_jobs,
+        )
+        self._spawn_workers(
+            "normalize-conversion",
+            [TASK_NORMALIZE_UNIT_CONVERSION],
+            copilot_normalization.UNIT_NORMALIZATION_BATCH_SIZE,
+            1,
+            self._handle_conversion_jobs,
+        )
+        self._spawn_workers(
+            "normalize-qualitative",
+            [TASK_NORMALIZE_QUALITATIVE],
+            copilot_normalization.QUALITATIVE_NORMALIZATION_BATCH_SIZE,
+            1,
+            self._handle_qualitative_jobs,
+        )
 
-    async def stop(self) -> None:
+    async def stop(self, *, abort_copilot_requests: bool = False) -> None:
         self.stop_event.set()
         for task in self.tasks:
             task.cancel()
+        if abort_copilot_requests:
+            # Clean reruns need a hard cut-over. Some Copilot SDK calls do not
+            # unwind on task cancellation alone, so closing the shared client
+            # forces those requests to exit before we delete and recreate jobs.
+            await shutdown_client()
         if self.tasks:
             await asyncio.gather(*self.tasks, return_exceptions=True)
         self.tasks.clear()
@@ -307,11 +369,11 @@ async def start_pipeline_runtime(session_factory: async_sessionmaker[AsyncSessio
     _runtime = runtime
 
 
-async def stop_pipeline_runtime() -> None:
+async def stop_pipeline_runtime(*, abort_copilot_requests: bool = False) -> None:
     global _runtime
     if _runtime is None:
         return
-    await _runtime.stop()
+    await _runtime.stop(abort_copilot_requests=abort_copilot_requests)
     _runtime = None
 
 
@@ -321,7 +383,8 @@ async def queue_file(session: AsyncSession, file_id: int) -> LabFile:
     if file is None:
         raise ValueError(f"Unknown file id {file_id}")
 
-    await _reset_file_processing_state(session, file)
+    await job_service.delete_jobs_for_file(session, file.id)
+    await _reset_file_processing_state(session, file, file_status=FILE_STATUS_QUEUED)
     await _enqueue_file_extraction_jobs(session, file)
     _refresh_file_status(file)
     await session.flush()
@@ -329,6 +392,13 @@ async def queue_file(session: AsyncSession, file_id: int) -> LabFile:
 
 
 async def queue_files(session: AsyncSession, file_ids: list[int]) -> list[int]:
+    if not file_ids:
+        return []
+    await reset_incomplete_processing(session)
+    return await _queue_selected_files(session, file_ids)
+
+
+async def _queue_selected_files(session: AsyncSession, file_ids: list[int]) -> list[int]:
     queued: list[int] = []
     for file_id in dict.fromkeys(file_ids):
         file = await queue_file(session, file_id)
@@ -338,6 +408,7 @@ async def queue_files(session: AsyncSession, file_ids: list[int]) -> list[int]:
 
 
 async def queue_unprocessed_files(session: AsyncSession) -> list[int]:
+    await reset_incomplete_processing(session)
     result = await session.execute(
         select(LabFile.id)
         .where(LabFile.status.in_([FILE_STATUS_UPLOADED, FILE_STATUS_ERROR]))
@@ -345,13 +416,58 @@ async def queue_unprocessed_files(session: AsyncSession) -> list[int]:
     )
     file_ids = result.scalars().all()
     if not file_ids:
+        await session.commit()
         return []
-    return await queue_files(session, file_ids)
+    return await _queue_selected_files(session, file_ids)
 
 
-async def _reset_file_processing_state(session: AsyncSession, file: LabFile) -> None:
+async def queue_files_from_clean_runtime(session: AsyncSession, file_ids: list[int]) -> list[int]:
+    return await _run_with_clean_runtime(session, lambda current_session: queue_files(current_session, file_ids))
+
+
+async def queue_unprocessed_files_from_clean_runtime(session: AsyncSession) -> list[int]:
+    return await _run_with_clean_runtime(session, queue_unprocessed_files)
+
+
+async def cancel_processing(session: AsyncSession) -> None:
+    await reset_incomplete_processing(session)
+    await session.commit()
+
+
+async def cancel_processing_from_clean_runtime(session: AsyncSession) -> None:
+    await _run_with_clean_runtime(session, cancel_processing)
+
+
+async def _run_with_clean_runtime(
+    session: AsyncSession,
+    operation: Callable[[AsyncSession], Awaitable[_T]],
+) -> _T:
+    async with _runtime_reset_lock:
+        session_factory = _runtime.session_factory if _runtime is not None else None
+        runtime_was_running = session_factory is not None
+        if runtime_was_running:
+            await stop_pipeline_runtime(abort_copilot_requests=True)
+        try:
+            return await operation(session)
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            if runtime_was_running and session_factory is not None:
+                await start_pipeline_runtime(session_factory)
+
+
+async def reset_incomplete_processing(session: AsyncSession) -> None:
+    await job_service.delete_all_jobs(session)
+    result = await session.execute(
+        select(LabFile).options(selectinload(LabFile.tags)).where(LabFile.status != READY_FILE_STATUS)
+    )
+    for file in result.scalars().unique().all():
+        await _reset_file_processing_state(session, file, file_status=FILE_STATUS_UPLOADED)
+
+
+async def _reset_file_processing_state(session: AsyncSession, file: LabFile, *, file_status: str) -> None:
     await session.execute(delete(Measurement).where(Measurement.lab_file_id == file.id))
-    await job_service.delete_jobs_for_file(session, file.id)
     await search_service.remove_lab_search_document(file.id, session)
 
     if file.tags:
@@ -359,7 +475,10 @@ async def _reset_file_processing_state(session: AsyncSession, file: LabFile) -> 
             if tag.tag.casefold().startswith(SOURCE_TAG_PREFIX):
                 await session.delete(tag)
 
-    file.status = FILE_STATUS_QUEUED
+    # Leave stage columns in their initial queued state, but let the caller pick
+    # whether the row should appear as freshly uploaded or already queued for a
+    # new run in the UI.
+    file.status = file_status
     file.measurement_status = FILE_STAGE_QUEUED
     file.normalization_status = FILE_STAGE_QUEUED
     file.text_status = FILE_STAGE_QUEUED
@@ -393,25 +512,6 @@ async def _enqueue_file_extraction_jobs(session: AsyncSession, file: LabFile) ->
             file_id=file.id,
             priority=PRIORITY_MEASUREMENT_EXTRACT,
         )
-
-    for batch_index, (start_page, stop_page) in enumerate(
-        copilot_extraction.build_page_ranges(page_count, TEXT_BATCH_SIZE)
-    ):
-        await job_service.enqueue_job(
-            session,
-            task_type=TASK_EXTRACT_TEXT,
-            task_key=_batch_task_key("text", file.id, start_page, stop_page, DEFAULT_OCR_DPI),
-            payload={
-                "file_id": file.id,
-                "batch_index": batch_index,
-                "start_page": start_page,
-                "stop_page": stop_page,
-                "dpi": DEFAULT_OCR_DPI,
-            },
-            file_id=file.id,
-            priority=PRIORITY_TEXT_EXTRACT,
-        )
-
 
 async def enqueue_file_reconcile(session: AsyncSession, file_id: int) -> None:
     await job_service.enqueue_job(
@@ -496,6 +596,7 @@ async def _process_extraction_job(session: AsyncSession, job: Job, *, measuremen
         return
 
     stage_name = "measurement" if measurement_mode else "text"
+    started_at = time.perf_counter()
     if measurement_mode:
         file.measurement_status = FILE_STAGE_RUNNING
     else:
@@ -507,6 +608,21 @@ async def _process_extraction_job(session: AsyncSession, job: Job, *, measuremen
     stop_page = int(payload.get("stop_page", max(1, file.page_count)))
     dpi = int(payload.get("dpi", DEFAULT_OCR_DPI))
     file_path = Path(file.filepath)
+    queued_requests, active_requests = get_copilot_request_load()
+    logger.info(
+        "Extraction job start stage=%s job_id=%s file_id=%s filename=%s pages=%s-%s dpi=%s attempts=%s "
+        "queued_requests=%s active_requests=%s",
+        stage_name,
+        job.id,
+        file.id,
+        file.filename,
+        start_page + 1,
+        stop_page,
+        dpi,
+        job.attempt_count,
+        queued_requests,
+        active_requests,
+    )
 
     try:
         if measurement_mode:
@@ -526,9 +642,26 @@ async def _process_extraction_job(session: AsyncSession, job: Job, *, measuremen
                 filename=file.filename,
             )
     except Exception as exc:
-        if copilot_extraction.is_retryable_batch_error(exc):
+        if measurement_mode and copilot_extraction.is_retryable_batch_error(exc):
             fallback_ranges = _fallback_batch_ranges(start_page, stop_page, dpi)
             if fallback_ranges:
+                logger.warning(
+                    "Extraction job retry split stage=%s job_id=%s file_id=%s filename=%s pages=%s-%s dpi=%s "
+                    "fallback_ranges=%s duration=%.2fs error=%s",
+                    stage_name,
+                    job.id,
+                    file.id,
+                    file.filename,
+                    start_page + 1,
+                    stop_page,
+                    dpi,
+                    [
+                        (fallback_start + 1, fallback_stop, fallback_dpi)
+                        for fallback_start, fallback_stop, fallback_dpi in fallback_ranges
+                    ],
+                    time.perf_counter() - started_at,
+                    exc,
+                )
                 for index, (fallback_start, fallback_stop, fallback_dpi) in enumerate(fallback_ranges):
                     await job_service.enqueue_job(
                         session,
@@ -552,10 +685,24 @@ async def _process_extraction_job(session: AsyncSession, job: Job, *, measuremen
                     )
                 await job_service.delete_job(session, job)
                 return
+        logger.error(
+            "Extraction job failed stage=%s job_id=%s file_id=%s filename=%s "
+            "pages=%s-%s dpi=%s duration=%.2fs error=%s",
+            stage_name,
+            job.id,
+            file.id,
+            file.filename,
+            start_page + 1,
+            stop_page,
+            dpi,
+            time.perf_counter() - started_at,
+            exc,
+        )
         if measurement_mode:
             file.measurement_status = FILE_STAGE_ERROR
         else:
             file.text_status = FILE_STAGE_ERROR
+            file.summary_status = FILE_STAGE_ERROR
         file.processing_error = str(exc)
         _refresh_file_status(file)
         await job_service.mark_job_failed(session, job, error_text=str(exc))
@@ -564,8 +711,35 @@ async def _process_extraction_job(session: AsyncSession, job: Job, *, measuremen
     if measurement_mode:
         await _persist_measurement_batch(session, file, job, result)
         await job_service.delete_job(session, job)
+        logger.info(
+            "Extraction job finished stage=%s job_id=%s file_id=%s filename=%s "
+            "pages=%s-%s dpi=%s duration=%.2fs measurements=%s",
+            stage_name,
+            job.id,
+            file.id,
+            file.filename,
+            start_page + 1,
+            stop_page,
+            dpi,
+            time.perf_counter() - started_at,
+            len(result.get("measurements", [])),
+        )
     else:
         await job_service.mark_job_resolved(session, job, payload=result)
+        logger.info(
+            "Extraction job finished stage=%s job_id=%s file_id=%s filename=%s pages=%s-%s dpi=%s duration=%.2fs "
+            "raw_text_chars=%s translated_text_chars=%s",
+            stage_name,
+            job.id,
+            file.id,
+            file.filename,
+            start_page + 1,
+            stop_page,
+            dpi,
+            time.perf_counter() - started_at,
+            len(str(result.get("raw_text") or "")),
+            len(str(result.get("translated_text_english") or "")),
+        )
     await enqueue_file_reconcile(session, file.id)
 
 
@@ -659,6 +833,9 @@ async def _reconcile_file(session: AsyncSession, job: Job) -> None:
     await _apply_measurement_normalization(session, file, measurements)
     await _refresh_file_stages(session, file, measurements)
 
+    if _file_ready_for_text_extraction(file):
+        await _enqueue_text_extraction_jobs(session, file)
+
     if _file_ready_for_summary(file):
         await job_service.enqueue_job(
             session,
@@ -705,6 +882,7 @@ async def _merge_resolved_text_jobs(session: AsyncSession, file: LabFile) -> Non
     )
     if failed_result.first() is not None:
         file.text_status = FILE_STAGE_ERROR
+        file.summary_status = FILE_STAGE_ERROR
         return
 
     resolved_result = await session.execute(
@@ -718,7 +896,16 @@ async def _merge_resolved_text_jobs(session: AsyncSession, file: LabFile) -> Non
     )
     resolved_jobs = list(resolved_result.scalars().all())
     if not resolved_jobs:
-        file.text_status = FILE_STAGE_DONE
+        if file.ocr_text_raw or file.ocr_text_english or file.ocr_summary_english:
+            if file.text_status != FILE_STAGE_ERROR:
+                file.text_status = FILE_STAGE_DONE
+            if file.summary_status != FILE_STAGE_ERROR:
+                file.summary_status = FILE_STAGE_DONE if file.ocr_summary_english else FILE_STAGE_QUEUED
+        else:
+            if file.text_status != FILE_STAGE_ERROR:
+                file.text_status = FILE_STAGE_QUEUED
+            if file.summary_status != FILE_STAGE_ERROR:
+                file.summary_status = FILE_STAGE_QUEUED
         return
 
     ordered_results = []
@@ -730,6 +917,8 @@ async def _merge_resolved_text_jobs(session: AsyncSession, file: LabFile) -> Non
     file.ocr_text_raw = _normalize_document_text(merged.get("raw_text"))
     file.ocr_text_english = _normalize_document_text(merged.get("translated_text_english"))
     file.text_status = FILE_STAGE_DONE
+    if file.summary_status != FILE_STAGE_ERROR:
+        file.summary_status = FILE_STAGE_DONE if file.ocr_summary_english else FILE_STAGE_QUEUED
 
     for resolved_job in resolved_jobs:
         await job_service.delete_job(session, resolved_job)
@@ -994,7 +1183,15 @@ async def _refresh_file_stages(session: AsyncSession, file: LabFile, measurement
         file.normalization_status = FILE_STAGE_RUNNING
 
     file.text_status = await _derive_stage_status(
-        session, file.id, TASK_EXTRACT_TEXT, done_when_no_jobs=True, current=file.text_status
+        session,
+        file.id,
+        TASK_EXTRACT_TEXT,
+        done_when_no_jobs=(
+            file.text_status == FILE_STAGE_DONE
+            or bool(file.ocr_text_raw)
+            or bool(file.ocr_text_english)
+        ),
+        current=file.text_status,
     )
 
     if file.summary_status != FILE_STAGE_ERROR:
@@ -1005,7 +1202,7 @@ async def _refresh_file_stages(session: AsyncSession, file: LabFile, measurement
                 session,
                 file.id,
                 TASK_GENERATE_SUMMARY,
-                done_when_no_jobs=bool(file.ocr_summary_english),
+                done_when_no_jobs=file.summary_status == FILE_STAGE_DONE or bool(file.ocr_summary_english),
                 current=file.summary_status,
             )
 
@@ -1045,6 +1242,14 @@ def _file_ready_for_summary(file: LabFile) -> bool:
         file.measurement_status == FILE_STAGE_DONE
         and file.normalization_status == FILE_STAGE_DONE
         and file.text_status == FILE_STAGE_DONE
+        and file.summary_status == FILE_STAGE_QUEUED
+    )
+
+
+def _file_ready_for_text_extraction(file: LabFile) -> bool:
+    return (
+        file.measurement_status == FILE_STAGE_DONE
+        and file.text_status == FILE_STAGE_QUEUED
         and file.summary_status == FILE_STAGE_QUEUED
     )
 
@@ -1108,6 +1313,29 @@ async def _generate_file_summary(session: AsyncSession, job: Job) -> None:
     file.summary_status = FILE_STAGE_DONE
     await job_service.delete_job(session, job)
     await enqueue_file_reconcile(session, file.id)
+
+
+async def _enqueue_text_extraction_jobs(session: AsyncSession, file: LabFile) -> None:
+    page_count = max(1, file.page_count)
+    # Summary stays as its own stage so the text OCR jobs can stay small and
+    # resilient while the summary call sees the fully merged document text.
+    for batch_index, (start_page, stop_page) in enumerate(
+        copilot_extraction.build_page_ranges(page_count, TEXT_BATCH_SIZE)
+    ):
+        await job_service.enqueue_job(
+            session,
+            task_type=TASK_EXTRACT_TEXT,
+            task_key=_batch_task_key("text", file.id, start_page, stop_page, DEFAULT_OCR_DPI),
+            payload={
+                "file_id": file.id,
+                "batch_index": batch_index,
+                "start_page": start_page,
+                "stop_page": stop_page,
+                "dpi": DEFAULT_OCR_DPI,
+            },
+            file_id=file.id,
+            priority=PRIORITY_TEXT_EXTRACT,
+        )
 
 
 async def _publish_file(session: AsyncSession, job: Job) -> None:
@@ -1179,11 +1407,19 @@ async def _resolve_marker_jobs(session: AsyncSession, jobs: list[Job]) -> None:
     normalized_map = await copilot_normalization.normalize_marker_names(prompt_names, existing_canonical)
     canonical_names = [normalized_map.get(name, name) for name in prompt_names]
     measurement_types = await _ensure_measurement_types(session, canonical_names)
+    alias_pairs_by_key: dict[str, tuple[str, MeasurementType]] = {}
 
     for raw_names in samples_by_key.values():
         canonical_name = normalized_map.get(raw_names[0], raw_names[0])
         measurement_type = measurement_types[canonical_name]
-        await ensure_measurement_type_aliases(session, [(raw_name, measurement_type) for raw_name in raw_names])
+        # Different raw marker jobs in one batch can collapse to the same alias key
+        # (for example "CRP+" and "CRP"), so deduplicate the whole batch before
+        # touching the alias table.
+        for raw_name in raw_names:
+            normalized_alias_key = normalize_marker_alias_key(raw_name)
+            if not normalized_alias_key:
+                continue
+            alias_pairs_by_key[normalized_alias_key] = (raw_name, measurement_type)
         if measurement_type.group_id is None:
             await job_service.enqueue_job(
                 session,
@@ -1192,6 +1428,9 @@ async def _resolve_marker_jobs(session: AsyncSession, jobs: list[Job]) -> None:
                 payload={"measurement_type_id": measurement_type.id},
                 priority=PRIORITY_NORMALIZE,
             )
+
+    if alias_pairs_by_key:
+        await ensure_measurement_type_aliases(session, list(alias_pairs_by_key.values()))
 
     await _enqueue_reconcile_for_measurement_keys(session, list(samples_by_key.keys()))
     for job in jobs:
@@ -1581,11 +1820,10 @@ def _build_medical_payload(file: LabFile, measurements: list[Measurement]) -> di
 def _fallback_batch_ranges(start_page: int, stop_page: int, dpi: int) -> list[tuple[int, int, int]]:
     page_count = stop_page - start_page
     if page_count > 1:
-        midpoint = start_page + math.ceil(page_count / 2)
-        return [
-            (start_page, midpoint, dpi),
-            (midpoint, stop_page, dpi),
-        ]
+        # By the time the durable job reaches this fallback path, the in-request
+        # retry logic has already tried the larger batch and its own recursive
+        # splits. Requeueing per page avoids repeating the same slow batch.
+        return [(page, page + 1, dpi) for page in range(start_page, stop_page)]
     smaller_dpi = max(MIN_OCR_DPI, dpi - 24)
     if smaller_dpi != dpi:
         return [(start_page, stop_page, smaller_dpi)]

@@ -173,6 +173,10 @@ async def delete_jobs_for_file(session: AsyncSession, file_id: int) -> None:
     await session.execute(delete(Job).where(Job.file_id == file_id))
 
 
+async def delete_all_jobs(session: AsyncSession) -> None:
+    await session.execute(delete(Job))
+
+
 async def prune_jobs(session: AsyncSession) -> None:
     now = utc_now()
     stale_resolved_before = now - timedelta(hours=6)
@@ -186,7 +190,7 @@ async def prune_jobs(session: AsyncSession) -> None:
     )
     await session.execute(
         update(Job)
-        .where(Job.status == JOB_STATUS_LEASED, Job.lease_until.is_not(None), Job.lease_until < now)
+        .where(Job.status == JOB_STATUS_LEASED)
         .values(status=JOB_STATUS_PENDING, lease_owner=None, lease_until=None, updated_at=now)
     )
     await session.commit()

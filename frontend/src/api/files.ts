@@ -66,6 +66,10 @@ export async function batchProcessFiles(fileIds: number[]) {
   return response.data;
 }
 
+export async function cancelProcessing() {
+  await apiClient.post("/files/ocr/cancel");
+}
+
 export async function fetchFileTags() {
   const response = await apiClient.get<string[]>("/tags/files");
   return response.data;

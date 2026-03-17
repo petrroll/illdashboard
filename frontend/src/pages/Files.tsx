@@ -2,6 +2,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import { Link } from "react-router-dom";
 import {
   batchProcessFiles,
+  cancelProcessing,
   deleteFile,
   fetchFiles,
   fetchFileTags,
@@ -15,6 +16,7 @@ import type { LabFile } from "../types";
 import { formatDate } from "../utils/measurements";
 
 type SortField = "lab_date" | "uploaded_at";
+type PendingProcessAction = "queue" | "reprocess" | "cancel" | null;
 
 const FILE_POLL_INTERVAL_MS = 3000;
 
@@ -80,7 +82,7 @@ function renderStatusBadge(file: LabFile) {
 export default function Files() {
   const [files, setFiles] = useState<LabFile[]>([]);
   const [uploading, setUploading] = useState(false);
-  const [processing, setProcessing] = useState(false);
+  const [pendingProcessAction, setPendingProcessAction] = useState<PendingProcessAction>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [allFileTags, setAllFileTags] = useState<string[]>([]);
   const [filterTags, setFilterTags] = useState<string[]>([]);
@@ -106,11 +108,13 @@ export default function Files() {
     void loadAllTags();
   }, [loadAllTags]);
 
-  const hasActiveFiles = files.some(isFileActive);
+  // File rows are the UI source of truth for queued/running work because the
+  // pipeline updates those status columns directly from the database.
+  const hasActiveJobs = files.some(isFileActive);
+  const isPrimaryActionPending = pendingProcessAction !== null;
 
   useEffect(() => {
-    if (!hasActiveFiles) {
-      setProcessing(false);
+    if (!hasActiveJobs) {
       return;
     }
 
@@ -139,7 +143,7 @@ export default function Files() {
         window.clearTimeout(timeoutId);
       }
     };
-  }, [hasActiveFiles, loadFiles]);
+  }, [hasActiveJobs, loadFiles]);
 
   const handleUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = event.target.files;
@@ -189,18 +193,18 @@ export default function Files() {
     });
   };
 
-  const startQueuedProcessing = async (run: () => Promise<void>) => {
-    setProcessing(true);
+  const runPrimaryAction = async (action: Exclude<PendingProcessAction, null>, run: () => Promise<void>) => {
+    setPendingProcessAction(action);
     try {
       await run();
       await loadFiles();
     } finally {
-      setProcessing(false);
+      setPendingProcessAction(null);
     }
   };
 
   const handleProcessUnprocessed = () => {
-    void startQueuedProcessing(async () => {
+    void runPrimaryAction("queue", async () => {
       await processUnprocessedFiles();
     });
   };
@@ -212,8 +216,18 @@ export default function Files() {
 
     const fileIds = Array.from(selected);
     setSelected(new Set());
-    await startQueuedProcessing(async () => {
+    await runPrimaryAction("reprocess", async () => {
       await batchProcessFiles(fileIds);
+    });
+  };
+
+  const handleCancelProcessing = () => {
+    if (!confirm("Cancel all queued processing and reset active files back to their uploaded state?")) {
+      return;
+    }
+
+    void runPrimaryAction("cancel", async () => {
+      await cancelProcessing();
     });
   };
 
@@ -275,18 +289,26 @@ export default function Files() {
           <div className="flex-row" style={{ gap: "0.5rem" }}>
             <button
               className="btn btn-primary"
-              disabled={processing || hasActiveFiles || (selected.size === 0 && unprocessedCount === 0)}
-              onClick={selected.size > 0 ? handleReprocessSelected : handleProcessUnprocessed}
+              disabled={isPrimaryActionPending || (!hasActiveJobs && selected.size === 0 && unprocessedCount === 0)}
+              onClick={hasActiveJobs ? handleCancelProcessing : selected.size > 0 ? handleReprocessSelected : handleProcessUnprocessed}
             >
-              {selected.size > 0
+              {pendingProcessAction === "cancel"
+                ? "Cancelling…"
+                : pendingProcessAction === "queue" || pendingProcessAction === "reprocess"
+                ? "Queueing…"
+                : hasActiveJobs
+                ? "Cancel Processing"
+                : selected.size > 0
                 ? `Reprocess Selected (${selected.size})`
                 : `Process Pending (${unprocessedCount})`}
             </button>
           </div>
 
-          {(processing || hasActiveFiles) && (
+          {(isPrimaryActionPending || hasActiveJobs) && (
             <div style={{ marginTop: "0.5rem", color: "var(--text-muted)", fontSize: "0.85rem" }}>
-              Processing continues in the background. File rows update directly from the database pipeline.
+              {hasActiveJobs
+                ? "Processing continues in the background. Cancel clears queued jobs and resets active files back to their uploaded state."
+                : "Updating processing state…"}
             </div>
           )}
         </div>
