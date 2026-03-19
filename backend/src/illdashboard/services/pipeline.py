@@ -954,6 +954,9 @@ async def _merge_resolved_text_jobs(session: AsyncSession, file: LabFile) -> Non
 async def _apply_measurement_normalization(
     session: AsyncSession, file: LabFile, measurements: list[Measurement]
 ) -> None:
+    # Reconcile is the normalization convergence loop: reuse whatever canonical
+    # aliases/rules already exist in SQLite, then enqueue only the missing
+    # normalization work so later reconcile runs can finish the file.
     if not measurements:
         file.normalization_status = FILE_STAGE_DONE if file.measurement_status == FILE_STAGE_DONE else FILE_STAGE_QUEUED
         return
