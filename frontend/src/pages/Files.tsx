@@ -240,7 +240,8 @@ export default function Files() {
   };
 
   const unprocessedCount = files.filter((file) => file.status === "uploaded" || file.status === "error").length;
-  const allFilesSelected = files.length > 0 && selected.size === files.length;
+  const isFileChecked = (file: LabFile) => selected.has(file.id) || isFileActive(file);
+  const allFilesSelected = files.length > 0 && files.every(isFileChecked);
 
   const sortedFiles = useMemo(() => {
     const query = searchQuery.toLowerCase();
@@ -391,7 +392,7 @@ export default function Files() {
                         <label className={`checkbox-row${isSelectionLocked ? " checkbox-row-disabled" : ""}`}>
                           <input
                             type="checkbox"
-                            checked={selected.has(file.id)}
+                            checked={isFileChecked(file)}
                             onChange={() => toggleSelect(file.id)}
                             disabled={isSelectionLocked}
                           />
