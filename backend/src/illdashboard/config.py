@@ -17,9 +17,12 @@ class Settings(BaseSettings):
     # reasoning disabled unless we have evidence it improves accuracy enough to
     # justify the latency.
     COPILOT_MEASUREMENT_EXTRACTION_REASONING_EFFORT: Literal["low", "medium", "high", "xhigh"] | None = None
-    COPILOT_TEXT_EXTRACTION_MODEL: str = "gpt-5.4"
-    # Text extraction is likewise OCR/transcription work rather than a task
-    # that benefits from extra reasoning.
+    # Keep free-form document OCR on 4.1 so raw transcription and translation do
+    # not consume the same premium model budget as structured extraction and the
+    # downstream summary, which still uses the default model above.
+    COPILOT_TEXT_EXTRACTION_MODEL: str = "gpt-4.1"
+    # Text extraction is OCR/transcription work rather than a task that
+    # benefits from extra reasoning.
     COPILOT_TEXT_EXTRACTION_REASONING_EFFORT: Literal["low", "medium", "high", "xhigh"] | None = None
     COPILOT_NORMALIZATION_MODEL: str = "gpt-5-mini"
     COPILOT_NORMALIZATION_REASONING_EFFORT: Literal["low", "medium", "high", "xhigh"] = "high"
