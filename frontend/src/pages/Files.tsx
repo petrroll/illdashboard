@@ -112,6 +112,9 @@ export default function Files() {
   // pipeline updates those status columns directly from the database.
   const hasActiveJobs = files.some(isFileActive);
   const isPrimaryActionPending = pendingProcessAction !== null;
+  // Keep the current checkmarks rendered while a run is starting or active so
+  // the table does not jump between selection and cancel states.
+  const isSelectionLocked = hasActiveJobs || isPrimaryActionPending;
 
   useEffect(() => {
     if (!hasActiveJobs) {
@@ -173,6 +176,9 @@ export default function Files() {
   };
 
   const toggleSelect = (id: number) => {
+    if (isSelectionLocked) {
+      return;
+    }
     setSelected((previousSelected) => {
       const nextSelected = new Set(previousSelected);
       if (nextSelected.has(id)) {
@@ -185,6 +191,9 @@ export default function Files() {
   };
 
   const toggleSelectAll = () => {
+    if (isSelectionLocked) {
+      return;
+    }
     setSelected((previousSelected) => {
       if (previousSelected.size === files.length) {
         return new Set();
@@ -215,7 +224,6 @@ export default function Files() {
     }
 
     const fileIds = Array.from(selected);
-    setSelected(new Set());
     await runPrimaryAction("reprocess", async () => {
       await batchProcessFiles(fileIds);
     });
@@ -346,8 +354,13 @@ export default function Files() {
             <thead>
               <tr>
                 <th>
-                  <label className="checkbox-row">
-                    <input type="checkbox" checked={allFilesSelected} onChange={toggleSelectAll} />
+                  <label className={`checkbox-row${isSelectionLocked ? " checkbox-row-disabled" : ""}`}>
+                    <input
+                      type="checkbox"
+                      checked={allFilesSelected}
+                      onChange={toggleSelectAll}
+                      disabled={isSelectionLocked}
+                    />
                   </label>
                 </th>
                 <th>Filename</th>
@@ -375,11 +388,12 @@ export default function Files() {
                     )}
                     <tr>
                       <td>
-                        <label className="checkbox-row">
+                        <label className={`checkbox-row${isSelectionLocked ? " checkbox-row-disabled" : ""}`}>
                           <input
                             type="checkbox"
                             checked={selected.has(file.id)}
                             onChange={() => toggleSelect(file.id)}
+                            disabled={isSelectionLocked}
                           />
                         </label>
                       </td>

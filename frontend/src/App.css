@@ -689,6 +689,10 @@ input[type="file"] {
   font-size: 0.875rem;
 }
 
+.checkbox-row-disabled {
+  cursor: not-allowed;
+}
+
 .checkbox-row input[type="checkbox"] {
   margin: 0;
 }
@@ -1420,12 +1424,27 @@ input[type="checkbox"] {
   transition: background 0.15s, border-color 0.15s;
 }
 
+input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+  opacity: 0.78;
+}
+
 input[type="checkbox"]:hover {
   border-color: var(--accent);
   background: var(--accent-subtle);
 }
 
+input[type="checkbox"]:disabled:hover {
+  border-color: var(--border);
+  background: rgba(255, 255, 255, 0.04);
+}
+
 input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+input[type="checkbox"]:disabled:checked {
   background: var(--accent);
   border-color: var(--accent);
 }
