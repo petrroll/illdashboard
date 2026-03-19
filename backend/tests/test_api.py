@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from illdashboard.config import settings
@@ -65,11 +67,12 @@ async def test_upload_and_queue_processing_creates_durable_jobs(client, session_
 
     assert [job.task_type for job in jobs] == [
         pipeline.TASK_EXTRACT_MEASUREMENT,
+        pipeline.TASK_EXTRACT_TEXT,
     ]
 
 
 @pytest.mark.asyncio
-async def test_enqueue_file_extraction_jobs_batches_measurements_two_pages_by_default():
+async def test_enqueue_file_extraction_jobs_batches_measurement_and_text_two_pages_by_default():
     file = LabFile(
         id=42,
         filename="report.pdf",
@@ -79,7 +82,7 @@ async def test_enqueue_file_extraction_jobs_batches_measurements_two_pages_by_de
     )
 
     with patch("illdashboard.services.pipeline.job_service.enqueue_job", new=AsyncMock()) as enqueue_job_mock:
-        await pipeline._enqueue_file_extraction_jobs(object(), file)
+        await pipeline._enqueue_file_extraction_jobs(cast(AsyncSession, object()), file)
 
     assert [
         (
@@ -92,11 +95,14 @@ async def test_enqueue_file_extraction_jobs_batches_measurements_two_pages_by_de
         (pipeline.TASK_EXTRACT_MEASUREMENT, 0, 2),
         (pipeline.TASK_EXTRACT_MEASUREMENT, 2, 4),
         (pipeline.TASK_EXTRACT_MEASUREMENT, 4, 5),
+        (pipeline.TASK_EXTRACT_TEXT, 0, 2),
+        (pipeline.TASK_EXTRACT_TEXT, 2, 4),
+        (pipeline.TASK_EXTRACT_TEXT, 4, 5),
     ]
 
 
 @pytest.mark.asyncio
-async def test_reconcile_enqueues_batched_text_jobs_after_measurements_finish(session_factory):
+async def test_reconcile_does_not_backfill_missing_text_jobs(session_factory):
     async with session_factory() as session:
         lab_file = LabFile(
             filename="report.pdf",
@@ -135,18 +141,7 @@ async def test_reconcile_enqueues_batched_text_jobs_after_measurements_finish(se
         )
         jobs = jobs_result.scalars().all()
 
-    assert [job.task_type for job in jobs] == [
-        pipeline.TASK_EXTRACT_TEXT,
-        pipeline.TASK_EXTRACT_TEXT,
-        pipeline.TASK_EXTRACT_TEXT,
-    ]
-    assert [
-        (
-            job_service.json_loads(job.payload_json)["start_page"],
-            job_service.json_loads(job.payload_json)["stop_page"],
-        )
-        for job in jobs
-    ] == [(0, 2), (2, 4), (4, 5)]
+    assert jobs == []
 
 
 @pytest.mark.asyncio
@@ -223,7 +218,11 @@ async def test_single_file_ocr_does_not_reset_other_incomplete_files(client, ses
     assert second_file.id == second_file_id
     assert second_file.status == "processing"
     assert second_file.ocr_text_raw == "partial text"
-    assert [job.file_id for job in jobs] == [first_file_id, second_file_id]
+    assert [(job.file_id, job.task_type) for job in jobs] == [
+        (first_file_id, pipeline.TASK_EXTRACT_MEASUREMENT),
+        (first_file_id, pipeline.TASK_EXTRACT_TEXT),
+        (second_file_id, pipeline.TASK_EXTRACT_MEASUREMENT),
+    ]
 
 
 @pytest.mark.asyncio
@@ -711,6 +710,7 @@ async def test_queue_files_resets_old_jobs_and_incomplete_files(session_factory)
     assert measurements == []
     assert [job.task_type for job in jobs] == [
         pipeline.TASK_EXTRACT_MEASUREMENT,
+        pipeline.TASK_EXTRACT_TEXT,
     ]
     assert all(job.file_id == ready_file.id for job in jobs)
 
@@ -767,7 +767,12 @@ async def test_queue_unprocessed_files_requeues_reset_incomplete_rows(session_fa
         jobs = jobs_result.scalars().all()
 
     assert all(file.status == "queued" for file in files)
-    assert [job.file_id for job in jobs] == [1, 2]
+    assert [(job.file_id, job.task_type) for job in jobs] == [
+        (1, pipeline.TASK_EXTRACT_MEASUREMENT),
+        (1, pipeline.TASK_EXTRACT_TEXT),
+        (2, pipeline.TASK_EXTRACT_MEASUREMENT),
+        (2, pipeline.TASK_EXTRACT_TEXT),
+    ]
 
 
 @pytest.mark.asyncio

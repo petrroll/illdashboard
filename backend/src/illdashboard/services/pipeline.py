@@ -494,14 +494,44 @@ async def _reset_file_processing_state(session: AsyncSession, file: LabFile, *, 
 
 
 async def _enqueue_file_extraction_jobs(session: AsyncSession, file: LabFile) -> None:
+    # Fresh runs seed both durable OCR branches immediately so structured
+    # extraction and document text can overlap. Reconcile still backfills text
+    # jobs for older rows or interrupted runs that only have measurement work.
+    await _enqueue_batched_extraction_jobs(
+        session,
+        file,
+        task_type=TASK_EXTRACT_MEASUREMENT,
+        task_kind="measurement",
+        batch_size=MEASUREMENT_BATCH_SIZE,
+        priority=PRIORITY_MEASUREMENT_EXTRACT,
+    )
+    await _enqueue_batched_extraction_jobs(
+        session,
+        file,
+        task_type=TASK_EXTRACT_TEXT,
+        task_kind="text",
+        batch_size=TEXT_BATCH_SIZE,
+        priority=PRIORITY_TEXT_EXTRACT,
+    )
+
+
+async def _enqueue_batched_extraction_jobs(
+    session: AsyncSession,
+    file: LabFile,
+    *,
+    task_type: str,
+    task_kind: str,
+    batch_size: int,
+    priority: int,
+) -> None:
     page_count = max(1, file.page_count)
     for batch_index, (start_page, stop_page) in enumerate(
-        copilot_extraction.build_page_ranges(page_count, MEASUREMENT_BATCH_SIZE)
+        copilot_extraction.build_page_ranges(page_count, batch_size)
     ):
         await job_service.enqueue_job(
             session,
-            task_type=TASK_EXTRACT_MEASUREMENT,
-            task_key=_batch_task_key("measurement", file.id, start_page, stop_page, DEFAULT_OCR_DPI),
+            task_type=task_type,
+            task_key=_batch_task_key(task_kind, file.id, start_page, stop_page, DEFAULT_OCR_DPI),
             payload={
                 "file_id": file.id,
                 "batch_index": batch_index,
@@ -510,7 +540,7 @@ async def _enqueue_file_extraction_jobs(session: AsyncSession, file: LabFile) ->
                 "dpi": DEFAULT_OCR_DPI,
             },
             file_id=file.id,
-            priority=PRIORITY_MEASUREMENT_EXTRACT,
+            priority=priority,
         )
 
 async def enqueue_file_reconcile(session: AsyncSession, file_id: int) -> None:
@@ -832,9 +862,6 @@ async def _reconcile_file(session: AsyncSession, job: Job) -> None:
     await _merge_resolved_text_jobs(session, file)
     await _apply_measurement_normalization(session, file, measurements)
     await _refresh_file_stages(session, file, measurements)
-
-    if _file_ready_for_text_extraction(file):
-        await _enqueue_text_extraction_jobs(session, file)
 
     if _file_ready_for_summary(file):
         await job_service.enqueue_job(
@@ -1246,14 +1273,6 @@ def _file_ready_for_summary(file: LabFile) -> bool:
     )
 
 
-def _file_ready_for_text_extraction(file: LabFile) -> bool:
-    return (
-        file.measurement_status == FILE_STAGE_DONE
-        and file.text_status == FILE_STAGE_QUEUED
-        and file.summary_status == FILE_STAGE_QUEUED
-    )
-
-
 def _summary_is_skippable(file: LabFile, measurements: list[Measurement]) -> bool:
     return (
         file.measurement_status == FILE_STAGE_DONE
@@ -1313,29 +1332,6 @@ async def _generate_file_summary(session: AsyncSession, job: Job) -> None:
     file.summary_status = FILE_STAGE_DONE
     await job_service.delete_job(session, job)
     await enqueue_file_reconcile(session, file.id)
-
-
-async def _enqueue_text_extraction_jobs(session: AsyncSession, file: LabFile) -> None:
-    page_count = max(1, file.page_count)
-    # Summary stays as its own stage so the text OCR jobs can stay small and
-    # resilient while the summary call sees the fully merged document text.
-    for batch_index, (start_page, stop_page) in enumerate(
-        copilot_extraction.build_page_ranges(page_count, TEXT_BATCH_SIZE)
-    ):
-        await job_service.enqueue_job(
-            session,
-            task_type=TASK_EXTRACT_TEXT,
-            task_key=_batch_task_key("text", file.id, start_page, stop_page, DEFAULT_OCR_DPI),
-            payload={
-                "file_id": file.id,
-                "batch_index": batch_index,
-                "start_page": start_page,
-                "stop_page": stop_page,
-                "dpi": DEFAULT_OCR_DPI,
-            },
-            file_id=file.id,
-            priority=PRIORITY_TEXT_EXTRACT,
-        )
 
 
 async def _publish_file(session: AsyncSession, job: Job) -> None:

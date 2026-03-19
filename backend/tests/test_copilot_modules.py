@@ -634,6 +634,71 @@ async def test_ocr_extract_streams_medical_batches_before_combining_result():
 
 
 @pytest.mark.asyncio
+async def test_ocr_extract_runs_text_ocr_in_parallel_with_medical_extraction():
+    medical_started = asyncio.Event()
+    text_started = asyncio.Event()
+    allow_medical_finish = asyncio.Event()
+
+    async def fake_extract_batches(
+        file_path: str,
+        kind: copilot_ocr._ExtractionKind,
+        *,
+        filename: str | None = None,
+        render_cache=None,
+    ):
+        assert file_path == "/tmp/report.pdf"
+        assert kind is copilot_ocr._MEDICAL_EXTRACTION
+        medical_started.set()
+        await text_started.wait()
+        await allow_medical_finish.wait()
+        yield copilot_ocr._ExtractionBatch(
+            batch_index=0,
+            start_page=0,
+            stop_page=1,
+            result={
+                "lab_date": None,
+                "source": None,
+                "measurements": [
+                    {
+                        "marker_name": "CRP",
+                        "value": 15,
+                        "unit": "mg/L",
+                        "reference_low": 0,
+                        "reference_high": 5,
+                        "measured_at": None,
+                        "page_number": 1,
+                    }
+                ],
+            },
+        )
+
+    async def fake_extract_text(
+        file_path: str,
+        *,
+        filename: str | None = None,
+        render_cache=None,
+    ):
+        assert file_path == "/tmp/report.pdf"
+        await medical_started.wait()
+        text_started.set()
+        return {"raw_text": "CRP 15 mg/L", "translated_text_english": "CRP 15 mg/L"}
+
+    with (
+        patch.object(copilot_ocr, "_extract_file_batches", side_effect=fake_extract_batches),
+        patch.object(copilot_ocr, "extract_text", side_effect=fake_extract_text),
+        patch.object(copilot_ocr, "generate_summary", new=AsyncMock(return_value=None)),
+    ):
+        task = asyncio.create_task(copilot_ocr.ocr_extract("/tmp/report.pdf"))
+        await _wait_for(lambda: text_started.is_set())
+        allow_medical_finish.set()
+        result = await task
+
+    assert result["raw_text"] == "CRP 15 mg/L"
+    assert result["translated_text_english"] == "CRP 15 mg/L"
+    assert [measurement["marker_name"] for measurement in result["measurements"]] == ["CRP"]
+
+
+@pytest.mark.asyncio
 async def test_normalize_marker_names_splits_large_batches():
     responses = [
         '{"Marker 1": "Canonical 1", "Marker 2": "Canonical 2"}',

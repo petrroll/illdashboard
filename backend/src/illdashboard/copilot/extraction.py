@@ -928,6 +928,8 @@ async def ocr_extract(
     )
     usable_text_result: dict | None = None
     summary_english: str | None = None
+    medical_task: asyncio.Task[dict] | None = None
+    text_task: asyncio.Task[dict] | None = None
 
     async def _extract_medical_result() -> dict:
         if on_medical_batch is None:
@@ -948,7 +950,28 @@ async def ocr_extract(
         )
 
     try:
-        medical_result = await _extract_medical_result()
+        # Keep batch-streaming for medical extraction, but let full-document
+        # text OCR run at the same time so the durable pipeline helper and the
+        # single-call helper do not serialize independent OCR work.
+        medical_task = asyncio.create_task(_extract_medical_result(), name="ocr:medical")
+        text_task = asyncio.create_task(
+            extract_text(
+                file_path,
+                filename=filename,
+                render_cache=render_cache,
+            ),
+            name="ocr:text",
+        )
+
+        try:
+            medical_result = await medical_task
+        except Exception:
+            if text_task is not None:
+                if not text_task.done():
+                    text_task.cancel()
+                await asyncio.gather(text_task, return_exceptions=True)
+            raise
+
         logger.info(
             "OCR pipeline medical extraction ready path=%s filename=%s measurements=%s elapsed=%.2fs",
             file_path,
@@ -958,11 +981,7 @@ async def ocr_extract(
         )
 
         try:
-            usable_text_result = await extract_text(
-                file_path,
-                filename=filename,
-                render_cache=render_cache,
-            )
+            usable_text_result = await text_task
         except Exception as exc:
             logger.error(
                 "Document text extraction failed for %s (filename=%s): %s",
