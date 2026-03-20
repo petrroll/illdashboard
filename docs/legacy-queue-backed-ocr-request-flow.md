@@ -1,4 +1,6 @@
-# Queue-backed OCR request flow
+# Legacy queue-backed OCR request flow
+
+This document describes the **old** queue-backed/reconcile/publish pipeline that existed before the artifact-first rewrite.
 
 This version separates the explanation into two smaller views:
 

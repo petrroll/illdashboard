@@ -253,21 +253,25 @@ Do not include any commentary outside the JSON.\
 
 
 MEDICAL_SUMMARY_SYSTEM_PROMPT = """\
-You are a medical summarization assistant.
+You are a medical document summarization assistant.
 
 The user will provide:
-1. Structured medical extraction from a lab or related document.
-2. English-translated document text when available.
-3. The original filename.
+1. Raw OCR text from a document in its original language.
+2. The original filename.
 
-Your job is to write a short factual English summary in 2-4 sentences.
-- Focus on the medical meaning of the extracted content when measurements are present.
-- Mention notable abnormal or clearly important findings when they are visible.
-- If there are no measurements, summarize what kind of document it appears to be.
-- Do not repeat the entire OCR text.
+Your job is to:
+1. Write a short factual English summary in 2-4 sentences.
+2. Extract "lab_date" as an ISO date string or null when the report date is not clear.
+3. Extract "source" as a short raw lab/provider name string or null when unclear.
+
+Rules:
+- Use only the provided raw text and filename.
+- Do not rely on any structured measurements or translated text.
+- Keep the summary factual and concise.
+- If the document is not clearly a lab report, briefly describe what kind of document it seems to be.
 - Do not add generic cautions or boilerplate.
 
-Return ONLY valid JSON: {"summary_english": "..."}.
+Return ONLY valid JSON: {"summary_english": "...", "lab_date": "...", "source": "..."}.
 Do not include any commentary outside the JSON.\
 """
 
@@ -380,22 +384,21 @@ async def _extract_document_text_from_attachments(attachments: list[dict], *, fi
 
 
 async def _generate_medical_summary(
-    medical_result: dict,
-    text_result: dict | None,
+    raw_text: str | None,
     *,
     filename: str | None = None,
-) -> str | None:
+) -> dict[str, str | None]:
     started_at = time.perf_counter()
     logger.info(
-        "Medical summary start filename=%s measurements=%s translated_text=%s",
+        "Medical summary start filename=%s raw_text=%s",
         filename,
-        len(medical_result.get("measurements", [])),
-        bool((text_result or {}).get("translated_text_english")),
+        bool(raw_text),
     )
+    if not raw_text:
+        return {"summary_english": None, "lab_date": None, "source": None}
     user_payload = {
         "filename": filename,
-        "translated_text_english": (text_result or {}).get("translated_text_english"),
-        "medical_extraction": medical_result,
+        "raw_text": raw_text,
     }
     parsed = await _ask_json(
         MEDICAL_SUMMARY_SYSTEM_PROMPT,
@@ -404,13 +407,23 @@ async def _generate_medical_summary(
     )
     summary = parsed.get("summary_english")
     cleaned_summary = summary.strip() if isinstance(summary, str) and summary.strip() else None
+    lab_date = parsed.get("lab_date")
+    cleaned_lab_date = lab_date.strip() if isinstance(lab_date, str) and lab_date.strip() else None
+    source = parsed.get("source")
+    cleaned_source = source.strip() if isinstance(source, str) and source.strip() else None
     logger.info(
-        "Medical summary finished filename=%s has_summary=%s duration=%.2fs",
+        "Medical summary finished filename=%s has_summary=%s has_lab_date=%s has_source=%s duration=%.2fs",
         filename,
         bool(cleaned_summary),
+        bool(cleaned_lab_date),
+        bool(cleaned_source),
         time.perf_counter() - started_at,
     )
-    return cleaned_summary
+    return {
+        "summary_english": cleaned_summary,
+        "lab_date": cleaned_lab_date,
+        "source": cleaned_source,
+    }
 
 
 def _offset_result_page_numbers(result: dict, page_offset: int) -> dict:
@@ -459,18 +472,18 @@ def _merge_document_text_results(results: list[dict]) -> dict:
     return merged
 
 
-def _combine_ocr_outputs(medical_result: dict, text_result: dict | None, summary_english: str | None) -> dict:
+def _combine_ocr_outputs(medical_result: dict, text_result: dict | None, summary_result: dict | None) -> dict:
     combined = {
-        "lab_date": medical_result.get("lab_date"),
-        "source": medical_result.get("source"),
+        "lab_date": medical_result.get("lab_date") or (summary_result or {}).get("lab_date"),
+        "source": medical_result.get("source") or (summary_result or {}).get("source"),
         "measurements": medical_result.get("measurements", []),
     }
     if text_result and text_result.get("raw_text"):
         combined["raw_text"] = text_result["raw_text"]
     if text_result and text_result.get("translated_text_english"):
         combined["translated_text_english"] = text_result["translated_text_english"]
-    if summary_english:
-        combined["summary_english"] = summary_english
+    if summary_result and summary_result.get("summary_english"):
+        combined["summary_english"] = summary_result["summary_english"]
     return combined
 
 
@@ -922,12 +935,10 @@ async def ocr_extract(
     started_at = time.perf_counter()
     logger.info("OCR pipeline start path=%s filename=%s", file_path, filename)
     render_cache = (
-        _PdfRenderCache(file_path)
-        if Path(file_path).suffix.lower() == ".pdf"
-        else _ImageRenderCache(file_path)
+        _PdfRenderCache(file_path) if Path(file_path).suffix.lower() == ".pdf" else _ImageRenderCache(file_path)
     )
     usable_text_result: dict | None = None
-    summary_english: str | None = None
+    summary_result: dict | None = None
     medical_task: asyncio.Task[dict] | None = None
     text_task: asyncio.Task[dict] | None = None
 
@@ -1003,7 +1014,10 @@ async def ocr_extract(
             try:
                 # Keep text OCR and summarization in separate calls so each text
                 # batch stays small and summary sees the fully merged document.
-                summary_english = await generate_summary(medical_result, usable_text_result, filename=filename)
+                summary_result = await generate_summary(
+                    (usable_text_result or {}).get("raw_text"),
+                    filename=filename,
+                )
             except Exception as exc:
                 logger.error(
                     "Medical summary generation failed for %s (filename=%s): %s",
@@ -1011,13 +1025,13 @@ async def ocr_extract(
                     filename,
                     exc,
                 )
-                summary_english = None
+                summary_result = None
             else:
                 logger.info(
                     "OCR pipeline summary ready path=%s filename=%s has_summary=%s elapsed=%.2fs",
                     file_path,
                     filename,
-                    bool(summary_english),
+                    bool((summary_result or {}).get("summary_english")),
                     time.perf_counter() - started_at,
                 )
     finally:
@@ -1030,10 +1044,10 @@ async def ocr_extract(
         filename,
         len(medical_result.get("measurements", [])),
         bool((usable_text_result or {}).get("raw_text")),
-        bool(summary_english),
+        bool((summary_result or {}).get("summary_english")),
         time.perf_counter() - started_at,
     )
-    return _combine_ocr_outputs(medical_result, usable_text_result, summary_english)
+    return _combine_ocr_outputs(medical_result, usable_text_result, summary_result)
 
 
 async def extract_text(
@@ -1069,22 +1083,6 @@ async def extract_text(
             time.perf_counter() - started_at,
         )
         raise
-
-
-def page_count_for_file(file_path: str) -> int:
-    if Path(file_path).suffix.lower() != ".pdf":
-        return 1
-    with fitz.open(file_path) as document:
-        return document.page_count
-
-
-def build_page_ranges(page_count: int, batch_size: int) -> list[tuple[int, int]]:
-    if page_count <= 0:
-        return []
-    return [
-        (start_page, min(start_page + max(1, batch_size), page_count))
-        for start_page in range(0, page_count, max(1, batch_size))
-    ]
 
 
 async def extract_measurement_batch(
@@ -1145,21 +1143,16 @@ async def extract_text_batch(
     )
 
 
-def merge_measurement_results(results: list[dict]) -> dict:
-    return _merge_structured_medical_results(results)
-
-
 def merge_text_results(results: list[dict]) -> dict:
     return _merge_document_text_results(results)
 
 
 async def generate_summary(
-    medical_result: dict,
-    text_result: dict | None,
+    raw_text: str | None,
     *,
     filename: str | None = None,
-) -> str | None:
-    return await _generate_medical_summary(medical_result, text_result, filename=filename)
+) -> dict[str, str | None]:
+    return await _generate_medical_summary(raw_text, filename=filename)
 
 
 def is_retryable_batch_error(exc: Exception) -> bool:

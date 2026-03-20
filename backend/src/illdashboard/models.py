@@ -6,7 +6,10 @@ from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Te
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 UPLOADED_FILE_STATUS = "uploaded"
-READY_FILE_STATUS = "ready"
+QUEUED_FILE_STATUS = "queued"
+PROCESSING_FILE_STATUS = "processing"
+COMPLETE_FILE_STATUS = "complete"
+ERROR_FILE_STATUS = "error"
 DEFAULT_GROUP_NAME = "Other"
 
 
@@ -27,12 +30,9 @@ class LabFile(Base):
     mime_type: Mapped[str] = mapped_column(String, nullable=False)
     page_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     status: Mapped[str] = mapped_column(String, nullable=False, default=UPLOADED_FILE_STATUS, index=True)
-    measurement_status: Mapped[str] = mapped_column(String, nullable=False, default="queued")
-    normalization_status: Mapped[str] = mapped_column(String, nullable=False, default="queued")
-    text_status: Mapped[str] = mapped_column(String, nullable=False, default="queued")
-    summary_status: Mapped[str] = mapped_column(String, nullable=False, default="queued")
-    publish_status: Mapped[str] = mapped_column(String, nullable=False, default="queued")
     processing_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_candidate: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_candidate_key: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     source_name: Mapped[str | None] = mapped_column(String, nullable=True)
     ocr_raw: Mapped[str | None] = mapped_column(Text, nullable=True)
     ocr_text_raw: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -40,7 +40,10 @@ class LabFile(Base):
     ocr_summary_english: Mapped[str | None] = mapped_column(Text, nullable=True)
     lab_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    text_assembled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    summary_generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source_resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    search_indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utc_now,
@@ -59,10 +62,60 @@ class LabFile(Base):
         back_populates="lab_file",
         cascade="all, delete-orphan",
     )
+    measurement_batches: Mapped[list[MeasurementBatch]] = relationship(
+        back_populates="lab_file",
+        cascade="all, delete-orphan",
+    )
+    text_batches: Mapped[list[TextBatch]] = relationship(
+        back_populates="lab_file",
+        cascade="all, delete-orphan",
+    )
 
     @property
-    def is_ready(self) -> bool:
-        return self.status == READY_FILE_STATUS
+    def is_complete(self) -> bool:
+        return self.status == COMPLETE_FILE_STATUS
+
+
+class MeasurementBatch(Base):
+    __tablename__ = "measurement_batches"
+    __table_args__ = (UniqueConstraint("file_id", "task_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    file_id: Mapped[int] = mapped_column(ForeignKey("lab_files.id", ondelete="CASCADE"), nullable=False, index=True)
+    task_key: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    start_page: Mapped[int] = mapped_column(Integer, nullable=False)
+    stop_page: Mapped[int] = mapped_column(Integer, nullable=False)
+    dpi: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    lab_file: Mapped[LabFile] = relationship(back_populates="measurement_batches")
+
+
+class TextBatch(Base):
+    __tablename__ = "text_batches"
+    __table_args__ = (UniqueConstraint("file_id", "task_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    file_id: Mapped[int] = mapped_column(ForeignKey("lab_files.id", ondelete="CASCADE"), nullable=False, index=True)
+    task_key: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    start_page: Mapped[int] = mapped_column(Integer, nullable=False)
+    stop_page: Mapped[int] = mapped_column(Integer, nullable=False)
+    dpi: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    translated_text_english: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    lab_file: Mapped[LabFile] = relationship(back_populates="text_batches")
 
 
 class MarkerGroup(Base):
@@ -227,6 +280,22 @@ class MeasurementAlias(Base):
     measurement_type: Mapped[MeasurementType] = relationship(back_populates="aliases")
 
 
+class SourceAlias(Base):
+    __tablename__ = "source_aliases"
+    __table_args__ = (UniqueConstraint("normalized_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    alias_name: Mapped[str] = mapped_column(String, nullable=False)
+    normalized_key: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
+    canonical_name: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+
 class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (UniqueConstraint("task_type", "task_key"),)
@@ -244,6 +313,7 @@ class Job(Base):
     payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     resolved_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rerun_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     lease_owner: Mapped[str | None] = mapped_column(String, nullable=True)

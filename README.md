@@ -15,7 +15,7 @@ backend/          FastAPI + SQLite + async SQLAlchemy (uv-managed)
     schemas.py        – Pydantic request/response schemas
     api/              – API endpoints
     copilot/          – GitHub Copilot SDK integration modules
-    services/pipeline.py – durable background job runtime for OCR, normalization, summary, publish
+    services/pipeline.py – durable artifact-first job runtime for OCR, normalization, summary, and search refresh
   tests/              – pytest test suite
 
 frontend/         React + TypeScript + Vite
@@ -28,16 +28,19 @@ frontend/         React + TypeScript + Vite
       FileDetail.tsx  – view file, run OCR, see measurements, get explanations
       MarkerChart.tsx – line charts of marker values over time
 
+tools/
+  run-log-viewer/     – standalone browser waterfall viewer for run.log
+
 justfile          – build / dev / test / lint commands
 ```
 
 ## Features
 
 - **Upload** PDF and image lab files (PNG, JPG, WEBP)
-- **DB-first OCR pipeline** – files, jobs, extracted rows, normalization rules, and publish state all live in SQLite
+- **DB-first OCR pipeline** – files, jobs, extraction artifacts, normalization rules, and derived progress all live in SQLite
 - **Parallel extraction** – measurement OCR runs separately from text / translation / summary work, with page-batch fanout across files
 - **Serialized normalization** – DB lookups are used first, and any LLM-backed normalization result is stored back into the DB for reuse
-- **Publish gate** – measurements stay hidden until a file has fully finished extraction, normalization, and summary generation
+- **Progressive visibility** – measurements become visible as soon as they are individually resolved
 - **Charts** – visualize any marker's trend over time (with reference range lines)
 - **Tables** – view all values from a single lab report
 - **AI Explanations** – click "Explain" on any marker or select multiple and get a cross-marker analysis
@@ -83,12 +86,26 @@ just clean           # Remove build artifacts and caches
 just help            # List all recipes
 ```
 
+## Developer Tools
+
+The repository includes a standalone `run.log` waterfall viewer at `tools/run-log-viewer/index.html`.
+
+You can open the HTML file directly and upload or paste a log, or serve the repository root and let the page fetch `run.log` for you:
+
+```bash
+python -m http.server 4173
+```
+
+Then visit `http://localhost:4173/tools/run-log-viewer/index.html`.
+
+The viewer highlights extraction jobs, page-batch sizes, Copilot request lifecycles, summaries, normalization spans, and worker crashes in one timeline.
+
 ### 3. Usage
 
 1. Go to **Lab Files** → upload a PDF or image of a lab report
 2. Click into the file → **Run OCR** to queue the file into the durable processing pipeline
-3. Watch the file stages update as extraction, normalization, summary, and publish complete
-4. View extracted measurements once the file reaches the ready state
+3. Watch file progress update as measurement OCR, text OCR, summary generation, and source/search completion converge
+4. View resolved measurements as they become ready, without waiting for a final publish step
 5. Click **Explain** on any row, or select multiple rows and click **Explain selected**
 6. Go to **Charts** to see how a specific marker changes over time
 7. Select data points in the chart table to get AI cross-analysis

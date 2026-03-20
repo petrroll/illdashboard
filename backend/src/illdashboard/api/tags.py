@@ -8,12 +8,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from illdashboard.database import get_db
-from illdashboard.models import READY_FILE_STATUS, LabFile, LabFileTag, MarkerTag, Measurement, MeasurementType
+from illdashboard.models import LabFile, LabFileTag, MarkerTag, Measurement, MeasurementType, utc_now
 from illdashboard.schemas import TagsUpdate
 from illdashboard.services import markers as marker_service
+from illdashboard.services import pipeline
 from illdashboard.services import search as search_service
 
 router = APIRouter(prefix="")
+VISIBLE_MEASUREMENT_STATUS = "resolved"
 
 
 @router.get("/tags/files", response_model=list[str], tags=["tags"])
@@ -32,7 +34,7 @@ async def list_marker_tags(db: AsyncSession = Depends(get_db)):
             selectinload(Measurement.measurement_type),
             selectinload(Measurement.lab_file).selectinload(LabFile.tags),
         )
-        .where(LabFile.status == READY_FILE_STATUS)
+        .where(Measurement.normalization_status == VISIBLE_MEASUREMENT_STATUS)
         .order_by(MeasurementType.name.asc(), Measurement.measured_at.asc(), Measurement.id.asc())
     )
     measurements = result.scalars().all()
@@ -68,8 +70,13 @@ async def set_file_tags(file_id: int, body: TagsUpdate, db: AsyncSession = Depen
     for tag in unique_tags:
         db.add(LabFileTag(lab_file_id=file_id, tag=tag))
     await db.flush()
-    if lab.status == READY_FILE_STATUS:
+    progress = await pipeline.get_file_progress(db, lab)
+    if progress.is_complete:
         await search_service.refresh_lab_search_document(file_id, db)
+        lab.search_indexed_at = utc_now()
+    else:
+        await search_service.remove_lab_search_document(file_id, db)
+        lab.search_indexed_at = None
     await db.commit()
     return unique_tags
 
@@ -94,6 +101,6 @@ async def set_marker_tags(marker_name: str, body: TagsUpdate, db: AsyncSession =
     measurements = [
         measurement
         for measurement in await marker_service.load_measurements_for_marker(db, marker_name)
-        if measurement.lab_file.status == READY_FILE_STATUS
+        if measurement.normalization_status == VISIBLE_MEASUREMENT_STATUS
     ]
     return marker_service.combine_marker_tags(unique_tags, measurement_type.group_name, len(measurements))

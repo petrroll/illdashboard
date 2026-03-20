@@ -41,37 +41,51 @@ function isFileActive(file: LabFile | null) {
   return file?.status === "queued" || file?.status === "processing";
 }
 
-function getStageLabel(file: LabFile) {
+function getProcessingLabel(file: LabFile) {
   if (file.status === "error") {
     return file.processing_error || "Processing failed";
   }
   if (file.status === "uploaded") {
     return "Not processed";
   }
-  if (file.publish_status === "running") {
-    return "Publishing";
-  }
-  if (file.summary_status === "running") {
-    return "Generating summary";
-  }
-  if (file.text_status === "running") {
-    return "Extracting text";
-  }
-  if (file.normalization_status === "running") {
-    return "Normalizing measurements";
-  }
-  if (file.measurement_status === "running") {
-    return "Extracting measurements";
-  }
   if (file.status === "queued") {
     return "Queued";
   }
-  return "Ready";
+  if (file.status === "complete") {
+    return file.progress.search_ready ? "Complete" : "Refreshing search";
+  }
+  if (file.progress.measurement_pages_done < file.progress.measurement_pages_total) {
+    return "Extracting measurements";
+  }
+  if (file.progress.total_measurements > file.progress.ready_measurements) {
+    return "Normalizing measurements";
+  }
+  if (file.progress.text_pages_done < file.progress.text_pages_total) {
+    return "Extracting text";
+  }
+  if (!file.text_assembled_at) {
+    return "Assembling text";
+  }
+  if (!file.progress.summary_ready) {
+    return "Generating summary";
+  }
+  if (!file.progress.source_ready) {
+    return "Resolving source";
+  }
+  return "Processing";
+}
+
+function getProgressSummary(file: LabFile) {
+  return [
+    `Measurements ${file.progress.measurement_pages_done}/${file.progress.measurement_pages_total} pages`,
+    `Text ${file.progress.text_pages_done}/${file.progress.text_pages_total} pages`,
+    `Visible markers ${file.progress.ready_measurements}/${file.progress.total_measurements}`,
+  ].join(" · ");
 }
 
 function renderStatusBadge(file: LabFile) {
-  if (file.status === "ready") {
-    return <span className="badge badge-success">Ready</span>;
+  if (file.status === "complete") {
+    return <span className="badge badge-success">Complete</span>;
   }
   if (file.status === "error") {
     return <span className="badge badge-danger">Error</span>;
@@ -84,7 +98,7 @@ function renderStatusBadge(file: LabFile) {
   }
   return (
     <span className="badge badge-info">
-      <span className="spinner" style={{ width: 12, height: 12 }} /> {getStageLabel(file)}…
+      <span className="spinner" style={{ width: 12, height: 12 }} /> {getProcessingLabel(file)}…
     </span>
   );
 }
@@ -280,13 +294,19 @@ export default function FileDetail() {
       <section className="card" style={{ marginBottom: "1rem" }}>
         <div style={{ display: "flex", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
           {renderStatusBadge(file)}
-          <span style={{ color: "var(--text-muted)", fontSize: "0.9rem" }}>{getStageLabel(file)}</span>
+          <span style={{ color: "var(--text-muted)", fontSize: "0.9rem" }}>{getProcessingLabel(file)}</span>
           {file.processing_error && file.status === "error" && (
             <span style={{ color: "var(--red, #e74c3c)", fontSize: "0.85rem" }}>{file.processing_error}</span>
           )}
         </div>
         <div style={{ color: "var(--text-muted)", fontSize: "0.82rem", marginTop: "0.5rem" }}>
-          Measurement OCR: {file.measurement_status} · Normalization: {file.normalization_status} · Text: {file.text_status} · Summary: {file.summary_status}
+          {getProgressSummary(file)}
+          {" · "}
+          Summary {file.progress.summary_ready ? "ready" : "pending"}
+          {" · "}
+          Source {file.progress.source_ready ? "resolved" : "pending"}
+          {" · "}
+          Search {file.progress.search_ready ? "fresh" : "stale"}
         </div>
       </section>
 
@@ -332,7 +352,7 @@ export default function FileDetail() {
             <>
               <span className="spinner" /> Queueing…
             </>
-          ) : file.status === "ready" ? (
+          ) : file.status === "complete" ? (
             "Re-run processing"
           ) : (
             "Start processing"
@@ -416,11 +436,11 @@ export default function FileDetail() {
             <div className="card">
               <p style={{ color: "var(--text-muted)" }}>
                 {isFileActive(file)
-                  ? "This file is still processing. Measurements will appear once the file is published."
+                  ? "This file is still processing. Resolved measurements will appear as they become ready."
                   : file.status === "error"
                   ? "Processing failed. Re-run the pipeline to try again."
-                  : "No measurements were published for this file."}
-              </p>
+                  : "No resolved measurements were produced for this file."}
+                </p>
             </div>
           ) : (
             <div className="card" style={{ overflow: "auto" }}>

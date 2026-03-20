@@ -1,24 +1,38 @@
+export interface FileProgress {
+  measurement_pages_done: number;
+  measurement_pages_total: number;
+  text_pages_done: number;
+  text_pages_total: number;
+  ready_measurements: number;
+  total_measurements: number;
+  summary_ready: boolean;
+  source_ready: boolean;
+  search_ready: boolean;
+  measurement_error_count: number;
+  is_complete: boolean;
+}
+
 export interface LabFile {
   id: number;
   filename: string;
   filepath: string;
   mime_type: string;
   page_count: number;
-  status: "uploaded" | "queued" | "processing" | "ready" | "error";
-  measurement_status: "queued" | "running" | "done" | "error";
-  normalization_status: "queued" | "running" | "done" | "error";
-  text_status: "queued" | "running" | "done" | "error";
-  summary_status: "queued" | "running" | "done" | "error";
-  publish_status: "queued" | "running" | "done" | "error";
+  status: "uploaded" | "queued" | "processing" | "complete" | "error";
   processing_error: string | null;
   uploaded_at: string;
-  published_at: string | null;
   ocr_raw: string | null;
   ocr_text_raw: string | null;
   ocr_text_english: string | null;
   ocr_summary_english: string | null;
   lab_date: string | null;
+  source_name: string | null;
+  text_assembled_at: string | null;
+  summary_generated_at: string | null;
+  source_resolved_at: string | null;
+  search_indexed_at: string | null;
   tags: string[];
+  progress: FileProgress;
 }
 
 export interface Measurement {

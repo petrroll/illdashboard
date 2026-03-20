@@ -18,7 +18,7 @@ from sqlalchemy.orm import selectinload
 from illdashboard.config import settings
 from illdashboard.database import get_db
 from illdashboard.models import LabFile, LabFileTag
-from illdashboard.schemas import BatchOcrRequest, LabFileOut, QueueFilesResponse
+from illdashboard.schemas import BatchOcrRequest, FileProgressOut, LabFileOut, QueueFilesResponse
 from illdashboard.services import pipeline
 from illdashboard.services import search as search_service
 
@@ -47,6 +47,46 @@ def get_page_count(file_path: Path, mime_type: str) -> int:
         with fitz.open(str(file_path)) as document:
             return document.page_count
     return 1
+
+
+async def serialize_lab_file(lab: LabFile, db: AsyncSession) -> LabFileOut:
+    progress = await pipeline.get_file_progress(db, lab)
+    raw_tags = lab.__dict__.get("tags", [])
+    tags = [tag.tag for tag in raw_tags if hasattr(tag, "tag")]
+    return LabFileOut(
+        id=lab.id,
+        filename=lab.filename,
+        filepath=lab.filepath,
+        mime_type=lab.mime_type,
+        page_count=lab.page_count,
+        status=lab.status,
+        processing_error=lab.processing_error,
+        uploaded_at=lab.uploaded_at,
+        ocr_raw=lab.ocr_raw,
+        ocr_text_raw=lab.ocr_text_raw,
+        ocr_text_english=lab.ocr_text_english,
+        ocr_summary_english=lab.ocr_summary_english,
+        lab_date=lab.lab_date,
+        source_name=lab.source_name,
+        text_assembled_at=lab.text_assembled_at,
+        summary_generated_at=lab.summary_generated_at,
+        source_resolved_at=lab.source_resolved_at,
+        search_indexed_at=lab.search_indexed_at,
+        tags=tags,
+        progress=FileProgressOut(
+            measurement_pages_done=progress.measurement_pages_done,
+            measurement_pages_total=progress.measurement_pages_total,
+            text_pages_done=progress.text_pages_done,
+            text_pages_total=progress.text_pages_total,
+            ready_measurements=progress.ready_measurements,
+            total_measurements=progress.total_measurements,
+            summary_ready=progress.summary_ready,
+            source_ready=progress.source_ready,
+            search_ready=progress.search_ready,
+            measurement_error_count=progress.measurement_error_count,
+            is_complete=progress.is_complete,
+        ),
+    )
 
 
 def render_pdf_page(file_path: Path, page_num: int) -> bytes:
@@ -89,7 +129,7 @@ async def upload_file(
     db.add(lab)
     await db.commit()
     await db.refresh(lab)
-    return lab
+    return await serialize_lab_file(lab, db)
 
 
 @router.get("/files", response_model=list[LabFileOut], tags=["files"])
@@ -102,12 +142,13 @@ async def list_files(
         for tag in tags:
             query = query.where(LabFile.id.in_(select(LabFileTag.lab_file_id).where(LabFileTag.tag == tag)))
     result = await db.execute(query)
-    return result.scalars().unique().all()
+    labs = result.scalars().unique().all()
+    return [await serialize_lab_file(lab, db) for lab in labs]
 
 
 @router.get("/files/{file_id}", response_model=LabFileOut, tags=["files"])
 async def get_file(file_id: int, db: AsyncSession = Depends(get_db)):
-    return await get_lab_file_or_404(file_id, db)
+    return await serialize_lab_file(await get_lab_file_or_404(file_id, db), db)
 
 
 @router.delete("/files/{file_id}", tags=["files"])

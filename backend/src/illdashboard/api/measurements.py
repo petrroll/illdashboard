@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from illdashboard.database import get_db
-from illdashboard.models import READY_FILE_STATUS, LabFile, MarkerTag, Measurement, MeasurementType
+from illdashboard.models import LabFile, MarkerTag, Measurement, MeasurementType
 from illdashboard.schemas import (
     MarkerDetailResponse,
     MarkerInsightResponse,
@@ -25,6 +25,7 @@ from illdashboard.services.rescaling import annotate_missing_rescaling_measureme
 from illdashboard.sparkline import generate_sparkline, get_cached_sparkline
 
 router = APIRouter(prefix="")
+VISIBLE_MEASUREMENT_STATUS = "resolved"
 
 
 @router.get("/measurements", response_model=list[MeasurementOut], tags=["measurements"])
@@ -40,7 +41,7 @@ async def list_measurements(
             selectinload(Measurement.measurement_type),
             selectinload(Measurement.lab_file).selectinload(LabFile.tags),
         )
-        .where(LabFile.status == READY_FILE_STATUS)
+        .where(Measurement.normalization_status == VISIBLE_MEASUREMENT_STATUS)
         .order_by(Measurement.measured_at.asc(), Measurement.id.asc())
     )
     if marker_name:
@@ -64,7 +65,7 @@ async def measurement_overview(
             selectinload(Measurement.measurement_type),
             selectinload(Measurement.lab_file).selectinload(LabFile.tags),
         )
-        .where(LabFile.status == READY_FILE_STATUS)
+        .where(Measurement.normalization_status == VISIBLE_MEASUREMENT_STATUS)
         .order_by(MeasurementType.name.asc(), Measurement.measured_at.asc(), Measurement.id.asc())
     )
     measurements = list(result.scalars().all())
@@ -123,8 +124,7 @@ async def list_marker_names(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(MeasurementType.name)
         .join(MeasurementType.measurements)
-        .join(Measurement.lab_file)
-        .where(LabFile.status == READY_FILE_STATUS)
+        .where(Measurement.normalization_status == VISIBLE_MEASUREMENT_STATUS)
         .distinct()
         .order_by(MeasurementType.name)
     )
@@ -143,7 +143,7 @@ async def measurement_detail(
     measurements = [
         measurement
         for measurement in await marker_service.load_measurements_for_marker(db, marker_name)
-        if measurement.lab_file.status == READY_FILE_STATUS
+        if measurement.normalization_status == VISIBLE_MEASUREMENT_STATUS
     ]
     if not measurements:
         raise HTTPException(404, "Marker not found")
@@ -188,7 +188,7 @@ async def measurement_insight(
     measurements = [
         measurement
         for measurement in await marker_service.load_measurements_for_marker(db, marker_name)
-        if measurement.lab_file.status == READY_FILE_STATUS
+        if measurement.normalization_status == VISIBLE_MEASUREMENT_STATUS
     ]
     if not measurements:
         raise HTTPException(404, "Marker not found")
@@ -212,8 +212,6 @@ async def file_measurements(file_id: int, db: AsyncSession = Depends(get_db)):
     file = await db.get(LabFile, file_id)
     if file is None:
         raise HTTPException(404, "File not found")
-    if file.status != READY_FILE_STATUS:
-        return []
 
     result = await db.execute(
         select(Measurement)
@@ -222,7 +220,10 @@ async def file_measurements(file_id: int, db: AsyncSession = Depends(get_db)):
             selectinload(Measurement.measurement_type),
             selectinload(Measurement.lab_file).selectinload(LabFile.tags),
         )
-        .where(Measurement.lab_file_id == file_id)
+        .where(
+            Measurement.lab_file_id == file_id,
+            Measurement.normalization_status == VISIBLE_MEASUREMENT_STATUS,
+        )
         .order_by(MeasurementType.name.asc(), Measurement.id.asc())
     )
     measurements = result.scalars().all()
@@ -238,7 +239,7 @@ async def measurement_sparkline(
     measurements = [
         measurement
         for measurement in await marker_service.load_measurements_for_marker(db, marker_name)
-        if measurement.lab_file.status == READY_FILE_STATUS
+        if measurement.normalization_status == VISIBLE_MEASUREMENT_STATUS
     ]
     if not measurements:
         raise HTTPException(404, "Marker not found")

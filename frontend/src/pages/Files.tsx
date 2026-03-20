@@ -31,33 +31,44 @@ function getProcessingLabel(file: LabFile) {
   if (file.status === "uploaded") {
     return "Not processed";
   }
-  if (file.publish_status === "running") {
-    return "Publishing";
-  }
-  if (file.summary_status === "running") {
-    return "Summarizing";
-  }
-  if (file.text_status === "running") {
-    return "Extracting text";
-  }
-  if (file.normalization_status === "running") {
-    return "Normalizing measurements";
-  }
-  if (file.measurement_status === "running") {
-    return "Extracting measurements";
-  }
   if (file.status === "queued") {
     return "Queued";
   }
-  if (file.status === "ready") {
-    return "Ready";
+  if (file.status === "complete") {
+    return file.progress.search_ready ? "Complete" : "Refreshing search";
   }
-  return "Waiting";
+  if (file.progress.measurement_pages_done < file.progress.measurement_pages_total) {
+    return "Extracting measurements";
+  }
+  if (file.progress.total_measurements > file.progress.ready_measurements) {
+    return "Normalizing measurements";
+  }
+  if (file.progress.text_pages_done < file.progress.text_pages_total) {
+    return "Extracting text";
+  }
+  if (!file.text_assembled_at) {
+    return "Assembling text";
+  }
+  if (!file.progress.summary_ready) {
+    return "Generating summary";
+  }
+  if (!file.progress.source_ready) {
+    return "Resolving source";
+  }
+  return "Processing";
+}
+
+function getProgressSummary(file: LabFile) {
+  return [
+    `Measurements ${file.progress.measurement_pages_done}/${file.progress.measurement_pages_total}p`,
+    `Text ${file.progress.text_pages_done}/${file.progress.text_pages_total}p`,
+    `Ready markers ${file.progress.ready_measurements}/${file.progress.total_measurements}`,
+  ].join(" · ");
 }
 
 function renderStatusBadge(file: LabFile) {
-  if (file.status === "ready") {
-    return <span className="badge badge-success">Ready</span>;
+  if (file.status === "complete") {
+    return <span className="badge badge-success">Complete</span>;
   }
   if (file.status === "error") {
     return (
@@ -409,7 +420,12 @@ export default function Files() {
                       </td>
                       <td>{formatDate(file.lab_date)}</td>
                       <td>{formatDate(file.uploaded_at)}</td>
-                      <td>{renderStatusBadge(file)}</td>
+                      <td>
+                        <div>{renderStatusBadge(file)}</div>
+                        <div style={{ color: "var(--text-muted)", fontSize: "0.78rem", marginTop: "0.25rem" }}>
+                          {getProgressSummary(file)}
+                        </div>
+                      </td>
                       <td style={{ minWidth: 160 }}>
                         {editingTagsFileId === file.id ? (
                           <TagInput

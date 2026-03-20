@@ -2,50 +2,53 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from illdashboard.config import settings
 from illdashboard.models import (
-    READY_FILE_STATUS,
     Job,
     LabFile,
     LabFileTag,
     Measurement,
     MeasurementAlias,
+    MeasurementBatch,
     MeasurementType,
+    TextBatch,
     utc_now,
 )
 from illdashboard.services import jobs as job_service
 from illdashboard.services import pipeline, rescaling
+from illdashboard.services import search as search_service
 
 
-async def _wait_for_file_ready(session_factory, file_id: int, *, timeout_seconds: float = 10.0) -> LabFile:
+async def _wait_for_file_complete(session_factory, file_id: int, *, timeout_seconds: float = 10.0) -> LabFile:
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while True:
         async with session_factory() as session:
             result = await session.execute(
                 select(LabFile)
-                .options(selectinload(LabFile.measurements).selectinload(Measurement.measurement_type))
+                .options(
+                    selectinload(LabFile.tags),
+                    selectinload(LabFile.measurements).selectinload(Measurement.measurement_type),
+                )
                 .where(LabFile.id == file_id)
             )
             file = result.scalar_one()
-            if file.status == READY_FILE_STATUS:
+            if file.status == "complete" and file.search_indexed_at is not None:
                 return file
             if file.status == "error":
                 raise AssertionError(file.processing_error or "file entered error state")
         if asyncio.get_running_loop().time() >= deadline:
-            raise AssertionError("timed out waiting for file to become ready")
+            raise AssertionError("timed out waiting for file completion")
         await asyncio.sleep(0.05)
 
 
 @pytest.mark.asyncio
-async def test_upload_and_queue_processing_creates_durable_jobs(client, session_factory):
+async def test_upload_and_queue_processing_creates_ensure_file_job(client, session_factory):
     upload_response = await client.post(
         "/api/files/upload",
         files={"file": ("report.png", b"fake-image", "image/png")},
@@ -54,175 +57,79 @@ async def test_upload_and_queue_processing_creates_durable_jobs(client, session_
     uploaded_file = upload_response.json()
     assert uploaded_file["status"] == "uploaded"
     assert uploaded_file["page_count"] == 1
+    assert uploaded_file["progress"]["measurement_pages_total"] == 1
+    assert uploaded_file["progress"]["text_pages_total"] == 1
+    assert uploaded_file["progress"]["is_complete"] is False
 
     queue_response = await client.post(f"/api/files/{uploaded_file['id']}/ocr")
     assert queue_response.status_code == 200
     assert queue_response.json() == {"queued_file_ids": [uploaded_file["id"]]}
 
     async with session_factory() as session:
-        result = await session.execute(
-            select(Job).where(Job.file_id == uploaded_file["id"]).order_by(Job.task_type.asc())
-        )
-        jobs = result.scalars().all()
-
-    assert [job.task_type for job in jobs] == [
-        pipeline.TASK_EXTRACT_MEASUREMENT,
-        pipeline.TASK_EXTRACT_TEXT,
-    ]
-
-
-@pytest.mark.asyncio
-async def test_enqueue_file_extraction_jobs_batches_measurement_and_text_two_pages_by_default():
-    file = LabFile(
-        id=42,
-        filename="report.pdf",
-        filepath="/tmp/report.pdf",
-        mime_type="application/pdf",
-        page_count=5,
-    )
-
-    with patch("illdashboard.services.pipeline.job_service.enqueue_job", new=AsyncMock()) as enqueue_job_mock:
-        await pipeline._enqueue_file_extraction_jobs(cast(AsyncSession, object()), file)
-
-    assert [
-        (
-            call.kwargs["task_type"],
-            call.kwargs["payload"]["start_page"],
-            call.kwargs["payload"]["stop_page"],
-        )
-        for call in enqueue_job_mock.await_args_list
-    ] == [
-        (pipeline.TASK_EXTRACT_MEASUREMENT, 0, 2),
-        (pipeline.TASK_EXTRACT_MEASUREMENT, 2, 4),
-        (pipeline.TASK_EXTRACT_MEASUREMENT, 4, 5),
-        (pipeline.TASK_EXTRACT_TEXT, 0, 2),
-        (pipeline.TASK_EXTRACT_TEXT, 2, 4),
-        (pipeline.TASK_EXTRACT_TEXT, 4, 5),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_reconcile_does_not_backfill_missing_text_jobs(session_factory):
-    async with session_factory() as session:
-        lab_file = LabFile(
-            filename="report.pdf",
-            filepath="/tmp/report.pdf",
-            mime_type="application/pdf",
-            page_count=5,
-            status="processing",
-            measurement_status="done",
-            normalization_status="queued",
-            text_status="queued",
-            summary_status="queued",
-            publish_status="queued",
-        )
-        session.add(lab_file)
-        await session.flush()
-        reconcile_job = Job(
-            file_id=lab_file.id,
-            task_type=pipeline.TASK_RECONCILE_FILE,
-            task_key=f"file:{lab_file.id}",
-            status=job_service.JOB_STATUS_PENDING,
-            priority=5,
-            payload_json=job_service.json_dumps({"file_id": lab_file.id}),
-        )
-        session.add(reconcile_job)
-        await session.commit()
-        file_id = lab_file.id
-
-    async with session_factory() as session:
-        job_result = await session.execute(select(Job).where(Job.task_type == pipeline.TASK_RECONCILE_FILE))
-        reconcile_job = job_result.scalar_one()
-        await pipeline._reconcile_file(session, reconcile_job)
-        await session.commit()
-
         jobs_result = await session.execute(
-            select(Job).where(Job.file_id == file_id).order_by(Job.task_type.asc(), Job.task_key.asc())
+            select(Job).where(Job.file_id == uploaded_file["id"]).order_by(Job.task_type.asc(), Job.task_key.asc())
         )
         jobs = jobs_result.scalars().all()
+        refreshed_file = await session.get(LabFile, uploaded_file["id"])
 
-    assert jobs == []
-
-
-@pytest.mark.asyncio
-async def test_file_measurements_stay_hidden_until_publish(client):
-    upload_response = await client.post(
-        "/api/files/upload",
-        files={"file": ("report.png", b"fake-image", "image/png")},
-    )
-    file_id = upload_response.json()["id"]
-
-    queue_response = await client.post(f"/api/files/{file_id}/ocr")
-    assert queue_response.status_code == 200
-
-    measurements_response = await client.get(f"/api/files/{file_id}/measurements")
-    assert measurements_response.status_code == 200
-    assert measurements_response.json() == []
+    assert refreshed_file is not None
+    assert refreshed_file.status == "queued"
+    assert [(job.task_type, job.task_key) for job in jobs] == [
+        (pipeline.TASK_ENSURE_FILE, f"file:{uploaded_file['id']}"),
+    ]
 
 
 @pytest.mark.asyncio
-async def test_single_file_ocr_does_not_reset_other_incomplete_files(client, session_factory):
-    upload_dir = Path(settings.UPLOAD_DIR)
-    first_path = upload_dir / "first.png"
-    second_path = upload_dir / "second.png"
-    first_path.write_bytes(b"first-image")
-    second_path.write_bytes(b"second-image")
-
+async def test_file_measurements_are_visible_progressively(client, session_factory):
     async with session_factory() as session:
-        first_file = LabFile(
-            filename="first.png",
-            filepath=str(first_path),
-            mime_type="image/png",
-            page_count=1,
-        )
-        second_file = LabFile(
-            filename="second.png",
-            filepath=str(second_path),
+        file = LabFile(
+            filename="partial.png",
+            filepath="/tmp/partial.png",
             mime_type="image/png",
             page_count=1,
             status="processing",
-            measurement_status="running",
-            normalization_status="queued",
-            text_status="queued",
-            summary_status="queued",
-            publish_status="queued",
-            ocr_text_raw="partial text",
         )
-        session.add_all([first_file, second_file])
+        measurement_type = MeasurementType(
+            name="CRP",
+            normalized_key="crp",
+            group_name="Inflammation & Infection",
+            canonical_unit="mg/L",
+        )
+        session.add_all([file, measurement_type])
         await session.flush()
-        session.add(
-            Job(
-                file_id=second_file.id,
-                task_type=pipeline.TASK_EXTRACT_MEASUREMENT,
-                task_key="file:second:measurement",
-                status="pending",
-                priority=10,
-            )
+        session.add_all(
+            [
+                Measurement(
+                    lab_file_id=file.id,
+                    measurement_type_id=measurement_type.id,
+                    raw_marker_name="CRP",
+                    normalized_marker_key="crp",
+                    original_value=12.0,
+                    original_unit="mg/L",
+                    canonical_value=12.0,
+                    canonical_unit="mg/L",
+                    normalization_status="resolved",
+                ),
+                Measurement(
+                    lab_file_id=file.id,
+                    raw_marker_name="ALT",
+                    normalized_marker_key="alt",
+                    normalization_status="pending",
+                ),
+            ]
         )
         await session.commit()
-        first_file_id = first_file.id
-        second_file_id = second_file.id
+        file_id = file.id
 
-    queue_response = await client.post(f"/api/files/{first_file_id}/ocr")
-    assert queue_response.status_code == 200
-    assert queue_response.json() == {"queued_file_ids": [first_file_id]}
+    response = await client.get(f"/api/files/{file_id}/measurements")
+    assert response.status_code == 200
+    measurements = response.json()
+    assert [measurement["marker_name"] for measurement in measurements] == ["CRP"]
 
-    async with session_factory() as session:
-        files_result = await session.execute(select(LabFile).order_by(LabFile.id.asc()))
-        first_file, second_file = files_result.scalars().all()
-        jobs_result = await session.execute(select(Job).order_by(Job.file_id.asc(), Job.task_type.asc()))
-        jobs = jobs_result.scalars().all()
-
-    assert first_file.id == first_file_id
-    assert first_file.status == "queued"
-    assert second_file.id == second_file_id
-    assert second_file.status == "processing"
-    assert second_file.ocr_text_raw == "partial text"
-    assert [(job.file_id, job.task_type) for job in jobs] == [
-        (first_file_id, pipeline.TASK_EXTRACT_MEASUREMENT),
-        (first_file_id, pipeline.TASK_EXTRACT_TEXT),
-        (second_file_id, pipeline.TASK_EXTRACT_MEASUREMENT),
-    ]
+    list_response = await client.get("/api/measurements")
+    assert list_response.status_code == 200
+    listed = list_response.json()
+    assert [measurement["marker_name"] for measurement in listed] == ["CRP"]
 
 
 @pytest.mark.asyncio
@@ -251,8 +158,6 @@ async def test_pipeline_runtime_processes_file_end_to_end(session_factory):
                 "illdashboard.services.pipeline.copilot_extraction.extract_measurement_batch",
                 new=AsyncMock(
                     return_value={
-                        "lab_date": "2026-03-15T00:00:00+00:00",
-                        "source": "synlab",
                         "measurements": [
                             {
                                 "marker_name": "CRP",
@@ -278,7 +183,13 @@ async def test_pipeline_runtime_processes_file_end_to_end(session_factory):
             ),
             patch(
                 "illdashboard.services.pipeline.copilot_extraction.generate_summary",
-                new=AsyncMock(return_value="Inflammation marker is elevated."),
+                new=AsyncMock(
+                    return_value={
+                        "summary_english": "Inflammation marker is elevated.",
+                        "lab_date": "2026-03-15T00:00:00+00:00",
+                        "source": "Synlab",
+                    }
+                ),
             ),
             patch(
                 "illdashboard.services.pipeline.copilot_normalization.normalize_marker_names",
@@ -309,21 +220,19 @@ async def test_pipeline_runtime_processes_file_end_to_end(session_factory):
                 queued_file_ids = await pipeline.queue_files(session, [file_id])
             assert queued_file_ids == [file_id]
 
-            ready_file = await _wait_for_file_ready(session_factory, file_id)
+            complete_file = await _wait_for_file_complete(session_factory, file_id)
     finally:
         await runtime.stop()
 
-    assert ready_file.status == READY_FILE_STATUS
-    assert ready_file.measurement_status == "done"
-    assert ready_file.normalization_status == "done"
-    assert ready_file.text_status == "done"
-    assert ready_file.summary_status == "done"
-    assert ready_file.publish_status == "done"
-    assert ready_file.ocr_summary_english == "Inflammation marker is elevated."
-    assert ready_file.ocr_text_english == "CRP 15 mg/L"
-    assert ready_file.lab_date is not None
-    assert len(ready_file.measurements) == 1
-    measurement = ready_file.measurements[0]
+    assert complete_file.status == "complete"
+    assert complete_file.ocr_summary_english == "Inflammation marker is elevated."
+    assert complete_file.ocr_text_english == "CRP 15 mg/L"
+    assert complete_file.lab_date is not None
+    assert complete_file.source_name == "synlab"
+    assert any(tag.tag == "source:synlab" for tag in complete_file.tags)
+    assert complete_file.ocr_raw is not None
+    assert len(complete_file.measurements) == 1
+    measurement = complete_file.measurements[0]
     assert measurement.marker_name == "CRP"
     assert measurement.canonical_value == 15.0
     assert measurement.canonical_unit == "mg/L"
@@ -331,16 +240,270 @@ async def test_pipeline_runtime_processes_file_end_to_end(session_factory):
     assert measurement.measurement_type.group_name == "Inflammation & Infection"
 
     async with session_factory() as session:
-        file_result = await session.execute(select(LabFile).where(LabFile.id == file_id))
-        refreshed_file = file_result.scalar_one()
         alias_result = await session.execute(select(MeasurementAlias).join(MeasurementAlias.measurement_type))
         aliases = alias_result.scalars().all()
-        jobs_result = await session.execute(select(Job))
-        remaining_jobs = jobs_result.scalars().all()
+        jobs_result = await session.execute(select(Job.status))
+        job_statuses = jobs_result.scalars().all()
+        search_results = await search_service.search_lab_files("crp", [], session)
+        refreshed_file = await session.get(LabFile, file_id)
+        assert refreshed_file is not None
+        progress = await pipeline.get_file_progress(session, refreshed_file)
 
-    assert refreshed_file.source_name == "synlab"
     assert any(alias.alias_name == "CRP" for alias in aliases)
-    assert remaining_jobs == []
+    assert all(status == job_service.JOB_STATUS_RESOLVED for status in job_statuses)
+    assert [result["file_id"] for result in search_results] == [file_id]
+    assert progress.search_ready is True
+
+
+@pytest.mark.asyncio
+async def test_queue_file_reset_clears_summary_derived_lab_date(session_factory):
+    upload_dir = Path(settings.UPLOAD_DIR)
+    file_path = upload_dir / "stale-date.png"
+    file_path.write_bytes(b"stale-date")
+
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="stale-date.png",
+            filepath=str(file_path),
+            mime_type="image/png",
+            page_count=1,
+            status="complete",
+            lab_date=utc_now(),
+            ocr_summary_english="old summary",
+            text_assembled_at=utc_now(),
+            summary_generated_at=utc_now(),
+            source_resolved_at=utc_now(),
+            search_indexed_at=utc_now(),
+        )
+        session.add(lab_file)
+        await session.commit()
+        await session.refresh(lab_file)
+        file_id = lab_file.id
+
+        await pipeline.queue_file(session, file_id)
+        await session.commit()
+
+        refreshed_file = await session.get(LabFile, file_id)
+
+    assert refreshed_file is not None
+    assert refreshed_file.lab_date is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_measurement_extraction_does_not_revive_failed_batch_job(session_factory):
+    upload_dir = Path(settings.UPLOAD_DIR)
+    file_path = upload_dir / "failed-batch.png"
+    file_path.write_bytes(b"failed-batch")
+
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="failed-batch.png",
+            filepath=str(file_path),
+            mime_type="image/png",
+            page_count=1,
+            status="error",
+            processing_error="batch failed",
+        )
+        session.add(lab_file)
+        await session.flush()
+        failed_task_key = pipeline._batch_task_key("measurements", lab_file.id, 0, 1, pipeline.DEFAULT_OCR_DPI)
+        session.add_all(
+            [
+                Job(
+                    file_id=lab_file.id,
+                    task_type=pipeline.TASK_EXTRACT_MEASUREMENTS,
+                    task_key=failed_task_key,
+                    status=job_service.JOB_STATUS_FAILED,
+                    error_text="boom",
+                ),
+                Job(
+                    file_id=lab_file.id,
+                    task_type=pipeline.TASK_ENSURE_MEASUREMENT_EXTRACTION,
+                    task_key=f"file:{lab_file.id}",
+                    status=job_service.JOB_STATUS_LEASED,
+                    lease_owner="test-runtime",
+                    lease_until=utc_now(),
+                    payload_json=job_service.json_dumps({"file_id": lab_file.id}),
+                ),
+            ]
+        )
+        await session.commit()
+
+        ensure_job = (
+            await session.execute(
+                select(Job).where(Job.task_type == pipeline.TASK_ENSURE_MEASUREMENT_EXTRACTION).limit(1)
+            )
+        ).scalar_one()
+        await pipeline._ensure_measurement_extraction(session, ensure_job)
+        await session.commit()
+
+        failed_job = (
+            await session.execute(
+                select(Job).where(
+                    Job.task_type == pipeline.TASK_EXTRACT_MEASUREMENTS,
+                    Job.task_key == failed_task_key,
+                )
+            )
+        ).scalar_one()
+        refreshed_file = await session.get(LabFile, lab_file.id)
+
+    assert failed_job.status == job_service.JOB_STATUS_FAILED
+    assert refreshed_file is not None
+    assert refreshed_file.status == "error"
+
+
+@pytest.mark.asyncio
+async def test_ensure_measurement_extraction_respects_split_child_jobs(session_factory):
+    upload_dir = Path(settings.UPLOAD_DIR)
+    file_path = upload_dir / "split-batch.png"
+    file_path.write_bytes(b"split-batch")
+
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="split-batch.png",
+            filepath=str(file_path),
+            mime_type="image/png",
+            page_count=2,
+            status="processing",
+        )
+        session.add(lab_file)
+        await session.flush()
+        file_id = lab_file.id
+        session.add_all(
+            [
+                Job(
+                    file_id=file_id,
+                    task_type=pipeline.TASK_EXTRACT_MEASUREMENTS,
+                    task_key=pipeline._batch_task_key("measurements", file_id, 0, 1, pipeline.DEFAULT_OCR_DPI),
+                    status=job_service.JOB_STATUS_PENDING,
+                    payload_json=job_service.json_dumps(
+                        {"file_id": file_id, "start_page": 0, "stop_page": 1, "dpi": pipeline.DEFAULT_OCR_DPI}
+                    ),
+                ),
+                Job(
+                    file_id=file_id,
+                    task_type=pipeline.TASK_EXTRACT_MEASUREMENTS,
+                    task_key=pipeline._batch_task_key("measurements", file_id, 1, 2, pipeline.DEFAULT_OCR_DPI),
+                    status=job_service.JOB_STATUS_PENDING,
+                    payload_json=job_service.json_dumps(
+                        {"file_id": file_id, "start_page": 1, "stop_page": 2, "dpi": pipeline.DEFAULT_OCR_DPI}
+                    ),
+                ),
+                Job(
+                    file_id=file_id,
+                    task_type=pipeline.TASK_ENSURE_MEASUREMENT_EXTRACTION,
+                    task_key=f"file:{file_id}",
+                    status=job_service.JOB_STATUS_LEASED,
+                    lease_owner="test-runtime",
+                    lease_until=utc_now(),
+                    payload_json=job_service.json_dumps({"file_id": file_id}),
+                ),
+            ]
+        )
+        await session.commit()
+
+        ensure_job = (
+            await session.execute(
+                select(Job).where(Job.task_type == pipeline.TASK_ENSURE_MEASUREMENT_EXTRACTION).limit(1)
+            )
+        ).scalar_one()
+        await pipeline._ensure_measurement_extraction(session, ensure_job)
+        await session.commit()
+
+        extract_jobs = list(
+            (
+                await session.execute(
+                    select(Job)
+                    .where(Job.task_type == pipeline.TASK_EXTRACT_MEASUREMENTS)
+                    .order_by(Job.task_key.asc())
+                )
+            ).scalars()
+        )
+
+    assert [job.task_key for job in extract_jobs] == [
+        pipeline._batch_task_key("measurements", file_id, 0, 1, pipeline.DEFAULT_OCR_DPI),
+        pipeline._batch_task_key("measurements", file_id, 1, 2, pipeline.DEFAULT_OCR_DPI),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ensure_file_keeps_source_failure_terminal(session_factory):
+    upload_dir = Path(settings.UPLOAD_DIR)
+    file_path = upload_dir / "source-terminal.png"
+    file_path.write_bytes(b"source-terminal")
+
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="source-terminal.png",
+            filepath=str(file_path),
+            mime_type="image/png",
+            page_count=1,
+            status="error",
+            processing_error="source failed",
+            source_candidate="Synlab",
+            source_candidate_key="synlab",
+            ocr_text_raw="text",
+            ocr_text_english="text",
+            ocr_summary_english="summary",
+            text_assembled_at=utc_now(),
+            summary_generated_at=utc_now(),
+        )
+        session.add(lab_file)
+        await session.flush()
+        session.add_all(
+            [
+                MeasurementBatch(
+                    file_id=lab_file.id,
+                    task_key=pipeline._batch_task_key("measurements", lab_file.id, 0, 1, pipeline.DEFAULT_OCR_DPI),
+                    start_page=0,
+                    stop_page=1,
+                    dpi=pipeline.DEFAULT_OCR_DPI,
+                ),
+                TextBatch(
+                    file_id=lab_file.id,
+                    task_key=pipeline._batch_task_key("text", lab_file.id, 0, 1, pipeline.DEFAULT_OCR_DPI),
+                    start_page=0,
+                    stop_page=1,
+                    dpi=pipeline.DEFAULT_OCR_DPI,
+                    raw_text="text",
+                    translated_text_english="text",
+                ),
+                Job(
+                    task_type=pipeline.TASK_CANONIZE_SOURCE,
+                    task_key="synlab",
+                    status=job_service.JOB_STATUS_FAILED,
+                    error_text="source boom",
+                ),
+                Job(
+                    file_id=lab_file.id,
+                    task_type=pipeline.TASK_ENSURE_FILE,
+                    task_key=f"file:{lab_file.id}",
+                    status=job_service.JOB_STATUS_LEASED,
+                    lease_owner="test-runtime",
+                    lease_until=utc_now(),
+                    payload_json=job_service.json_dumps({"file_id": lab_file.id}),
+                ),
+            ]
+        )
+        await session.commit()
+
+        ensure_job = (
+            await session.execute(select(Job).where(Job.task_type == pipeline.TASK_ENSURE_FILE).limit(1))
+        ).scalar_one()
+        await pipeline._ensure_file(session, ensure_job)
+        await session.commit()
+
+        source_job = (
+            await session.execute(
+                select(Job).where(Job.task_type == pipeline.TASK_CANONIZE_SOURCE, Job.task_key == "synlab")
+            )
+        ).scalar_one()
+        refreshed_file = await session.get(LabFile, lab_file.id)
+
+    assert source_job.status == job_service.JOB_STATUS_FAILED
+    assert refreshed_file is not None
+    assert refreshed_file.status == "error"
+    assert refreshed_file.processing_error == "source boom"
 
 
 @pytest.mark.asyncio
@@ -360,8 +523,8 @@ async def test_prune_jobs_resets_leased_jobs_after_restart(session_factory):
         await session.flush()
         leased_job = Job(
             file_id=lab_file.id,
-            task_type=pipeline.TASK_EXTRACT_MEASUREMENT,
-            task_key="file:leased:measurement",
+            task_type=pipeline.TASK_ENSURE_FILE,
+            task_key=f"file:{lab_file.id}",
             status=job_service.JOB_STATUS_LEASED,
             priority=10,
             lease_owner="old-runtime",
@@ -374,12 +537,89 @@ async def test_prune_jobs_resets_leased_jobs_after_restart(session_factory):
         await job_service.prune_jobs(session)
 
     async with session_factory() as session:
-        result = await session.execute(select(Job).where(Job.task_key == "file:leased:measurement"))
+        result = await session.execute(select(Job).where(Job.task_type == pipeline.TASK_ENSURE_FILE))
         refreshed_job = result.scalar_one()
 
     assert refreshed_job.status == job_service.JOB_STATUS_PENDING
     assert refreshed_job.lease_owner is None
     assert refreshed_job.lease_until is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_start_only_resumes_previously_scheduled_files(session_factory):
+    upload_dir = Path(settings.UPLOAD_DIR)
+    uploaded_path = upload_dir / "startup-uploaded.png"
+    scheduled_path = upload_dir / "startup-scheduled.png"
+    queued_path = upload_dir / "startup-queued.png"
+    processing_path = upload_dir / "startup-processing.png"
+    error_path = upload_dir / "startup-error.png"
+    uploaded_path.write_bytes(b"uploaded-image")
+    scheduled_path.write_bytes(b"scheduled-image")
+    queued_path.write_bytes(b"queued-image")
+    processing_path.write_bytes(b"processing-image")
+    error_path.write_bytes(b"error-image")
+
+    async with session_factory() as session:
+        uploaded_file = LabFile(
+            filename="startup-uploaded.png",
+            filepath=str(uploaded_path),
+            mime_type="image/png",
+            page_count=1,
+        )
+        scheduled_file = LabFile(
+            filename="startup-scheduled.png",
+            filepath=str(scheduled_path),
+            mime_type="image/png",
+            page_count=1,
+        )
+        queued_file = LabFile(
+            filename="startup-queued.png",
+            filepath=str(queued_path),
+            mime_type="image/png",
+            page_count=1,
+            status="queued",
+        )
+        processing_file = LabFile(
+            filename="startup-processing.png",
+            filepath=str(processing_path),
+            mime_type="image/png",
+            page_count=1,
+            status="processing",
+        )
+        error_file = LabFile(
+            filename="startup-error.png",
+            filepath=str(error_path),
+            mime_type="image/png",
+            page_count=1,
+            status="error",
+        )
+        session.add_all([uploaded_file, scheduled_file, queued_file, processing_file, error_file])
+        await session.flush()
+        session.add(
+            Job(
+                file_id=scheduled_file.id,
+                task_type=pipeline.TASK_ENSURE_FILE,
+                task_key=f"file:{scheduled_file.id}",
+                status=job_service.JOB_STATUS_PENDING,
+                priority=10,
+            )
+        )
+        await session.commit()
+
+    with patch.object(pipeline.PipelineRuntime, "_spawn_workers", return_value=None):
+        runtime = pipeline.PipelineRuntime(session_factory)
+        await runtime.start()
+        await runtime.stop()
+
+    async with session_factory() as session:
+        jobs_result = await session.execute(select(Job).order_by(Job.file_id.asc(), Job.task_type.asc()))
+        jobs = jobs_result.scalars().all()
+
+    assert [(job.file_id, job.task_type) for job in jobs] == [
+        (scheduled_file.id, pipeline.TASK_ENSURE_FILE),
+        (queued_file.id, pipeline.TASK_ENSURE_FILE),
+        (processing_file.id, pipeline.TASK_ENSURE_FILE),
+    ]
 
 
 @pytest.mark.asyncio
@@ -398,15 +638,10 @@ async def test_queue_files_from_clean_runtime_cancels_inflight_work(session_fact
         extract_attempts += 1
         if extract_attempts == 1:
             first_run_started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                await shutdown_requested.wait()
-                first_run_cancelled.set()
-                raise
+            await shutdown_requested.wait()
+            first_run_cancelled.set()
+            raise RuntimeError("aborted during clean-runtime reset")
         return {
-            "lab_date": "2026-03-15T00:00:00+00:00",
-            "source": "synlab",
             "measurements": [
                 {
                     "marker_name": "CRP",
@@ -439,7 +674,13 @@ async def test_queue_files_from_clean_runtime_cancels_inflight_work(session_fact
         ),
         patch(
             "illdashboard.services.pipeline.copilot_extraction.generate_summary",
-            new=AsyncMock(return_value="Fresh rerun summary."),
+            new=AsyncMock(
+                return_value={
+                    "summary_english": "Fresh rerun summary.",
+                    "lab_date": "2026-03-15T00:00:00+00:00",
+                    "source": "Synlab",
+                }
+            ),
         ),
         patch(
             "illdashboard.services.pipeline.copilot_normalization.normalize_marker_names",
@@ -488,25 +729,373 @@ async def test_queue_files_from_clean_runtime_cancels_inflight_work(session_fact
                 queued_file_ids = await pipeline.queue_files(session, [file_id])
             assert queued_file_ids == [file_id]
 
-            await asyncio.wait_for(first_run_started.wait(), timeout=3.0)
+            await asyncio.wait_for(first_run_started.wait(), timeout=5.0)
 
             async with session_factory() as session:
                 rerun_file_ids = await asyncio.wait_for(
                     pipeline.queue_files_from_clean_runtime(session, [file_id]),
-                    timeout=3.0,
+                    timeout=5.0,
                 )
             assert rerun_file_ids == [file_id]
             assert first_run_cancelled.is_set()
             shutdown_client_mock.assert_awaited_once()
 
-            ready_file = await _wait_for_file_ready(session_factory, file_id)
+            complete_file = await _wait_for_file_complete(session_factory, file_id)
         finally:
             await pipeline.stop_pipeline_runtime()
 
     assert extract_attempts >= 2
-    assert ready_file.ocr_summary_english == "Fresh rerun summary."
-    assert len(ready_file.measurements) == 1
-    assert ready_file.measurements[0].canonical_value == 42.0
+    assert complete_file.ocr_summary_english == "Fresh rerun summary."
+    assert len(complete_file.measurements) == 1
+    assert complete_file.measurements[0].canonical_value == 42.0
+
+
+@pytest.mark.asyncio
+async def test_preload_uploaded_files_seeds_missing_disk_files(session_factory):
+    upload_dir = Path(settings.UPLOAD_DIR)
+
+    existing_path = upload_dir / "already-tracked.png"
+    existing_path.write_bytes(b"tracked-image")
+    async with session_factory() as session:
+        session.add(
+            LabFile(
+                filename="already-tracked.png",
+                filepath=str(existing_path.resolve()),
+                mime_type="image/png",
+            )
+        )
+        await session.commit()
+
+    (upload_dir / "new-scan.png").write_bytes(b"new-png")
+    (upload_dir / "notes.txt").write_text("ignore me")
+
+    async with session_factory() as session:
+        added = await pipeline.preload_uploaded_files(session)
+
+    assert added == 1
+
+    async with session_factory() as session:
+        result = await session.execute(select(LabFile).order_by(LabFile.filepath.asc()))
+        files = result.scalars().all()
+
+    paths = [Path(file.filepath).name for file in files]
+    assert "already-tracked.png" in paths
+    assert "new-scan.png" in paths
+    assert "notes.txt" not in paths
+
+    new_file = next(file for file in files if Path(file.filepath).name == "new-scan.png")
+    assert new_file.mime_type == "image/png"
+    assert new_file.status == "uploaded"
+
+
+@pytest.mark.asyncio
+async def test_queue_files_only_requeues_selected_files(session_factory):
+    upload_dir = Path(settings.UPLOAD_DIR)
+    complete_path = upload_dir / "complete.png"
+    stuck_path = upload_dir / "stuck.png"
+    error_path = upload_dir / "error.png"
+    complete_path.write_bytes(b"complete-image")
+    stuck_path.write_bytes(b"stuck-image")
+    error_path.write_bytes(b"error-image")
+
+    async with session_factory() as session:
+        complete_file = LabFile(
+            filename="complete.png",
+            filepath=str(complete_path),
+            mime_type="image/png",
+            page_count=1,
+            status="complete",
+            ocr_raw="published",
+            ocr_text_raw="text",
+            ocr_summary_english="summary",
+            source_name="synlab",
+            text_assembled_at=utc_now(),
+            summary_generated_at=utc_now(),
+            source_resolved_at=utc_now(),
+            search_indexed_at=utc_now(),
+            tags=[LabFileTag(tag="source:synlab")],
+        )
+        stuck_file = LabFile(
+            filename="stuck.png",
+            filepath=str(stuck_path),
+            mime_type="image/png",
+            page_count=1,
+            status="processing",
+            processing_error="timed out",
+            source_name="legacy-lab",
+            ocr_text_raw="partial text",
+            tags=[LabFileTag(tag="source:legacy-lab")],
+        )
+        error_file = LabFile(
+            filename="error.png",
+            filepath=str(error_path),
+            mime_type="image/png",
+            page_count=1,
+            status="error",
+            processing_error="bad OCR",
+            source_name="broken-lab",
+        )
+        session.add_all([complete_file, stuck_file, error_file])
+        await session.flush()
+
+        session.add(
+            Measurement(
+                lab_file_id=stuck_file.id,
+                raw_marker_name="CRP",
+                normalized_marker_key="crp",
+            )
+        )
+        session.add_all(
+            [
+                Job(
+                    file_id=stuck_file.id,
+                    task_type=pipeline.TASK_EXTRACT_MEASUREMENTS,
+                    task_key=f"file:{stuck_file.id}:measurements:0:1:144",
+                    status=job_service.JOB_STATUS_PENDING,
+                    priority=10,
+                ),
+                Job(
+                    file_id=None,
+                    task_type=pipeline.TASK_CANONIZE_MARKER,
+                    task_key="crp",
+                    status=job_service.JOB_STATUS_PENDING,
+                    priority=20,
+                ),
+            ]
+        )
+        await session.commit()
+        selected_id = complete_file.id
+
+    async with session_factory() as session:
+        queued_file_ids = await pipeline.queue_files(session, [selected_id])
+
+    assert queued_file_ids == [selected_id]
+
+    async with session_factory() as session:
+        files_result = await session.execute(
+            select(LabFile).options(selectinload(LabFile.tags)).order_by(LabFile.id.asc())
+        )
+        complete_file, stuck_file, error_file = files_result.scalars().all()
+        jobs_result = await session.execute(select(Job).order_by(Job.task_type.asc(), Job.task_key.asc()))
+        jobs = jobs_result.scalars().all()
+        measurements_result = await session.execute(select(Measurement).order_by(Measurement.id.asc()))
+        measurements = measurements_result.scalars().all()
+
+    assert complete_file.status == "queued"
+    assert complete_file.source_name is None
+    assert complete_file.ocr_text_raw is None
+    assert complete_file.tags == []
+
+    assert stuck_file.status == "processing"
+    assert stuck_file.processing_error == "timed out"
+    assert stuck_file.source_name == "legacy-lab"
+    assert stuck_file.ocr_text_raw == "partial text"
+    assert [tag.tag for tag in stuck_file.tags] == ["source:legacy-lab"]
+
+    assert error_file.status == "error"
+    assert error_file.processing_error == "bad OCR"
+    assert error_file.source_name == "broken-lab"
+
+    assert [measurement.lab_file_id for measurement in measurements] == [stuck_file.id]
+    assert {(job.file_id, job.task_type) for job in jobs} == {
+        (selected_id, pipeline.TASK_ENSURE_FILE),
+        (stuck_file.id, pipeline.TASK_EXTRACT_MEASUREMENTS),
+        (None, pipeline.TASK_CANONIZE_MARKER),
+    }
+
+
+@pytest.mark.asyncio
+async def test_queue_unprocessed_files_requeues_all_non_complete_files(session_factory):
+    upload_dir = Path(settings.UPLOAD_DIR)
+    uploaded_path = upload_dir / "uploaded.png"
+    retry_path = upload_dir / "retry.png"
+    error_path = upload_dir / "error.png"
+    complete_path = upload_dir / "complete.png"
+    uploaded_path.write_bytes(b"uploaded-image")
+    retry_path.write_bytes(b"retry-image")
+    error_path.write_bytes(b"error-image")
+    complete_path.write_bytes(b"complete-image")
+
+    async with session_factory() as session:
+        uploaded_file = LabFile(
+            filename="uploaded.png",
+            filepath=str(uploaded_path),
+            mime_type="image/png",
+            page_count=1,
+        )
+        retry_file = LabFile(
+            filename="retry.png",
+            filepath=str(retry_path),
+            mime_type="image/png",
+            page_count=1,
+            status="processing",
+        )
+        error_file = LabFile(
+            filename="error.png",
+            filepath=str(error_path),
+            mime_type="image/png",
+            page_count=1,
+            status="error",
+        )
+        complete_file = LabFile(
+            filename="complete.png",
+            filepath=str(complete_path),
+            mime_type="image/png",
+            page_count=1,
+            status="complete",
+            text_assembled_at=utc_now(),
+            summary_generated_at=utc_now(),
+            source_resolved_at=utc_now(),
+            search_indexed_at=utc_now(),
+        )
+        session.add_all([uploaded_file, retry_file, error_file, complete_file])
+        await session.flush()
+        session.add(
+            Job(
+                file_id=retry_file.id,
+                task_type=pipeline.TASK_ENSURE_FILE,
+                task_key=f"file:{retry_file.id}",
+                status=job_service.JOB_STATUS_PENDING,
+                priority=10,
+            )
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        queued_file_ids = await pipeline.queue_unprocessed_files(session)
+
+    assert set(queued_file_ids) == {1, 2, 3}
+
+    async with session_factory() as session:
+        files_result = await session.execute(select(LabFile).order_by(LabFile.id.asc()))
+        files = files_result.scalars().all()
+        jobs_result = await session.execute(select(Job).order_by(Job.file_id.asc(), Job.task_type.asc()))
+        jobs = jobs_result.scalars().all()
+
+    assert [file.status for file in files] == ["queued", "queued", "queued", "complete"]
+    assert [(job.file_id, job.task_type) for job in jobs] == [
+        (1, pipeline.TASK_ENSURE_FILE),
+        (2, pipeline.TASK_ENSURE_FILE),
+        (3, pipeline.TASK_ENSURE_FILE),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancel_ocr_clears_jobs_and_resets_active_files(client, session_factory):
+    upload_dir = Path(settings.UPLOAD_DIR)
+    complete_path = upload_dir / "cancel-complete.png"
+    queued_path = upload_dir / "cancel-queued.png"
+    processing_path = upload_dir / "cancel-processing.png"
+    complete_path.write_bytes(b"complete-image")
+    queued_path.write_bytes(b"queued-image")
+    processing_path.write_bytes(b"processing-image")
+
+    async with session_factory() as session:
+        complete_file = LabFile(
+            filename="cancel-complete.png",
+            filepath=str(complete_path),
+            mime_type="image/png",
+            page_count=1,
+            status="complete",
+            ocr_raw="published",
+            text_assembled_at=utc_now(),
+            summary_generated_at=utc_now(),
+            source_resolved_at=utc_now(),
+            search_indexed_at=utc_now(),
+        )
+        queued_file = LabFile(
+            filename="cancel-queued.png",
+            filepath=str(queued_path),
+            mime_type="image/png",
+            page_count=1,
+            status="queued",
+            source_name="queued-lab",
+            ocr_text_raw="queued text",
+            ocr_summary_english="queued summary",
+            tags=[LabFileTag(tag="source:queued-lab")],
+        )
+        processing_file = LabFile(
+            filename="cancel-processing.png",
+            filepath=str(processing_path),
+            mime_type="image/png",
+            page_count=1,
+            status="processing",
+            processing_error="still running",
+            source_name="processing-lab",
+            ocr_text_raw="partial text",
+            tags=[LabFileTag(tag="source:processing-lab")],
+        )
+        session.add_all([complete_file, queued_file, processing_file])
+        await session.flush()
+
+        session.add(
+            Measurement(
+                lab_file_id=processing_file.id,
+                raw_marker_name="CRP",
+                normalized_marker_key="crp",
+            )
+        )
+        session.add_all(
+            [
+                Job(
+                    file_id=queued_file.id,
+                    task_type=pipeline.TASK_ENSURE_FILE,
+                    task_key=f"file:{queued_file.id}",
+                    status=job_service.JOB_STATUS_PENDING,
+                    priority=10,
+                ),
+                Job(
+                    file_id=processing_file.id,
+                    task_type=pipeline.TASK_EXTRACT_TEXT,
+                    task_key=f"file:{processing_file.id}:text:0:1:144",
+                    status=job_service.JOB_STATUS_LEASED,
+                    priority=20,
+                    lease_owner="runtime:test",
+                    lease_until=utc_now(),
+                ),
+                Job(
+                    file_id=None,
+                    task_type=pipeline.TASK_CANONIZE_MARKER,
+                    task_key="crp",
+                    status=job_service.JOB_STATUS_PENDING,
+                    priority=30,
+                ),
+            ]
+        )
+        await session.commit()
+
+    response = await client.post("/api/files/ocr/cancel")
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+    async with session_factory() as session:
+        files_result = await session.execute(
+            select(LabFile).options(selectinload(LabFile.tags)).order_by(LabFile.id.asc())
+        )
+        complete_file, queued_file, processing_file = files_result.scalars().all()
+        jobs_result = await session.execute(select(Job).order_by(Job.id.asc()))
+        jobs = jobs_result.scalars().all()
+        measurements_result = await session.execute(select(Measurement).order_by(Measurement.id.asc()))
+        measurements = measurements_result.scalars().all()
+
+    assert complete_file.status == "complete"
+    assert complete_file.ocr_raw == "published"
+
+    assert queued_file.status == "uploaded"
+    assert queued_file.processing_error is None
+    assert queued_file.source_name is None
+    assert queued_file.ocr_text_raw is None
+    assert queued_file.ocr_summary_english is None
+    assert queued_file.tags == []
+
+    assert processing_file.status == "uploaded"
+    assert processing_file.processing_error is None
+    assert processing_file.source_name is None
+    assert processing_file.ocr_text_raw is None
+    assert processing_file.tags == []
+
+    assert measurements == []
+    assert jobs == []
 
 
 @pytest.mark.asyncio
@@ -546,365 +1135,3 @@ async def test_rescaling_rules_are_type_specific(session_factory):
 
     assert rules[(glucose.id, "mg/dl", "mmol/l")].scale_factor == pytest.approx(0.0555)
     assert rules[(cholesterol.id, "mg/dl", "mmol/l")].scale_factor == pytest.approx(0.0259)
-
-
-@pytest.mark.asyncio
-async def test_preload_uploaded_files_seeds_missing_disk_files(session_factory):
-    """Files in the upload folder that are not in the DB should be added on startup."""
-    upload_dir = Path(settings.UPLOAD_DIR)
-
-    # Already-tracked file
-    existing_path = upload_dir / "already-tracked.png"
-    existing_path.write_bytes(b"tracked-image")
-    async with session_factory() as session:
-        session.add(
-            LabFile(
-                filename="already-tracked.png",
-                filepath=str(existing_path.resolve()),
-                mime_type="image/png",
-            )
-        )
-        await session.commit()
-
-    # Untracked files: one supported, one unsupported
-    (upload_dir / "new-scan.png").write_bytes(b"new-png")
-    (upload_dir / "notes.txt").write_text("ignore me")
-
-    async with session_factory() as session:
-        added = await pipeline.preload_uploaded_files(session)
-
-    assert added == 1
-
-    async with session_factory() as session:
-        result = await session.execute(select(LabFile).order_by(LabFile.filepath.asc()))
-        files = result.scalars().all()
-
-    paths = [Path(f.filepath).name for f in files]
-    assert "already-tracked.png" in paths
-    assert "new-scan.png" in paths
-    assert "notes.txt" not in paths
-
-    new_file = next(f for f in files if Path(f.filepath).name == "new-scan.png")
-    assert new_file.mime_type == "image/png"
-    assert new_file.status == "uploaded"
-
-
-@pytest.mark.asyncio
-async def test_queue_files_resets_old_jobs_and_incomplete_files(session_factory):
-    upload_dir = Path(settings.UPLOAD_DIR)
-    ready_path = upload_dir / "ready.png"
-    stuck_path = upload_dir / "stuck.png"
-    error_path = upload_dir / "error.png"
-    ready_path.write_bytes(b"ready-image")
-    stuck_path.write_bytes(b"stuck-image")
-    error_path.write_bytes(b"error-image")
-
-    async with session_factory() as session:
-        ready_file = LabFile(
-            filename="ready.png",
-            filepath=str(ready_path),
-            mime_type="image/png",
-            page_count=1,
-            status=READY_FILE_STATUS,
-            measurement_status="done",
-            normalization_status="done",
-            text_status="done",
-            summary_status="done",
-            publish_status="done",
-            ocr_raw="published",
-            published_at=utc_now(),
-        )
-        stuck_file = LabFile(
-            filename="stuck.png",
-            filepath=str(stuck_path),
-            mime_type="image/png",
-            page_count=1,
-            status="processing",
-            measurement_status="running",
-            normalization_status="queued",
-            text_status="queued",
-            summary_status="queued",
-            publish_status="queued",
-            processing_error="timed out",
-            source_name="Legacy Lab",
-            ocr_text_raw="partial text",
-            tags=[LabFileTag(tag="source:legacy-lab")],
-        )
-        error_file = LabFile(
-            filename="error.png",
-            filepath=str(error_path),
-            mime_type="image/png",
-            page_count=1,
-            status="error",
-            measurement_status="error",
-            normalization_status="queued",
-            text_status="queued",
-            summary_status="queued",
-            publish_status="queued",
-            processing_error="bad OCR",
-            source_name="Broken Lab",
-        )
-        session.add_all([ready_file, stuck_file, error_file])
-        await session.flush()
-
-        session.add(
-            Measurement(
-                lab_file_id=stuck_file.id,
-                raw_marker_name="CRP",
-                normalized_marker_key="crp",
-            )
-        )
-        session.add_all(
-            [
-                Job(
-                    file_id=stuck_file.id,
-                    task_type=pipeline.TASK_EXTRACT_MEASUREMENT,
-                    task_key="file:stuck:measurement",
-                    status="pending",
-                    priority=10,
-                ),
-                Job(
-                    file_id=None,
-                    task_type=pipeline.TASK_NORMALIZE_MARKER,
-                    task_key="crp",
-                    status="pending",
-                    priority=20,
-                ),
-            ]
-        )
-        await session.commit()
-
-    async with session_factory() as session:
-        queued_file_ids = await pipeline.queue_files(session, [1])
-
-    assert queued_file_ids == [1]
-
-    async with session_factory() as session:
-        files_result = await session.execute(
-            select(LabFile).options(selectinload(LabFile.tags)).order_by(LabFile.id.asc())
-        )
-        ready_file, stuck_file, error_file = files_result.scalars().all()
-        jobs_result = await session.execute(select(Job).order_by(Job.task_type.asc(), Job.task_key.asc()))
-        jobs = jobs_result.scalars().all()
-        measurements_result = await session.execute(select(Measurement).order_by(Measurement.id.asc()))
-        measurements = measurements_result.scalars().all()
-
-    assert ready_file.status == "queued"
-    assert ready_file.measurement_status == "queued"
-    assert ready_file.text_status == "queued"
-
-    assert stuck_file.status == "uploaded"
-    assert stuck_file.measurement_status == "queued"
-    assert stuck_file.normalization_status == "queued"
-    assert stuck_file.text_status == "queued"
-    assert stuck_file.processing_error is None
-    assert stuck_file.source_name is None
-    assert stuck_file.ocr_text_raw is None
-    assert stuck_file.tags == []
-
-    assert error_file.status == "uploaded"
-    assert error_file.measurement_status == "queued"
-    assert error_file.processing_error is None
-    assert error_file.source_name is None
-
-    assert measurements == []
-    assert [job.task_type for job in jobs] == [
-        pipeline.TASK_EXTRACT_MEASUREMENT,
-        pipeline.TASK_EXTRACT_TEXT,
-    ]
-    assert all(job.file_id == ready_file.id for job in jobs)
-
-
-@pytest.mark.asyncio
-async def test_queue_unprocessed_files_requeues_reset_incomplete_rows(session_factory):
-    upload_dir = Path(settings.UPLOAD_DIR)
-    uploaded_path = upload_dir / "uploaded.png"
-    stuck_path = upload_dir / "retry.png"
-    uploaded_path.write_bytes(b"uploaded-image")
-    stuck_path.write_bytes(b"retry-image")
-
-    async with session_factory() as session:
-        uploaded_file = LabFile(
-            filename="uploaded.png",
-            filepath=str(uploaded_path),
-            mime_type="image/png",
-            page_count=1,
-        )
-        stuck_file = LabFile(
-            filename="retry.png",
-            filepath=str(stuck_path),
-            mime_type="image/png",
-            page_count=1,
-            status="processing",
-            measurement_status="running",
-            normalization_status="queued",
-            text_status="queued",
-            summary_status="queued",
-            publish_status="queued",
-        )
-        session.add_all([uploaded_file, stuck_file])
-        await session.flush()
-        session.add(
-            Job(
-                file_id=stuck_file.id,
-                task_type=pipeline.TASK_EXTRACT_MEASUREMENT,
-                task_key="file:retry:measurement",
-                status="pending",
-                priority=10,
-            )
-        )
-        await session.commit()
-
-    async with session_factory() as session:
-        queued_file_ids = await pipeline.queue_unprocessed_files(session)
-
-    assert set(queued_file_ids) == {1, 2}
-
-    async with session_factory() as session:
-        files_result = await session.execute(select(LabFile).order_by(LabFile.id.asc()))
-        files = files_result.scalars().all()
-        jobs_result = await session.execute(select(Job).order_by(Job.file_id.asc(), Job.task_type.asc()))
-        jobs = jobs_result.scalars().all()
-
-    assert all(file.status == "queued" for file in files)
-    assert [(job.file_id, job.task_type) for job in jobs] == [
-        (1, pipeline.TASK_EXTRACT_MEASUREMENT),
-        (1, pipeline.TASK_EXTRACT_TEXT),
-        (2, pipeline.TASK_EXTRACT_MEASUREMENT),
-        (2, pipeline.TASK_EXTRACT_TEXT),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_cancel_ocr_clears_jobs_and_resets_active_files(client, session_factory):
-    upload_dir = Path(settings.UPLOAD_DIR)
-    ready_path = upload_dir / "cancel-ready.png"
-    queued_path = upload_dir / "cancel-queued.png"
-    processing_path = upload_dir / "cancel-processing.png"
-    ready_path.write_bytes(b"ready-image")
-    queued_path.write_bytes(b"queued-image")
-    processing_path.write_bytes(b"processing-image")
-
-    async with session_factory() as session:
-        ready_file = LabFile(
-            filename="cancel-ready.png",
-            filepath=str(ready_path),
-            mime_type="image/png",
-            page_count=1,
-            status=READY_FILE_STATUS,
-            measurement_status="done",
-            normalization_status="done",
-            text_status="done",
-            summary_status="done",
-            publish_status="done",
-            ocr_raw="published",
-            published_at=utc_now(),
-        )
-        queued_file = LabFile(
-            filename="cancel-queued.png",
-            filepath=str(queued_path),
-            mime_type="image/png",
-            page_count=1,
-            status="queued",
-            measurement_status="queued",
-            normalization_status="queued",
-            text_status="queued",
-            summary_status="queued",
-            publish_status="queued",
-            source_name="Queued Lab",
-            ocr_text_raw="queued text",
-            ocr_summary_english="queued summary",
-            tags=[LabFileTag(tag="source:queued-lab")],
-        )
-        processing_file = LabFile(
-            filename="cancel-processing.png",
-            filepath=str(processing_path),
-            mime_type="image/png",
-            page_count=1,
-            status="processing",
-            measurement_status="running",
-            normalization_status="queued",
-            text_status="running",
-            summary_status="queued",
-            publish_status="queued",
-            processing_error="still running",
-            source_name="Processing Lab",
-            ocr_text_raw="partial text",
-            tags=[LabFileTag(tag="source:processing-lab")],
-        )
-        session.add_all([ready_file, queued_file, processing_file])
-        await session.flush()
-
-        session.add(
-            Measurement(
-                lab_file_id=processing_file.id,
-                raw_marker_name="CRP",
-                normalized_marker_key="crp",
-            )
-        )
-        session.add_all(
-            [
-                Job(
-                    file_id=queued_file.id,
-                    task_type=pipeline.TASK_EXTRACT_MEASUREMENT,
-                    task_key="file:cancel:queued:measurement",
-                    status="pending",
-                    priority=10,
-                ),
-                Job(
-                    file_id=processing_file.id,
-                    task_type=pipeline.TASK_EXTRACT_TEXT,
-                    task_key="file:cancel:processing:text",
-                    status=job_service.JOB_STATUS_LEASED,
-                    priority=20,
-                    lease_owner="runtime:test",
-                    lease_until=utc_now(),
-                ),
-                Job(
-                    file_id=None,
-                    task_type=pipeline.TASK_NORMALIZE_MARKER,
-                    task_key="crp",
-                    status="pending",
-                    priority=30,
-                ),
-            ]
-        )
-        await session.commit()
-
-    response = await client.post("/api/files/ocr/cancel")
-    assert response.status_code == 200
-    assert response.json() == {"ok": True}
-
-    async with session_factory() as session:
-        files_result = await session.execute(
-            select(LabFile).options(selectinload(LabFile.tags)).order_by(LabFile.id.asc())
-        )
-        ready_file, queued_file, processing_file = files_result.scalars().all()
-        jobs_result = await session.execute(select(Job).order_by(Job.id.asc()))
-        jobs = jobs_result.scalars().all()
-        measurements_result = await session.execute(select(Measurement).order_by(Measurement.id.asc()))
-        measurements = measurements_result.scalars().all()
-
-    assert ready_file.status == READY_FILE_STATUS
-    assert ready_file.publish_status == "done"
-
-    assert queued_file.status == "uploaded"
-    assert queued_file.measurement_status == "queued"
-    assert queued_file.text_status == "queued"
-    assert queued_file.processing_error is None
-    assert queued_file.source_name is None
-    assert queued_file.ocr_text_raw is None
-    assert queued_file.ocr_summary_english is None
-    assert queued_file.tags == []
-
-    assert processing_file.status == "uploaded"
-    assert processing_file.measurement_status == "queued"
-    assert processing_file.normalization_status == "queued"
-    assert processing_file.text_status == "queued"
-    assert processing_file.processing_error is None
-    assert processing_file.source_name is None
-    assert processing_file.ocr_text_raw is None
-    assert processing_file.tags == []
-
-    assert measurements == []
-    assert jobs == []

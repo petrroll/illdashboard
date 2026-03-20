@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import and_, case, delete, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,18 +40,19 @@ async def enqueue_job(
     payload: dict | None = None,
     file_id: int | None = None,
     priority: int = 100,
-    replace_existing: bool = False,
 ) -> None:
     now = utc_now()
+    payload_blob = json_dumps(payload)
     stmt = sqlite_insert(Job).values(
         file_id=file_id,
         task_type=task_type,
         task_key=task_key,
         status=JOB_STATUS_PENDING,
         priority=priority,
-        payload_json=json_dumps(payload),
+        payload_json=payload_blob,
         resolved_json=None,
         error_text=None,
+        rerun_requested=False,
         attempt_count=0,
         available_at=now,
         lease_owner=None,
@@ -59,25 +60,23 @@ async def enqueue_job(
         created_at=now,
         updated_at=now,
     )
-    if replace_existing:
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[Job.task_type, Job.task_key],
-            set_={
-                "file_id": file_id,
-                "status": JOB_STATUS_PENDING,
-                "priority": priority,
-                "payload_json": json_dumps(payload),
-                "resolved_json": None,
-                "error_text": None,
-                "attempt_count": 0,
-                "available_at": now,
-                "lease_owner": None,
-                "lease_until": None,
-                "updated_at": now,
-            },
-        )
-    else:
-        stmt = stmt.on_conflict_do_nothing(index_elements=[Job.task_type, Job.task_key])
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[Job.task_type, Job.task_key],
+        set_={
+            "file_id": file_id,
+            "priority": priority,
+            "payload_json": payload_blob,
+            "resolved_json": case((Job.status == JOB_STATUS_LEASED, Job.resolved_json), else_=None),
+            "error_text": case((Job.status == JOB_STATUS_LEASED, Job.error_text), else_=None),
+            "rerun_requested": case((Job.status == JOB_STATUS_LEASED, True), else_=False),
+            "attempt_count": case((Job.status == JOB_STATUS_LEASED, Job.attempt_count), else_=0),
+            "available_at": case((Job.status == JOB_STATUS_LEASED, Job.available_at), else_=now),
+            "lease_owner": case((Job.status == JOB_STATUS_LEASED, Job.lease_owner), else_=None),
+            "lease_until": case((Job.status == JOB_STATUS_LEASED, Job.lease_until), else_=None),
+            "status": case((Job.status == JOB_STATUS_LEASED, Job.status), else_=JOB_STATUS_PENDING),
+            "updated_at": now,
+        },
+    )
     await session.execute(stmt)
 
 
@@ -132,18 +131,26 @@ async def claim_jobs(
 
 
 async def mark_job_resolved(session: AsyncSession, job: Job, payload: dict | None = None) -> None:
-    job.status = JOB_STATUS_RESOLVED
-    job.resolved_json = json_dumps(payload)
+    now = utc_now()
+    if job.rerun_requested:
+        job.status = JOB_STATUS_PENDING
+        job.resolved_json = None
+        job.available_at = now
+        job.rerun_requested = False
+    else:
+        job.status = JOB_STATUS_RESOLVED
+        job.resolved_json = json_dumps(payload)
     job.error_text = None
     job.lease_owner = None
     job.lease_until = None
-    job.updated_at = utc_now()
+    job.updated_at = now
     await session.flush()
 
 
 async def release_job(session: AsyncSession, job: Job, *, delay_seconds: int, error_text: str | None = None) -> None:
     job.status = JOB_STATUS_PENDING
     job.error_text = error_text
+    job.rerun_requested = False
     job.lease_owner = None
     job.lease_until = None
     job.available_at = utc_now() + timedelta(seconds=delay_seconds)
@@ -154,6 +161,7 @@ async def release_job(session: AsyncSession, job: Job, *, delay_seconds: int, er
 async def mark_job_failed(session: AsyncSession, job: Job, *, error_text: str) -> None:
     job.status = JOB_STATUS_FAILED
     job.error_text = error_text
+    job.rerun_requested = False
     job.lease_owner = None
     job.lease_until = None
     job.updated_at = utc_now()
@@ -163,10 +171,6 @@ async def mark_job_failed(session: AsyncSession, job: Job, *, error_text: str) -
 async def delete_job(session: AsyncSession, job: Job) -> None:
     await session.delete(job)
     await session.flush()
-
-
-async def delete_resolved_jobs_for_file(session: AsyncSession, file_id: int) -> None:
-    await session.execute(delete(Job).where(Job.file_id == file_id, Job.status == JOB_STATUS_RESOLVED))
 
 
 async def delete_jobs_for_file(session: AsyncSession, file_id: int) -> None:

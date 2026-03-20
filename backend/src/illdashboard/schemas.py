@@ -4,6 +4,20 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+class FileProgressOut(BaseModel):
+    measurement_pages_done: int
+    measurement_pages_total: int
+    text_pages_done: int
+    text_pages_total: int
+    ready_measurements: int
+    total_measurements: int
+    summary_ready: bool
+    source_ready: bool
+    search_ready: bool
+    measurement_error_count: int
+    is_complete: bool
+
+
 class LabFileOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -13,20 +27,20 @@ class LabFileOut(BaseModel):
     mime_type: str
     page_count: int
     status: str
-    measurement_status: str
-    normalization_status: str
-    text_status: str
-    summary_status: str
-    publish_status: str
     processing_error: str | None = None
     uploaded_at: datetime
-    published_at: datetime | None = None
     ocr_raw: str | None = None
     ocr_text_raw: str | None = None
     ocr_text_english: str | None = None
     ocr_summary_english: str | None = None
     lab_date: datetime | None = None
+    source_name: str | None = None
+    text_assembled_at: datetime | None = None
+    summary_generated_at: datetime | None = None
+    source_resolved_at: datetime | None = None
+    search_indexed_at: datetime | None = None
     tags: list[str] = Field(default_factory=list)
+    progress: FileProgressOut
 
     @model_validator(mode="before")
     @classmethod

@@ -8,7 +8,7 @@ from collections import defaultdict
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from illdashboard.models import READY_FILE_STATUS, LabFileTag, Measurement, MeasurementType
+from illdashboard.models import COMPLETE_FILE_STATUS, LabFileTag, Measurement, MeasurementType
 
 SEARCH_TABLE_NAME = "lab_file_search"
 
@@ -83,7 +83,7 @@ async def refresh_lab_search_document(file_id: int, db: AsyncSession) -> None:
     row = file_result.mappings().first()
     if row is None:
         return
-    if row["status"] != READY_FILE_STATUS:
+    if row["status"] != COMPLETE_FILE_STATUS:
         await remove_lab_search_document(file_id, db)
         return
 
@@ -95,12 +95,12 @@ async def refresh_lab_search_document(file_id: int, db: AsyncSession) -> None:
     measurement_result = await db.execute(
         select(
             MeasurementType.name,
-            Measurement.original_value,
+            Measurement.canonical_value,
             Measurement.qualitative_value,
-            Measurement.original_unit,
+            Measurement.canonical_unit,
         )
         .join(Measurement.measurement_type)
-        .where(Measurement.lab_file_id == file_id)
+        .where(Measurement.lab_file_id == file_id, Measurement.normalization_status == "resolved")
         .order_by(MeasurementType.name.asc(), Measurement.id.asc())
     )
     measurement_rows = measurement_result.all()
@@ -147,7 +147,7 @@ async def remove_lab_search_document(file_id: int, db: AsyncSession) -> None:
 async def rebuild_lab_search_index(db: AsyncSession) -> None:
     result = await db.execute(
         text("SELECT id FROM lab_files WHERE status = :status ORDER BY id ASC"),
-        {"status": READY_FILE_STATUS},
+        {"status": COMPLETE_FILE_STATUS},
     )
     file_ids = [row[0] for row in result.fetchall()]
     await db.execute(text(f"DELETE FROM {SEARCH_TABLE_NAME}"))
@@ -215,7 +215,7 @@ async def search_lab_files(raw_query: str, tags: list[str], db: AsyncSession, *,
     marker_result = await db.execute(
         select(Measurement.lab_file_id, MeasurementType.name)
         .join(Measurement.measurement_type)
-        .where(Measurement.lab_file_id.in_(file_ids))
+        .where(Measurement.lab_file_id.in_(file_ids), Measurement.normalization_status == "resolved")
         .order_by(Measurement.lab_file_id.asc(), MeasurementType.name.asc())
     )
     marker_names_by_file: dict[int, list[str]] = defaultdict(list)
