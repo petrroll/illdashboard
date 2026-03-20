@@ -464,6 +464,29 @@
 
     if (
       (match = message.match(
+        /^Copilot request finished request_name=(\S+) request_id=(\w+) model=(\S+) reasoning_effort=(\S+) attachments=(\d+) duration=([\d.]+)s response_chars=(\d+) usage_cost=([\d.]+) input_tokens=(\d+) output_tokens=(\d+) cache_read_tokens=(\d+)$/
+      ))
+    ) {
+      return {
+        ...header,
+        eventType: "requestFinished",
+        requestName: match[1],
+        requestId: match[2],
+        model: match[3],
+        reasoningEffort: match[4],
+        attachments: Number(match[5]),
+        durationMs: secondsToMs(match[6]),
+        responseChars: Number(match[7]),
+        usageCost: Number(match[8]),
+        inputTokens: Number(match[9]),
+        outputTokens: Number(match[10]),
+        cacheReadTokens: Number(match[11]),
+      };
+    }
+
+    // Legacy format without token fields
+    if (
+      (match = message.match(
         /^Copilot request finished request_name=(\S+) request_id=(\w+) model=(\S+) reasoning_effort=(\S+) attachments=(\d+) duration=([\d.]+)s response_chars=(\d+) usage_cost=([\d.]+)$/
       ))
     ) {
@@ -1276,6 +1299,9 @@
     span.detail.attachments = event.attachments;
     span.detail.responseChars = event.responseChars;
     span.detail.usageCost = event.usageCost;
+    span.detail.inputTokens = event.inputTokens ?? null;
+    span.detail.outputTokens = event.outputTokens ?? null;
+    span.detail.cacheReadTokens = event.cacheReadTokens ?? null;
     span.subtitle = buildRequestSubtitle(span);
 
     finalizeSpan(ctx, span, resolveEndMs(span.startMs, event.timestampMs, event.durationMs), "success", event, {
@@ -1405,9 +1431,23 @@
       resolved: event.resolved,
       durationReportedMs: event.durationMs,
     });
+
+    // When a single batch covers the entire normalization, the batch row is
+    // redundant — fold it into the parent and enrich the parent subtitle.
+    if (span.childSpanIds.length === 1) {
+      const child = ctx.spans.find((s) => s.id === span.childSpanIds[0]);
+      if (child) {
+        child.folded = true;
+        if (typeof child.detail.existingCanonical === "number") {
+          span.subtitle += ` · existing=${child.detail.existingCanonical}`;
+          span.searchText = buildSearchText(span);
+        }
+      }
+    }
   }
 
   function openNormalizeMarkerBatchSpan(event, ctx) {
+    const parentSpan = ctx.openNormalizeMarkers[ctx.openNormalizeMarkers.length - 1] || null;
     const span = createSpan({
       type: "normalization",
       subtype: "normalize_marker_batch",
@@ -1421,6 +1461,13 @@
         existingCanonical: event.existingCanonical,
       },
     });
+
+    // Link batch to its parent normalization span so single-batch runs
+    // can be folded into the parent and multi-batch runs render indented.
+    if (parentSpan) {
+      span.parentSpanId = parentSpan.id;
+      parentSpan.childSpanIds.push(span.id);
+    }
 
     appendSource(span, event);
     ctx.openNormalizeMarkerBatches.push(span);
@@ -1573,6 +1620,11 @@
       sourceRefs: [],
       heartbeats: [],
       searchText: "",
+      // Parent-child linkage for hierarchical spans (e.g. marker
+      // normalization parent with per-batch children).
+      parentSpanId: null,
+      childSpanIds: [],
+      folded: false,
     };
   }
 
@@ -1633,12 +1685,17 @@
     return pieces.join(" ").toLowerCase();
   }
 
+  // Requests don't log their page range, so we infer context from the
+  // batch that spawned them.  Multiple batches of the same kind can be open
+  // concurrently (page-batch fanout), so we consume them in FIFO order
+  // rather than picking the "newest" — each request claims the next
+  // unclaimed batch of the matching kind.
   function findRequestContext(requestName, ctx) {
     switch (requestName) {
       case "document_text_extraction":
-        return newestMatchingSpanFromMap(ctx.openBatches, (span) => span.detail.batchKind === "Document text");
+        return claimOldestMatchingSpanFromMap(ctx.openBatches, (span) => span.detail.batchKind === "Document text");
       case "structured_medical_extraction":
-        return newestMatchingSpanFromMap(ctx.openBatches, (span) => span.detail.batchKind === "Structured medical");
+        return claimOldestMatchingSpanFromMap(ctx.openBatches, (span) => span.detail.batchKind === "Structured medical");
       case "medical_summary":
         return newestMatchingSpan(ctx.openSummaries);
       case "normalize_source_name":
@@ -1648,6 +1705,23 @@
       default:
         return null;
     }
+  }
+
+  function claimOldestMatchingSpanFromMap(map, predicate) {
+    let best = null;
+    map.forEach((queue) => {
+      for (const span of queue) {
+        if (!predicate(span)) continue;
+        if (span._requestClaimed) continue;
+        if (!best || span.startMs < best.startMs) {
+          best = span;
+        }
+      }
+    });
+    if (best) {
+      best._requestClaimed = true;
+    }
+    return best;
   }
 
   function newestMatchingSpanFromMap(map, predicate) {
@@ -1706,6 +1780,10 @@
     let openCount = 0;
     let largestBatchPages = 0;
     let longestSpan = null;
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let totalCacheReadTokens = 0;
+    let requestsWithTokens = 0;
 
     spans.forEach((span) => {
       typeCounts[span.type] = (typeCounts[span.type] || 0) + 1;
@@ -1718,6 +1796,12 @@
       }
       if (span.type === "request") {
         requestCount += 1;
+        if (typeof span.detail.inputTokens === "number" && span.detail.inputTokens > 0) {
+          requestsWithTokens += 1;
+          totalInputTokens += span.detail.inputTokens;
+          totalOutputTokens += (span.detail.outputTokens || 0);
+          totalCacheReadTokens += (span.detail.cacheReadTokens || 0);
+        }
       }
       if (span.status === "error" || span.type === "error") {
         errorCount += 1;
@@ -1750,6 +1834,11 @@
       longestSpan,
       peakActiveRequests: ctx.maxActiveRequests,
       peakQueuedRequests: ctx.maxQueuedRequests,
+      totalInputTokens,
+      totalOutputTokens,
+      totalCacheReadTokens,
+      avgInputTokens: requestsWithTokens ? Math.round(totalInputTokens / requestsWithTokens) : 0,
+      avgOutputTokens: requestsWithTokens ? Math.round(totalOutputTokens / requestsWithTokens) : 0,
       batchStats,
       laneStats,
       fileStats,
@@ -1800,6 +1889,9 @@
             count: 0,
             totalDurationMs: 0,
             maxDurationMs: 0,
+            totalInputTokens: 0,
+            totalOutputTokens: 0,
+            totalCacheReadTokens: 0,
             files: new Set(),
           });
         }
@@ -1807,6 +1899,9 @@
         bucket.count += 1;
         bucket.totalDurationMs += span.durationMs;
         bucket.maxDurationMs = Math.max(bucket.maxDurationMs, span.durationMs);
+        if (typeof span.detail.inputTokens === "number") bucket.totalInputTokens += span.detail.inputTokens;
+        if (typeof span.detail.outputTokens === "number") bucket.totalOutputTokens += span.detail.outputTokens;
+        if (typeof span.detail.cacheReadTokens === "number") bucket.totalCacheReadTokens += span.detail.cacheReadTokens;
         span.files.forEach((file) => bucket.files.add(file));
       });
 
@@ -1817,6 +1912,9 @@
         avgDurationMs: bucket.count ? bucket.totalDurationMs / bucket.count : 0,
         maxDurationMs: bucket.maxDurationMs,
         filesCount: bucket.files.size,
+        avgInputTokens: bucket.count ? Math.round(bucket.totalInputTokens / bucket.count) : 0,
+        avgOutputTokens: bucket.count ? Math.round(bucket.totalOutputTokens / bucket.count) : 0,
+        totalCacheReadTokens: bucket.totalCacheReadTokens,
       }))
       .sort((left, right) => right.count - left.count || right.maxDurationMs - left.maxDurationMs);
   }
@@ -1961,6 +2059,16 @@
     if (typeof span.detail.attachments === "number") {
       parts.push(`${span.detail.attachments} ${span.detail.attachments === 1 ? "attachment" : "attachments"}`);
     }
+    if (typeof span.detail.inputTokens === "number" && span.detail.inputTokens > 0) {
+      const tokenParts = [`${formatNumber(span.detail.inputTokens)} in`];
+      if (typeof span.detail.outputTokens === "number" && span.detail.outputTokens > 0) {
+        tokenParts.push(`${formatNumber(span.detail.outputTokens)} out`);
+      }
+      if (typeof span.detail.cacheReadTokens === "number" && span.detail.cacheReadTokens > 0) {
+        tokenParts.push(`${formatNumber(span.detail.cacheReadTokens)} cached`);
+      }
+      parts.push(tokenParts.join(", "));
+    }
     return parts.join(" · ");
   }
 
@@ -2017,6 +2125,9 @@
 
     const query = state.filters.query.trim().toLowerCase();
     return state.parsed.spans.filter((span) => {
+      if (span.folded) {
+        return false;
+      }
       if (!state.filters.selectedTypes.has(span.type)) {
         return false;
       }
@@ -2144,7 +2255,9 @@
       {
         label: "Requests",
         value: formatNumber(summary.requestCount),
-        subvalue: `peak active ${summary.peakActiveRequests} · queued ${summary.peakQueuedRequests}`,
+        subvalue: summary.avgInputTokens
+          ? `avg ${formatNumber(summary.avgInputTokens)} in · ${formatNumber(summary.avgOutputTokens)} out · peak active ${summary.peakActiveRequests}`
+          : `peak active ${summary.peakActiveRequests} · queued ${summary.peakQueuedRequests}`,
       },
       {
         label: "Errors / open",
@@ -2348,8 +2461,9 @@
   }
 
   function buildSpanRow(span, domainStartMs, domainEndMs, timelineWidth) {
+    const isAbandoned = span.status === "open";
     const row = document.createElement("div");
-    row.className = `timeline-row${state.selectedSpanId === span.id ? " is-selected" : ""}`;
+    row.className = `timeline-row${state.selectedSpanId === span.id ? " is-selected" : ""}${isAbandoned ? " is-abandoned" : ""}`;
     row.tabIndex = 0;
     row.addEventListener("click", () => {
       state.selectedSpanId = span.id;
@@ -2366,26 +2480,34 @@
     const labelCell = document.createElement("div");
     labelCell.className = "timeline-label";
 
-    const badgeRow = document.createElement("div");
-    badgeRow.className = "timeline-label__meta";
-    badgeRow.appendChild(createBadge("badge badge--type", typeLabel(span.type)));
-    badgeRow.appendChild(createBadge(`badge badge--status-${span.status}`, STATUS_LABELS[span.status] || span.status));
+    // Compact layout: status badge + title on one line, type conveyed by
+    // the colored left border on the row.  Saves a full line per row.
+    const headerRow = document.createElement("div");
+    headerRow.className = "timeline-label__header";
+    headerRow.appendChild(createBadge(`badge badge--status-${span.status}`, isAbandoned ? "Abandoned" : (STATUS_LABELS[span.status] || span.status)));
     if (typeof span.pageCount === "number") {
-      badgeRow.appendChild(createBadge("badge badge--pages", `${span.pageCount}p`));
+      headerRow.appendChild(createBadge("badge badge--pages", `${span.pageCount}p`));
     }
     if (span.files.length > 1) {
-      badgeRow.appendChild(createBadge("badge badge--shared", `${span.files.length} files`));
+      headerRow.appendChild(createBadge("badge badge--shared", `${span.files.length} files`));
+    }
+    if (span.childSpanIds.length > 1) {
+      headerRow.appendChild(createBadge("badge badge--children", `${span.childSpanIds.length} sub-steps`));
     }
 
-    const titleNode = document.createElement("p");
+    const titleNode = document.createElement("span");
     titleNode.className = "timeline-label__title";
     titleNode.textContent = span.title;
+    headerRow.appendChild(titleNode);
 
     const subtitleNode = document.createElement("p");
     subtitleNode.className = "timeline-label__subtitle";
-    subtitleNode.textContent = span.subtitle || "No additional metadata";
+    const subtitleText = span.subtitle || "No additional metadata";
+    subtitleNode.textContent = isAbandoned && span.detail.closedBecause
+      ? `${subtitleText} · ${span.detail.closedBecause}`
+      : subtitleText;
 
-    labelCell.append(badgeRow, titleNode, subtitleNode);
+    labelCell.append(headerRow, subtitleNode);
 
     const timelineCell = document.createElement("div");
     timelineCell.className = "timeline-cell";
@@ -2439,6 +2561,12 @@
     });
 
     timelineCell.appendChild(track);
+    // Colored left border encodes span type; indent children under parent.
+    row.dataset.spanType = span.type;
+    if (span.parentSpanId && !span.folded) {
+      row.classList.add("is-child");
+    }
+
     row.append(labelCell, timelineCell);
     return row;
   }
@@ -2451,7 +2579,7 @@
   }
 
   function buildTooltip(span) {
-    return [span.title, span.subtitle, `Duration: ${formatDuration(span.durationMs)}`].filter(Boolean).join("\n");
+    return [typeLabel(span.type), span.title, span.subtitle, `Duration: ${formatDuration(span.durationMs)}`].filter(Boolean).join("\n");
   }
 
   function createBadge(className, text) {
@@ -2499,6 +2627,8 @@
         { header: "Requests", value: (row) => formatNumber(row.count) },
         { header: "Avg duration", value: (row) => formatDuration(row.avgDurationMs) },
         { header: "Longest", value: (row) => formatDuration(row.maxDurationMs) },
+        { header: "Avg in tok", value: (row) => row.avgInputTokens ? formatNumber(row.avgInputTokens) : "—" },
+        { header: "Avg out tok", value: (row) => row.avgOutputTokens ? formatNumber(row.avgOutputTokens) : "—" },
         { header: "Files", value: (row) => formatNumber(row.filesCount) },
       ],
       state.parsed.summary.laneStats,

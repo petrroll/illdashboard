@@ -269,6 +269,9 @@ async def _ask(
     for attempt in range(1, COPILOT_TRANSIENT_RETRY_ATTEMPTS + 1):
         content = ""
         observed_usage_cost = 0.0
+        observed_input_tokens = 0
+        observed_output_tokens = 0
+        observed_cache_read_tokens = 0
         request_error: Exception | None = None
         queued_registered = False
 
@@ -321,11 +324,22 @@ async def _ask(
 
                     def handle_session_event(event) -> None:
                         nonlocal observed_usage_cost
+                        nonlocal observed_input_tokens, observed_output_tokens
+                        nonlocal observed_cache_read_tokens
 
                         if event.type == SessionEventType.ASSISTANT_USAGE:
                             cost = getattr(event.data, "cost", None)
                             if isinstance(cost, int | float) and cost > 0:
                                 observed_usage_cost += float(cost)
+                            in_tok = getattr(event.data, "input_tokens", None)
+                            if isinstance(in_tok, int | float) and in_tok > 0:
+                                observed_input_tokens += int(in_tok)
+                            out_tok = getattr(event.data, "output_tokens", None)
+                            if isinstance(out_tok, int | float) and out_tok > 0:
+                                observed_output_tokens += int(out_tok)
+                            cache_tok = getattr(event.data, "cache_read_tokens", None)
+                            if isinstance(cache_tok, int | float) and cache_tok > 0:
+                                observed_cache_read_tokens += int(cache_tok)
                             return
 
                         if event.type == SessionEventType.SESSION_WARNING:
@@ -425,7 +439,8 @@ async def _ask(
             add_premium_requests(observed_usage_cost_total)
             logger.info(
                 "Copilot request finished request_name=%s request_id=%s model=%s reasoning_effort=%s "
-                "attachments=%s duration=%.2fs response_chars=%s usage_cost=%.4f",
+                "attachments=%s duration=%.2fs response_chars=%s usage_cost=%.4f "
+                "input_tokens=%s output_tokens=%s cache_read_tokens=%s",
                 request_name,
                 request_id,
                 request_settings.model,
@@ -434,6 +449,9 @@ async def _ask(
                 duration,
                 len(content),
                 observed_usage_cost_total,
+                observed_input_tokens,
+                observed_output_tokens,
+                observed_cache_read_tokens,
             )
             return content
 
