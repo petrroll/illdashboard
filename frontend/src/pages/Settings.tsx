@@ -81,8 +81,8 @@ async function performSettingsAction(action: SettingsAction) {
     case "drop-db": {
       await resetDatabase();
       return {
-        message: "Database has been reset. All data removed.",
-        shouldReload: false,
+        message: "Database has been reset. Files still in the upload folder were reloaded as uploaded items.",
+        shouldReload: true,
       };
     }
   }
@@ -130,12 +130,7 @@ export default function Settings() {
       const result = await performSettingsAction(action);
       setActionResult(result.message);
 
-      if (action === "drop-db") {
-        setFiles([]);
-        setMarkers([]);
-        setRecentMeasurements([]);
-        setRescalingRules([]);
-      } else if (result.shouldReload) {
+      if (result.shouldReload) {
         await loadSettingsData();
       }
     } catch {

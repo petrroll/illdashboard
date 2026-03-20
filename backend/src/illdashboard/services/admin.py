@@ -8,6 +8,7 @@ from sqlalchemy.orm import selectinload
 
 from illdashboard.database import engine
 from illdashboard.models import Base, BiomarkerInsight, RescalingRule
+from illdashboard.services import pipeline as pipeline_service
 from illdashboard.services.markers import ensure_marker_groups
 from illdashboard.services.search import ensure_search_schema
 from illdashboard.sparkline import SPARKLINE_CACHE_DIR
@@ -33,14 +34,20 @@ def purge_sparkline_cache() -> int:
 
 
 async def reset_database() -> int:
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(Base.metadata.create_all)
-    async with AsyncSession(engine, expire_on_commit=False) as session:
-        await ensure_marker_groups(session)
-        await ensure_search_schema(session)
-        await session.commit()
-    return purge_sparkline_cache()
+    async def perform_reset() -> int:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+            await conn.run_sync(Base.metadata.create_all)
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            await ensure_marker_groups(session)
+            await ensure_search_schema(session)
+            await session.commit()
+            await pipeline_service.preload_uploaded_files(session)
+        return purge_sparkline_cache()
+
+    # Dropping the whole schema invalidates worker sessions, so the reset shares
+    # the same stop/restart boundary as the explicit clean-runtime flows.
+    return await pipeline_service.run_with_pipeline_runtime_stopped(perform_reset)
 
 
 async def list_rescaling_rules(db: AsyncSession) -> list[RescalingRule]:

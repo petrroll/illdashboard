@@ -542,23 +542,31 @@ async def cancel_processing_from_clean_runtime(session: AsyncSession) -> None:
     await _run_with_clean_runtime(session, cancel_processing)
 
 
-async def _run_with_clean_runtime(
-    session: AsyncSession,
-    operation: Callable[[AsyncSession], Awaitable[_T]],
-) -> _T:
+async def run_with_pipeline_runtime_stopped(operation: Callable[[], Awaitable[_T]]) -> _T:
     async with _runtime_reset_lock:
         session_factory = _runtime.session_factory if _runtime is not None else None
         runtime_was_running = session_factory is not None
         if runtime_was_running:
             await stop_pipeline_runtime(abort_copilot_requests=True)
         try:
+            return await operation()
+        finally:
+            if runtime_was_running and session_factory is not None:
+                await _restart_pipeline_runtime(session_factory)
+
+
+async def _run_with_clean_runtime(
+    session: AsyncSession,
+    operation: Callable[[AsyncSession], Awaitable[_T]],
+) -> _T:
+    async def run_operation() -> _T:
+        try:
             return await operation(session)
         except Exception:
             await session.rollback()
             raise
-        finally:
-            if runtime_was_running and session_factory is not None:
-                await _restart_pipeline_runtime(session_factory)
+
+    return await run_with_pipeline_runtime_stopped(run_operation)
 
 
 async def _restart_pipeline_runtime(session_factory: async_sessionmaker[AsyncSession]) -> None:

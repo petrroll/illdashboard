@@ -20,6 +20,7 @@ from illdashboard.models import (
     TextBatch,
     utc_now,
 )
+from illdashboard.services import admin as admin_service
 from illdashboard.services import jobs as job_service
 from illdashboard.services import pipeline, rescaling
 from illdashboard.services import search as search_service
@@ -786,6 +787,46 @@ async def test_preload_uploaded_files_seeds_missing_disk_files(session_factory):
     new_file = next(file for file in files if Path(file.filepath).name == "new-scan.png")
     assert new_file.mime_type == "image/png"
     assert new_file.status == "uploaded"
+
+
+@pytest.mark.asyncio
+async def test_reset_database_reloads_upload_dir_as_uploaded_files(client, session_factory):
+    upload_dir = Path(settings.UPLOAD_DIR)
+    staged_path = upload_dir / "reset-preloaded.png"
+    staged_path.write_bytes(b"reset-image")
+
+    await pipeline.stop_pipeline_runtime()
+    async with session_factory() as session:
+        session.add(
+            LabFile(
+                filename="stale-db-only.png",
+                filepath=str((upload_dir / "stale-db-only.png").resolve()),
+                mime_type="image/png",
+                page_count=1,
+                status="complete",
+            )
+        )
+        await session.commit()
+
+    with (
+        patch.object(admin_service, "engine", session_factory.kw["bind"]),
+        patch.object(admin_service, "purge_sparkline_cache", return_value=0),
+    ):
+        response = await client.delete("/api/admin/database")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "database_reset", "deleted_sparklines": 0}
+
+    files_response = await client.get("/api/files")
+    assert files_response.status_code == 200
+    files = files_response.json()
+    assert [(file["filename"], file["status"]) for file in files] == [("reset-preloaded.png", "uploaded")]
+
+    async with session_factory() as session:
+        jobs_result = await session.execute(select(Job).order_by(Job.id.asc()))
+        jobs = jobs_result.scalars().all()
+
+    assert jobs == []
 
 
 @pytest.mark.asyncio
