@@ -44,7 +44,7 @@ from illdashboard.models import (
     utc_now,
 )
 from illdashboard.services import jobs as job_service
-from illdashboard.services import qualitative_values, rescaling
+from illdashboard.services import qualitative_values, rescaling, upload_metadata
 from illdashboard.services import search as search_service
 from illdashboard.services.markers import (
     SOURCE_TAG_PREFIX,
@@ -159,6 +159,8 @@ async def preload_uploaded_files(session: AsyncSession) -> int:
 
     added = 0
     for file_path in sorted(path for path in upload_dir.iterdir() if path.is_file()):
+        if upload_metadata.is_original_name_sidecar(file_path):
+            continue
         if file_path.resolve() in known_paths:
             continue
 
@@ -179,7 +181,7 @@ async def preload_uploaded_files(session: AsyncSession) -> int:
 
         session.add(
             LabFile(
-                filename=file_path.name,
+                filename=upload_metadata.read_original_name_sidecar(file_path) or file_path.name,
                 filepath=str(file_path.resolve()),
                 mime_type=mime_type,
                 page_count=page_count,

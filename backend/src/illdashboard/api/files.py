@@ -19,7 +19,7 @@ from illdashboard.config import settings
 from illdashboard.database import get_db
 from illdashboard.models import LabFile, LabFileTag
 from illdashboard.schemas import BatchOcrRequest, FileProgressOut, LabFileOut, QueueFilesResponse
-from illdashboard.services import pipeline
+from illdashboard.services import pipeline, upload_metadata
 from illdashboard.services import search as search_service
 
 router = APIRouter(prefix="")
@@ -117,6 +117,12 @@ async def upload_file(
     destination = (upload_dir / safe_name).resolve()
     content = await file.read()
     destination.write_bytes(content)
+    try:
+        upload_metadata.write_original_name_sidecar(destination, file.filename)
+    except (OSError, UnicodeError):
+        upload_metadata.delete_original_name_sidecar(destination)
+        destination.unlink(missing_ok=True)
+        raise
 
     mime_type = file.content_type or "application/octet-stream"
     lab = LabFile(
@@ -157,6 +163,7 @@ async def delete_file(file_id: int, db: AsyncSession = Depends(get_db)):
     file_path = Path(lab.filepath)
     if file_path.exists():
         os.remove(file_path)
+    upload_metadata.delete_original_name_sidecar(file_path)
     await search_service.remove_lab_search_document(lab.id, db)
     await db.delete(lab)
     await db.commit()

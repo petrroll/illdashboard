@@ -24,6 +24,7 @@ from illdashboard.services import admin as admin_service
 from illdashboard.services import jobs as job_service
 from illdashboard.services import pipeline, rescaling
 from illdashboard.services import search as search_service
+from illdashboard.services.upload_metadata import original_name_sidecar_path
 
 
 async def _wait_for_file_complete(session_factory, file_id: int, *, timeout_seconds: float = 10.0) -> LabFile:
@@ -75,9 +76,40 @@ async def test_upload_and_queue_processing_creates_ensure_file_job(client, sessi
 
     assert refreshed_file is not None
     assert refreshed_file.status == "queued"
+    stored_path = Path(refreshed_file.filepath)
+    assert stored_path.name != "report.png"
+    assert original_name_sidecar_path(stored_path).read_text(encoding="utf-8") == "report.png"
     assert [(job.task_type, job.task_key) for job in jobs] == [
         (pipeline.TASK_ENSURE_FILE, f"file:{uploaded_file['id']}"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_delete_file_removes_original_name_sidecar(client, session_factory):
+    upload_response = await client.post(
+        "/api/files/upload",
+        files={"file": ("delete-me.png", b"fake-image", "image/png")},
+    )
+    assert upload_response.status_code == 200
+    uploaded_file = upload_response.json()
+
+    async with session_factory() as session:
+        stored_file = await session.get(LabFile, uploaded_file["id"])
+
+    assert stored_file is not None
+    stored_path = Path(stored_file.filepath)
+    sidecar_path = original_name_sidecar_path(stored_path)
+    assert stored_path.exists()
+    assert sidecar_path.exists()
+
+    delete_response = await client.delete(f"/api/files/{uploaded_file['id']}")
+    assert delete_response.status_code == 200
+    assert delete_response.json() == {"ok": True}
+    assert not stored_path.exists()
+    assert not sidecar_path.exists()
+
+    async with session_factory() as session:
+        assert await session.get(LabFile, uploaded_file["id"]) is None
 
 
 @pytest.mark.asyncio
@@ -767,13 +799,17 @@ async def test_preload_uploaded_files_seeds_missing_disk_files(session_factory):
         )
         await session.commit()
 
-    (upload_dir / "new-scan.png").write_bytes(b"new-png")
+    hashed_path = upload_dir / "2f4ce2f590f64dfabf99c3955b417d55.png"
+    hashed_path.write_bytes(b"new-png")
+    original_name_sidecar_path(hashed_path).write_text("new-scan.png", encoding="utf-8")
+    fallback_path = upload_dir / "missing-sidecar.png"
+    fallback_path.write_bytes(b"fallback-png")
     (upload_dir / "notes.txt").write_text("ignore me")
 
     async with session_factory() as session:
         added = await pipeline.preload_uploaded_files(session)
 
-    assert added == 1
+    assert added == 2
 
     async with session_factory() as session:
         result = await session.execute(select(LabFile).order_by(LabFile.filepath.asc()))
@@ -781,19 +817,26 @@ async def test_preload_uploaded_files_seeds_missing_disk_files(session_factory):
 
     paths = [Path(file.filepath).name for file in files]
     assert "already-tracked.png" in paths
-    assert "new-scan.png" in paths
+    assert hashed_path.name in paths
+    assert fallback_path.name in paths
+    assert original_name_sidecar_path(hashed_path).name not in paths
     assert "notes.txt" not in paths
 
-    new_file = next(file for file in files if Path(file.filepath).name == "new-scan.png")
+    new_file = next(file for file in files if Path(file.filepath).name == hashed_path.name)
     assert new_file.mime_type == "image/png"
+    assert new_file.filename == "new-scan.png"
     assert new_file.status == "uploaded"
+    fallback_file = next(file for file in files if Path(file.filepath).name == fallback_path.name)
+    assert fallback_file.filename == fallback_path.name
+    assert fallback_file.status == "uploaded"
 
 
 @pytest.mark.asyncio
 async def test_reset_database_reloads_upload_dir_as_uploaded_files(client, session_factory):
     upload_dir = Path(settings.UPLOAD_DIR)
-    staged_path = upload_dir / "reset-preloaded.png"
+    staged_path = upload_dir / "23b11191f78b49e5b98e2f7cf816f706.png"
     staged_path.write_bytes(b"reset-image")
+    original_name_sidecar_path(staged_path).write_text("reset-preloaded.png", encoding="utf-8")
 
     await pipeline.stop_pipeline_runtime()
     async with session_factory() as session:
