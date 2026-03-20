@@ -962,6 +962,36 @@ def _log_task_span_finish(job: Job, files: list[LabFile], started_at: float, *, 
     )
 
 
+# Batch canonize handlers operate on measurement types, not files, so they
+# use a lightweight span variant that logs the batch size instead of file lists.
+def _log_batch_span_start(task_type: str, jobs: list[Job]) -> float:
+    started_at = time.perf_counter()
+    logger.info(
+        "Task span start task_type=%s job_id=%s task_key=%s file_ids=%s filenames=%s",
+        task_type,
+        jobs[0].id,
+        jobs[0].task_key,
+        json.dumps([]),
+        json.dumps([f"batch({len(jobs)})"], ensure_ascii=False),
+    )
+    return started_at
+
+
+def _log_batch_span_finish(
+    task_type: str, jobs: list[Job], started_at: float, *, outcome: str = "success"
+) -> None:
+    logger.info(
+        "Task span finish task_type=%s job_id=%s task_key=%s file_ids=%s filenames=%s duration=%.2fs outcome=%s",
+        task_type,
+        jobs[0].id,
+        jobs[0].task_key,
+        json.dumps([]),
+        json.dumps([f"batch({len(jobs)})"], ensure_ascii=False),
+        time.perf_counter() - started_at,
+        outcome,
+    )
+
+
 async def _assemble_text(session: AsyncSession, job: Job) -> None:
     payload = job_service.json_loads(job.payload_json)
     file_id = int(payload.get("file_id", 0))
@@ -1006,6 +1036,24 @@ async def _assemble_text(session: AsyncSession, job: Job) -> None:
     await _request_file_ensure(session, file.id)
 
 
+def _measurement_processing_snapshot(measurements: list[Measurement]) -> list[tuple]:
+    return [
+        (
+            measurement.id,
+            measurement.measurement_type_id,
+            measurement.normalization_status,
+            measurement.normalization_error,
+            measurement.qualitative_value,
+            measurement.qualitative_bool,
+            measurement.canonical_unit,
+            measurement.canonical_value,
+            measurement.canonical_reference_low,
+            measurement.canonical_reference_high,
+        )
+        for measurement in measurements
+    ]
+
+
 async def _process_measurements(session: AsyncSession, job: Job) -> None:
     payload = job_service.json_loads(job.payload_json)
     file_id = int(payload.get("file_id", 0))
@@ -1021,9 +1069,12 @@ async def _process_measurements(session: AsyncSession, job: Job) -> None:
         return
 
     started_at = _log_task_span_start(job, [file])
-    await _apply_known_measurement_rules(session, measurements)
+    before_snapshot = _measurement_processing_snapshot(measurements)
+    requested_new_work = await _apply_known_measurement_rules(session, measurements)
+    after_snapshot = _measurement_processing_snapshot(measurements)
     await job_service.mark_job_resolved(session, job)
-    _log_task_span_finish(job, [file], started_at)
+    outcome = "noop" if not requested_new_work and before_snapshot == after_snapshot else "success"
+    _log_task_span_finish(job, [file], started_at, outcome=outcome)
     # Only re-trigger file ensure when no measurements are still waiting for
     # canonization.  When measurements remain pending, the canonization
     # completion handlers already call _request_process_measurements and
@@ -1150,6 +1201,7 @@ async def _canonize_marker_jobs(session: AsyncSession, jobs: list[Job]) -> None:
     if not marker_keys:
         return
 
+    started_at = _log_batch_span_start(TASK_CANONIZE_MARKER, [job for _, job in marker_jobs])
     raw_name_result = await session.execute(
         select(Measurement.normalized_marker_key, Measurement.raw_marker_name)
         .where(Measurement.normalized_marker_key.in_(marker_keys))
@@ -1202,6 +1254,7 @@ async def _canonize_marker_jobs(session: AsyncSession, jobs: list[Job]) -> None:
     for _, job in marker_jobs:
         await job_service.mark_job_resolved(session, job)
     await _request_processing_for_measurement_keys(session, marker_keys)
+    _log_batch_span_finish(TASK_CANONIZE_MARKER, [job for _, job in marker_jobs], started_at)
 
 
 async def _canonize_group_jobs(session: AsyncSession, jobs: list[Job]) -> None:
@@ -1231,6 +1284,9 @@ async def _canonize_group_jobs(session: AsyncSession, jobs: list[Job]) -> None:
         group_jobs.append((measurement_type, job))
 
     group_type_ids = list(dict.fromkeys(measurement_type.id for measurement_type, _ in group_jobs))
+    if not group_jobs:
+        return
+    started_at = _log_batch_span_start(TASK_CANONIZE_GROUP, [job for _, job in group_jobs])
     unresolved_types = [
         measurement_types_by_id[measurement_type_id]
         for measurement_type_id in group_type_ids
@@ -1253,6 +1309,7 @@ async def _canonize_group_jobs(session: AsyncSession, jobs: list[Job]) -> None:
     for _, job in group_jobs:
         await job_service.mark_job_resolved(session, job)
     await _request_processing_for_measurement_type_ids(session, group_type_ids)
+    _log_batch_span_finish(TASK_CANONIZE_GROUP, [job for _, job in group_jobs], started_at)
 
 
 async def _canonize_unit_jobs(session: AsyncSession, jobs: list[Job]) -> None:
@@ -1282,6 +1339,9 @@ async def _canonize_unit_jobs(session: AsyncSession, jobs: list[Job]) -> None:
         unit_jobs.append((measurement_type, job))
 
     unit_type_ids = list(dict.fromkeys(measurement_type.id for measurement_type, _ in unit_jobs))
+    if not unit_jobs:
+        return
+    started_at = _log_batch_span_start(TASK_CANONIZE_UNIT, [job for _, job in unit_jobs])
     unresolved_type_ids = [
         measurement_type_id
         for measurement_type_id in unit_type_ids
@@ -1334,6 +1394,7 @@ async def _canonize_unit_jobs(session: AsyncSession, jobs: list[Job]) -> None:
     for _, job in unit_jobs:
         await job_service.mark_job_resolved(session, job)
     await _request_processing_for_measurement_type_ids(session, unit_type_ids)
+    _log_batch_span_finish(TASK_CANONIZE_UNIT, [job for _, job in unit_jobs], started_at)
 
 
 async def _canonize_conversion_jobs(session: AsyncSession, jobs: list[Job]) -> None:
@@ -1370,63 +1431,66 @@ async def _canonize_conversion_jobs(session: AsyncSession, jobs: list[Job]) -> N
             continue
         conversion_jobs.append((job, measurement_type, original_unit, canonical_unit))
 
-    if conversion_jobs:
-        existing_rule_map = await rescaling.load_rescaling_rules(
-            session,
-            [
-                (measurement_type.id, original_unit, canonical_unit)
-                for _, measurement_type, original_unit, canonical_unit in conversion_jobs
-            ],
+    if not conversion_jobs:
+        return
+    started_at = _log_batch_span_start(TASK_CANONIZE_CONVERSION, [job for job, _, _, _ in conversion_jobs])
+
+    existing_rule_map = await rescaling.load_rescaling_rules(
+        session,
+        [
+            (measurement_type.id, original_unit, canonical_unit)
+            for _, measurement_type, original_unit, canonical_unit in conversion_jobs
+        ],
+    )
+    llm_requests: list[copilot_normalization.UnitConversionRequest] = []
+    upsert_entries: list[dict] = []
+    for job, measurement_type, original_unit, canonical_unit in conversion_jobs:
+        original_key = rescaling.normalize_unit_key(original_unit)
+        canonical_key = rescaling.normalize_unit_key(canonical_unit)
+        if (
+            original_key is None
+            or canonical_key is None
+            or (measurement_type.id, original_key, canonical_key) in existing_rule_map
+        ):
+            continue
+        result = await session.execute(
+            select(Measurement)
+            .where(
+                Measurement.measurement_type_id == measurement_type.id,
+                Measurement.normalized_original_unit == original_key,
+                Measurement.original_value.is_not(None),
+            )
+            .order_by(Measurement.id.asc())
+            .limit(3)
         )
-        llm_requests: list[copilot_normalization.UnitConversionRequest] = []
-        upsert_entries: list[dict] = []
-        for job, measurement_type, original_unit, canonical_unit in conversion_jobs:
-            original_key = rescaling.normalize_unit_key(original_unit)
-            canonical_key = rescaling.normalize_unit_key(canonical_unit)
-            if (
-                original_key is None
-                or canonical_key is None
-                or (measurement_type.id, original_key, canonical_key) in existing_rule_map
-            ):
-                continue
-            result = await session.execute(
-                select(Measurement)
-                .where(
-                    Measurement.measurement_type_id == measurement_type.id,
-                    Measurement.normalized_original_unit == original_key,
-                    Measurement.original_value.is_not(None),
-                )
-                .order_by(Measurement.id.asc())
-                .limit(3)
+        sample = result.scalars().first()
+        if sample is None or sample.original_value is None:
+            continue
+        llm_requests.append(
+            copilot_normalization.UnitConversionRequest(
+                id=job.task_key,
+                marker_name=measurement_type.name,
+                original_unit=original_unit,
+                canonical_unit=canonical_unit,
+                example_value=sample.original_value,
+                reference_low=sample.original_reference_low,
+                reference_high=sample.original_reference_high,
             )
-            sample = result.scalars().first()
-            if sample is None or sample.original_value is None:
-                continue
-            llm_requests.append(
-                copilot_normalization.UnitConversionRequest(
-                    id=job.task_key,
-                    marker_name=measurement_type.name,
-                    original_unit=original_unit,
-                    canonical_unit=canonical_unit,
-                    example_value=sample.original_value,
-                    reference_low=sample.original_reference_low,
-                    reference_high=sample.original_reference_high,
-                )
-            )
-            upsert_entries.append(
-                {
-                    "task_key": job.task_key,
-                    "measurement_type": measurement_type,
-                    "original_unit": original_unit,
-                    "canonical_unit": canonical_unit,
-                }
-            )
-        if llm_requests:
-            await _commit_before_external_normalization_call(session)
-            scale_factors = await copilot_normalization.infer_rescaling_factors(llm_requests)
-            for entry in upsert_entries:
-                entry["scale_factor"] = scale_factors.get(entry["task_key"])
-            await rescaling.upsert_rescaling_rules(session, upsert_entries)
+        )
+        upsert_entries.append(
+            {
+                "task_key": job.task_key,
+                "measurement_type": measurement_type,
+                "original_unit": original_unit,
+                "canonical_unit": canonical_unit,
+            }
+        )
+    if llm_requests:
+        await _commit_before_external_normalization_call(session)
+        scale_factors = await copilot_normalization.infer_rescaling_factors(llm_requests)
+        for entry in upsert_entries:
+            entry["scale_factor"] = scale_factors.get(entry["task_key"])
+        await rescaling.upsert_rescaling_rules(session, upsert_entries)
 
     for job, _, _, _ in conversion_jobs:
         await job_service.mark_job_resolved(session, job)
@@ -1434,6 +1498,7 @@ async def _canonize_conversion_jobs(session: AsyncSession, jobs: list[Job]) -> N
         session,
         [(measurement_type.id, original_unit) for _, measurement_type, original_unit, _ in conversion_jobs],
     )
+    _log_batch_span_finish(TASK_CANONIZE_CONVERSION, [job for job, _, _, _ in conversion_jobs], started_at)
 
 
 async def _canonize_qualitative_jobs(session: AsyncSession, jobs: list[Job]) -> None:
@@ -1449,6 +1514,7 @@ async def _canonize_qualitative_jobs(session: AsyncSession, jobs: list[Job]) -> 
     if not qualitative_keys:
         return
 
+    started_at = _log_batch_span_start(TASK_CANONIZE_QUALITATIVE, [job for _, job in qualitative_jobs])
     existing_rules = await qualitative_values.load_qualitative_rules(session, qualitative_keys)
     unresolved_keys = [key for key in qualitative_keys if key not in existing_rules]
     if unresolved_keys:
@@ -1500,6 +1566,7 @@ async def _canonize_qualitative_jobs(session: AsyncSession, jobs: list[Job]) -> 
     for _, job in qualitative_jobs:
         await job_service.mark_job_resolved(session, job)
     await _request_processing_for_qualitative_keys(session, qualitative_keys)
+    _log_batch_span_finish(TASK_CANONIZE_QUALITATIVE, [job for _, job in qualitative_jobs], started_at)
 
 
 async def _refresh_search(session: AsyncSession, job: Job) -> None:
@@ -1651,7 +1718,8 @@ async def _refresh_file_status_projection(
     file.processing_error = None
 
 
-async def _apply_known_measurement_rules(session: AsyncSession, measurements: list[Measurement]) -> None:
+async def _apply_known_measurement_rules(session: AsyncSession, measurements: list[Measurement]) -> bool:
+    requested_new_work = False
     alias_map = await load_measurement_type_aliases(
         session, [measurement.raw_marker_name for measurement in measurements]
     )
@@ -1685,12 +1753,15 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
                 measurement.normalization_status = MEASUREMENT_STATE_ERROR
                 measurement.normalization_error = f"Marker canonization failed for {measurement.raw_marker_name}"
                 continue
-            await _request_job(
-                session,
-                task_type=TASK_CANONIZE_MARKER,
-                task_key=task_key,
-                payload={"raw_name": measurement.raw_marker_name},
-                priority=PRIORITY_CANONIZE,
+            requested_new_work = (
+                await _request_job(
+                    session,
+                    task_type=TASK_CANONIZE_MARKER,
+                    task_key=task_key,
+                    payload={"raw_name": measurement.raw_marker_name},
+                    priority=PRIORITY_CANONIZE,
+                )
+                or requested_new_work
             )
             measurement.normalization_status = MEASUREMENT_STATE_PENDING
             continue
@@ -1702,7 +1773,7 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
         {measurement.measurement_type_id for measurement in measurements if measurement.measurement_type_id is not None}
     )
     if not type_ids:
-        return
+        return requested_new_work
     type_result = await session.execute(
         select(MeasurementType).options(selectinload(MeasurementType.group)).where(MeasurementType.id.in_(type_ids))
     )
@@ -1757,12 +1828,15 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
                 measurement.normalization_status = MEASUREMENT_STATE_ERROR
                 measurement.normalization_error = f"Group canonization failed for {measurement_type.name}"
                 continue
-            await _request_job(
-                session,
-                task_type=TASK_CANONIZE_GROUP,
-                task_key=task_key,
-                payload={"measurement_type_id": measurement_type.id},
-                priority=PRIORITY_CANONIZE,
+            requested_new_work = (
+                await _request_job(
+                    session,
+                    task_type=TASK_CANONIZE_GROUP,
+                    task_key=task_key,
+                    payload={"measurement_type_id": measurement_type.id},
+                    priority=PRIORITY_CANONIZE,
+                )
+                or requested_new_work
             )
             resolved = False
 
@@ -1773,12 +1847,15 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
                     measurement.normalization_status = MEASUREMENT_STATE_ERROR
                     measurement.normalization_error = f"Canonical unit canonization failed for {measurement_type.name}"
                     continue
-                await _request_job(
-                    session,
-                    task_type=TASK_CANONIZE_UNIT,
-                    task_key=task_key,
-                    payload={"measurement_type_id": measurement_type.id},
-                    priority=PRIORITY_CANONIZE,
+                requested_new_work = (
+                    await _request_job(
+                        session,
+                        task_type=TASK_CANONIZE_UNIT,
+                        task_key=task_key,
+                        payload={"measurement_type_id": measurement_type.id},
+                        priority=PRIORITY_CANONIZE,
+                    )
+                    or requested_new_work
                 )
                 resolved = False
             else:
@@ -1810,16 +1887,19 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
                                     f"Conversion canonization failed for {measurement_type.name}"
                                 )
                                 continue
-                            await _request_job(
-                                session,
-                                task_type=TASK_CANONIZE_CONVERSION,
-                                task_key=task_key,
-                                payload={
-                                    "measurement_type_id": measurement_type.id,
-                                    "original_unit": measurement.original_unit,
-                                    "canonical_unit": measurement_type.canonical_unit,
-                                },
-                                priority=PRIORITY_CANONIZE,
+                            requested_new_work = (
+                                await _request_job(
+                                    session,
+                                    task_type=TASK_CANONIZE_CONVERSION,
+                                    task_key=task_key,
+                                    payload={
+                                        "measurement_type_id": measurement_type.id,
+                                        "original_unit": measurement.original_unit,
+                                        "canonical_unit": measurement_type.canonical_unit,
+                                    },
+                                    priority=PRIORITY_CANONIZE,
+                                )
+                                or requested_new_work
                             )
                             resolved = False
                         else:
@@ -1851,12 +1931,15 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
                         f"Qualitative canonization failed for {measurement.original_qualitative_value}"
                     )
                     continue
-                await _request_job(
-                    session,
-                    task_type=TASK_CANONIZE_QUALITATIVE,
-                    task_key=task_key,
-                    payload={"original_value": measurement.original_qualitative_value},
-                    priority=PRIORITY_CANONIZE,
+                requested_new_work = (
+                    await _request_job(
+                        session,
+                        task_type=TASK_CANONIZE_QUALITATIVE,
+                        task_key=task_key,
+                        payload={"original_value": measurement.original_qualitative_value},
+                        priority=PRIORITY_CANONIZE,
+                    )
+                    or requested_new_work
                 )
                 resolved = False
             else:
@@ -1870,6 +1953,8 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
         measurement.normalization_status = MEASUREMENT_STATE_RESOLVED if resolved else MEASUREMENT_STATE_PENDING
         if resolved:
             measurement.normalization_error = None
+
+    return requested_new_work
 
 
 async def _handle_terminal_job_failure(session: AsyncSession, job: Job, error_text: str) -> None:
@@ -1916,11 +2001,13 @@ async def _request_job(
     priority: int,
 ) -> None:
     existing_status_result = await session.execute(
-        select(Job.status).where(Job.task_type == task_type, Job.task_key == task_key).limit(1)
+        select(Job.status, Job.rerun_requested).where(Job.task_type == task_type, Job.task_key == task_key).limit(1)
     )
-    existing_status = existing_status_result.scalar_one_or_none()
+    existing = existing_status_result.one_or_none()
+    existing_status = existing[0] if existing is not None else None
+    existing_rerun_requested = bool(existing[1]) if existing is not None else False
     if existing_status in {job_service.JOB_STATUS_FAILED, job_service.JOB_STATUS_CANCELLED}:
-        return
+        return False
     await job_service.enqueue_job(
         session,
         task_type=task_type,
@@ -1928,6 +2015,11 @@ async def _request_job(
         payload=payload,
         file_id=file_id,
         priority=priority,
+    )
+    return (
+        existing_status is None
+        or existing_status == job_service.JOB_STATUS_RESOLVED
+        or (existing_status == job_service.JOB_STATUS_LEASED and not existing_rerun_requested)
     )
 
 
