@@ -244,6 +244,7 @@ async def _ask(
     attachments: list[dict] | None = None,
     timeout: float = COPILOT_REQUEST_TIMEOUT,
     request_name: str = "copilot_request",
+    request_context: str = "",
 ) -> str:
     """Create an ephemeral Copilot session, send one prompt, return text."""
     started_at = time.perf_counter()
@@ -252,7 +253,7 @@ async def _ask(
     request_settings = _request_session_settings(request_name)
     logger.info(
         "Copilot request starting request_name=%s request_id=%s model=%s reasoning_effort=%s timeout=%ss "
-        "attachments=%s prompt_chars=%s",
+        "attachments=%s prompt_chars=%s context=%s",
         request_name,
         request_id,
         request_settings.model,
@@ -260,6 +261,7 @@ async def _ask(
         timeout,
         attachment_count,
         len(user_prompt),
+        request_context or "none",
     )
 
     lane_name = _request_lane_name(request_name)
@@ -440,7 +442,7 @@ async def _ask(
             logger.info(
                 "Copilot request finished request_name=%s request_id=%s model=%s reasoning_effort=%s "
                 "attachments=%s duration=%.2fs response_chars=%s usage_cost=%.4f "
-                "input_tokens=%s output_tokens=%s cache_read_tokens=%s",
+                "input_tokens=%s output_tokens=%s cache_read_tokens=%s context=%s",
                 request_name,
                 request_id,
                 request_settings.model,
@@ -452,6 +454,7 @@ async def _ask(
                 observed_input_tokens,
                 observed_output_tokens,
                 observed_cache_read_tokens,
+                request_context or "none",
             )
             return content
 
@@ -572,6 +575,7 @@ async def _ask_json(
     timeout: float = COPILOT_REQUEST_TIMEOUT,
     default: dict | None = None,
     request_name: str = "copilot_json_request",
+    request_context: str = "",
 ) -> dict:
     raw = await _ask(
         system_prompt,
@@ -579,6 +583,7 @@ async def _ask_json(
         attachments=attachments,
         timeout=timeout,
         request_name=request_name,
+        request_context=request_context,
     )
     try:
         return _parse_json_response(raw)

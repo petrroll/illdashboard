@@ -355,6 +355,7 @@ async def _extract_structured_medical_data_from_attachments(
     attachments: list[dict],
     *,
     filename: str | None = None,
+    request_context: str = "",
 ) -> dict:
     prompt = "Extract all lab values from the attached file, including qualitative serology and immunology results."
     if filename:
@@ -366,10 +367,11 @@ async def _extract_structured_medical_data_from_attachments(
         attachments=attachments,
         timeout=OCR_ASK_TIMEOUT,
         request_name="structured_medical_extraction",
+        request_context=request_context,
     )
 
 
-async def _extract_document_text_from_attachments(attachments: list[dict], *, filename: str | None = None) -> dict:
+async def _extract_document_text_from_attachments(attachments: list[dict], *, filename: str | None = None, request_context: str = "") -> dict:
     prompt = "Transcribe all visible text from the attached document and translate it to English."
     if filename:
         prompt = f"Original filename: {filename}\n\n{prompt}"
@@ -380,6 +382,7 @@ async def _extract_document_text_from_attachments(attachments: list[dict], *, fi
         attachments=attachments,
         timeout=OCR_ASK_TIMEOUT,
         request_name="document_text_extraction",
+        request_context=request_context,
     )
 
 
