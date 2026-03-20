@@ -35,9 +35,14 @@
         <div class="source-actions">
           <label class="button button--secondary file-button">
             <input id="file-input" type="file" accept=".log,.txt,text/plain" />
-            <span>Upload <code>run.log</code></span>
+            <span>Upload <code>.log</code></span>
           </label>
-          <button id="load-repo-log" class="button" type="button">Load repo <code>run.log</code></button>
+          <div class="repo-log-group">
+            <select id="repo-log-select" class="repo-log-select">
+              <option value="">Scanning...</option>
+            </select>
+            <button id="load-repo-log" class="button" type="button">Load</button>
+          </div>
           <button id="parse-text" class="button button--secondary" type="button">Parse textarea</button>
           <button id="clear-log" class="button button--ghost" type="button">Clear</button>
         </div>

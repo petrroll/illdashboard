@@ -2578,6 +2578,7 @@
     const titleNode = document.createElement("span");
     titleNode.className = "timeline-label__title";
     titleNode.textContent = span.title;
+    titleNode.title = span.title;
     headerRow.appendChild(titleNode);
 
     const subtitleNode = document.createElement("p");
@@ -2961,10 +2962,77 @@
     renderAll();
   }
 
+  // Probe the repo root for .log files by trying known candidates and
+  // parsing the directory listing when the server supports it.
+  async function discoverLogFiles() {
+    const found = [];
+
+    // Try parsing the root directory listing (Python http.server emits HTML
+    // with <a href="..."> links for each file).
+    try {
+      const response = await fetch(`/?cacheBust=${Date.now()}`, { cache: "no-store" });
+      if (response.ok) {
+        const html = await response.text();
+        const linkPattern = /href="([^"]+\.log)"/gi;
+        let linkMatch;
+        while ((linkMatch = linkPattern.exec(html)) !== null) {
+          const name = decodeURIComponent(linkMatch[1]).replace(/^\//, "");
+          if (!found.includes(name)) {
+            found.push(name);
+          }
+        }
+      }
+    } catch (_ignored) {
+      // Directory listing not available — fall through to probing.
+    }
+
+    // Always ensure run.log is probed even if listing failed.
+    const probes = ["run.log"];
+    for (const probe of probes) {
+      if (found.includes(probe)) continue;
+      try {
+        const response = await fetch(`/${probe}?cacheBust=${Date.now()}`, { cache: "no-store", method: "HEAD" });
+        if (response.ok) {
+          found.unshift(probe);
+        }
+      } catch (_ignored) { /* not available */ }
+    }
+
+    return found;
+  }
+
+  async function populateLogSelect() {
+    const select = refs.repoLogSelect;
+    const files = await discoverLogFiles();
+
+    select.innerHTML = "";
+    if (!files.length) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "No .log files found";
+      select.appendChild(opt);
+      refs.loadRepoLog.disabled = true;
+      return;
+    }
+
+    files.forEach((file) => {
+      const opt = document.createElement("option");
+      opt.value = `/${file}`;
+      opt.textContent = file;
+      select.appendChild(opt);
+    });
+    refs.loadRepoLog.disabled = false;
+  }
+
   async function loadRepoLog(auto) {
-    const candidates = ["../../run.log", "/run.log"];
+    const selected = refs.repoLogSelect ? refs.repoLogSelect.value : "";
+    // For auto-load on page open, use the first available option.
+    const candidates = selected
+      ? [selected]
+      : ["../../run.log", "/run.log"];
+
     if (!auto) {
-      setStatus("Loading repo run.log...", "info");
+      setStatus(`Loading ${selected || "run.log"}...`, "info");
     }
 
     for (const candidate of candidates) {
@@ -3034,6 +3102,7 @@
   function initApp() {
     refs.fileInput = global.document.getElementById("file-input");
     refs.loadRepoLog = global.document.getElementById("load-repo-log");
+    refs.repoLogSelect = global.document.getElementById("repo-log-select");
     refs.parseText = global.document.getElementById("parse-text");
     refs.clearLog = global.document.getElementById("clear-log");
     refs.sourceText = global.document.getElementById("source-text");
@@ -3102,7 +3171,7 @@
     });
 
     if (global.location && global.location.protocol !== "file:") {
-      loadRepoLog(true);
+      populateLogSelect().then(() => loadRepoLog(true));
     }
   }
 
