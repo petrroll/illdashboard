@@ -1024,7 +1024,15 @@ async def _process_measurements(session: AsyncSession, job: Job) -> None:
     await _apply_known_measurement_rules(session, measurements)
     await job_service.mark_job_resolved(session, job)
     _log_task_span_finish(job, [file], started_at)
-    await _request_file_ensure(session, file.id)
+    # Only re-trigger file ensure when no measurements are still waiting for
+    # canonization.  When measurements remain pending, the canonization
+    # completion handlers already call _request_process_measurements and
+    # _request_file_ensure, so triggering ensure here would create a busy
+    # loop (ensure re-enqueues process.measurements which finds the same
+    # pending state and re-enqueues ensure, repeatedly).
+    still_pending = any(m.normalization_status == MEASUREMENT_STATE_PENDING for m in measurements)
+    if not still_pending:
+        await _request_file_ensure(session, file.id)
 
 
 async def _generate_summary(session: AsyncSession, job: Job) -> None:
