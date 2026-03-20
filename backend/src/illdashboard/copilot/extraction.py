@@ -529,7 +529,8 @@ async def _pdf_batch_extract(
         else:
             attachments = await render_cache.attachments_for_range(start_page=start_page, stop_page=stop_page, dpi=dpi)
 
-        result = await kind.extract_fn(attachments, filename=filename)
+        batch_context = f"{filename}:p{start_page + 1}-{stop_page}:{dpi}dpi"
+        result = await kind.extract_fn(attachments, filename=filename, request_context=batch_context)
         logger.info(
             "PDF batch extract done kind=%s path=%s filename=%s pages=%s-%s dpi=%s duration=%.2fs",
             kind.label,
@@ -576,7 +577,7 @@ async def _image_extract(
         else:
             attachments = await render_cache.attachments_for_dpi(dpi=dpi)
 
-        result = await kind.extract_fn(attachments, filename=filename)
+        result = await kind.extract_fn(attachments, filename=filename, request_context=f"{filename}:{dpi}dpi")
         logger.info(
             "%s image extract done path=%s filename=%s dpi=%s duration=%.2fs",
             kind.label,
