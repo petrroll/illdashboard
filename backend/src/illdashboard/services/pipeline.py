@@ -1037,6 +1037,9 @@ async def _assemble_text(session: AsyncSession, job: Job) -> None:
 
 
 def _measurement_processing_snapshot(measurements: list[Measurement]) -> list[tuple]:
+    # Capture the measurement-facing artifacts that process.measurements owns so
+    # repeated passes that neither change artifacts nor queue new follow-up work
+    # can be logged as filterable no-ops in the waterfall viewer.
     return [
         (
             measurement.id,
@@ -1999,9 +2002,11 @@ async def _request_job(
     payload: dict | None = None,
     file_id: int | None = None,
     priority: int,
-) -> None:
+) -> bool:
     existing_status_result = await session.execute(
-        select(Job.status, Job.rerun_requested).where(Job.task_type == task_type, Job.task_key == task_key).limit(1)
+        select(Job.status, Job.rerun_requested)
+        .where(Job.task_type == task_type, Job.task_key == task_key)
+        .limit(1)
     )
     existing = existing_status_result.one_or_none()
     existing_status = existing[0] if existing is not None else None
