@@ -1190,18 +1190,22 @@
   }
 
   function openRequestSpan(event, ctx) {
-    const contextSpan = findRequestContext(event.requestName, ctx);
+    // When the log includes an explicit context= field (new format), parse
+    // file/page info directly instead of guessing from open batch spans.
+    const explicit = parseRequestContext(event.requestContext);
+    const contextSpan = explicit ? null : findRequestContext(event.requestName, ctx);
     const span = createSpan({
       type: "request",
       subtype: event.requestName,
       title: `${requestLabel(event.requestName)} · ${event.requestId}`,
       subtitle: "",
       startMs: event.timestampMs,
-      files: contextSpan ? contextSpan.files : [],
-      file: contextSpan ? contextSpan.file : null,
-      pageStart: contextSpan ? contextSpan.pageStart : null,
-      pageStop: contextSpan ? contextSpan.pageStop : null,
-      pageCount: contextSpan ? contextSpan.pageCount : null,
+      files: explicit ? (explicit.filename ? [explicit.filename] : [])
+                      : (contextSpan ? contextSpan.files : []),
+      file: explicit ? explicit.filename : (contextSpan ? contextSpan.file : null),
+      pageStart: explicit ? explicit.pageStart : (contextSpan ? contextSpan.pageStart : null),
+      pageStop: explicit ? explicit.pageStop : (contextSpan ? contextSpan.pageStop : null),
+      pageCount: explicit ? explicit.pageCount : (contextSpan ? contextSpan.pageCount : null),
       detail: {
         requestName: event.requestName,
         requestId: event.requestId,
@@ -1210,7 +1214,7 @@
         timeoutMs: event.timeoutMs,
         attachments: event.attachments,
         promptChars: event.promptChars,
-        contextTitle: contextSpan ? contextSpan.title : null,
+        contextTitle: contextSpan ? contextSpan.title : (event.requestContext || null),
       },
     });
 
@@ -2056,6 +2060,37 @@
 
   function basename(path) {
     return path.split("/").filter(Boolean).pop() || path;
+  }
+
+  // Parse the context= field logged by _ask: "filename:pStart-Stop:DPIdpi"
+  function parseRequestContext(raw) {
+    if (!raw) {
+      return null;
+    }
+    const match = raw.match(/^(.+?):p(\d+)-(\d+):(\d+)dpi$/);
+    if (match) {
+      const startPage = Number(match[2]);
+      const stopPage = Number(match[3]);
+      return {
+        filename: match[1],
+        pageStart: startPage,
+        pageStop: stopPage,
+        pageCount: pageCountFromRange(startPage, stopPage),
+        dpi: Number(match[4]),
+      };
+    }
+    // Image format: "filename:DPIdpi"
+    const imgMatch = raw.match(/^(.+?):(\d+)dpi$/);
+    if (imgMatch) {
+      return {
+        filename: imgMatch[1],
+        pageStart: null,
+        pageStop: null,
+        pageCount: null,
+        dpi: Number(imgMatch[2]),
+      };
+    }
+    return null;
   }
 
   function pageRangeLabel(startPage, stopPage) {
