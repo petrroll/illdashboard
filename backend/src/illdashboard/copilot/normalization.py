@@ -691,9 +691,10 @@ async def normalize_source_name(
 
     started_at = time.perf_counter()
     logger.info(
-        "Normalize source start source_present=%s filename_present=%s existing_canonical=%s",
+        "Normalize source start source_present=%s filename_present=%s filename=%s existing_canonical=%s",
         bool(source_name),
         bool(filename),
+        filename,
         len(existing_canonical),
     )
     payload = await _ask_json(
@@ -704,13 +705,19 @@ async def normalize_source_name(
     )
     normalized_source = payload.get("source")
     if normalized_source is None or not isinstance(normalized_source, str):
-        logger.info("Normalize source finished normalized=%s duration=%.2fs", False, time.perf_counter() - started_at)
+        logger.info(
+            "Normalize source finished filename=%s normalized=%s duration=%.2fs",
+            filename,
+            False,
+            time.perf_counter() - started_at,
+        )
         return None
 
     normalized_source = normalized_source.strip()
     result = normalized_source or None
     logger.info(
-        "Normalize source finished normalized=%s duration=%.2fs",
+        "Normalize source finished filename=%s normalized=%s duration=%.2fs",
+        filename,
         bool(result),
         time.perf_counter() - started_at,
     )

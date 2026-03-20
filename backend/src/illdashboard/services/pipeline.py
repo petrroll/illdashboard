@@ -920,6 +920,40 @@ async def _persist_text_batch(
     batch.translated_text_english = translated_text
 
 
+def _task_log_files(files: list[LabFile]) -> tuple[list[int], list[str]]:
+    return [file.id for file in files], [file.filename for file in files]
+
+
+def _log_task_span_start(job: Job, files: list[LabFile]) -> float:
+    # Emit explicit file lists so the run-log viewer can place shared task spans
+    # under every related file without guessing from surrounding lines.
+    file_ids, filenames = _task_log_files(files)
+    started_at = time.perf_counter()
+    logger.info(
+        "Task span start task_type=%s job_id=%s task_key=%s file_ids=%s filenames=%s",
+        job.task_type,
+        job.id,
+        job.task_key,
+        json.dumps(file_ids),
+        json.dumps(filenames, ensure_ascii=False),
+    )
+    return started_at
+
+
+def _log_task_span_finish(job: Job, files: list[LabFile], started_at: float, *, outcome: str = "success") -> None:
+    file_ids, filenames = _task_log_files(files)
+    logger.info(
+        "Task span finish task_type=%s job_id=%s task_key=%s file_ids=%s filenames=%s duration=%.2fs outcome=%s",
+        job.task_type,
+        job.id,
+        job.task_key,
+        json.dumps(file_ids),
+        json.dumps(filenames, ensure_ascii=False),
+        time.perf_counter() - started_at,
+        outcome,
+    )
+
+
 async def _assemble_text(session: AsyncSession, job: Job) -> None:
     payload = job_service.json_loads(job.payload_json)
     file_id = int(payload.get("file_id", 0))
@@ -939,6 +973,7 @@ async def _assemble_text(session: AsyncSession, job: Job) -> None:
         await _request_text_ensure(session, file.id)
         return
 
+    started_at = _log_task_span_start(job, [file])
     result = await session.execute(
         select(TextBatch)
         .where(TextBatch.file_id == file.id)
@@ -958,6 +993,7 @@ async def _assemble_text(session: AsyncSession, job: Job) -> None:
     file.ocr_text_english = _normalize_document_text(merged.get("translated_text_english"))
     file.text_assembled_at = utc_now()
     await job_service.mark_job_resolved(session, job)
+    _log_task_span_finish(job, [file], started_at)
     await _request_summary(session, file.id)
     await _request_file_ensure(session, file.id)
 
@@ -976,8 +1012,10 @@ async def _process_measurements(session: AsyncSession, job: Job) -> None:
         await _request_file_ensure(session, file.id)
         return
 
+    started_at = _log_task_span_start(job, [file])
     await _apply_known_measurement_rules(session, measurements)
     await job_service.mark_job_resolved(session, job)
+    _log_task_span_finish(job, [file], started_at)
     await _request_file_ensure(session, file.id)
 
 
@@ -1001,6 +1039,7 @@ async def _generate_summary(session: AsyncSession, job: Job) -> None:
 
     file.status = FILE_STATUS_PROCESSING
     await session.commit()
+    started_at = _log_task_span_start(job, [file])
 
     if not file.ocr_text_raw:
         file.ocr_summary_english = None
@@ -1008,6 +1047,7 @@ async def _generate_summary(session: AsyncSession, job: Job) -> None:
         file.source_candidate_key = None
         file.summary_generated_at = utc_now()
         await job_service.mark_job_resolved(session, job)
+        _log_task_span_finish(job, [file], started_at, outcome="no_text")
         await _request_file_ensure(session, file.id)
         return
 
@@ -1023,6 +1063,7 @@ async def _generate_summary(session: AsyncSession, job: Job) -> None:
     file.source_candidate_key = normalize_source_tag_value(source_candidate) if source_candidate else None
     file.summary_generated_at = utc_now()
     await job_service.mark_job_resolved(session, job)
+    _log_task_span_finish(job, [file], started_at)
     await _request_file_ensure(session, file.id)
 
 
@@ -1032,21 +1073,19 @@ async def _canonize_source(session: AsyncSession, job: Job) -> None:
         await job_service.mark_job_resolved(session, job, {"skipped": True})
         return
 
+    file_result = await session.execute(
+        select(LabFile).options(selectinload(LabFile.tags)).where(LabFile.source_candidate_key == source_key)
+    )
+    files = file_result.scalars().unique().all()
+    if not files:
+        await job_service.mark_job_resolved(session, job, {"skipped": True})
+        return
+
+    started_at = _log_task_span_start(job, files)
     alias_result = await session.execute(select(SourceAlias).where(SourceAlias.normalized_key == source_key))
     alias = alias_result.scalar_one_or_none()
     if alias is None:
-        file_result = await session.execute(
-            select(LabFile)
-            .options(selectinload(LabFile.tags))
-            .where(LabFile.source_candidate_key == source_key)
-            .order_by(LabFile.id.asc())
-        )
-        files = file_result.scalars().all()
-        if not files:
-            await job_service.mark_job_resolved(session, job, {"skipped": True})
-            return
-
-        sample_file = files[0]
+        sample_file = sorted(files, key=lambda current: current.id)[0]
         sample_candidate = sample_file.source_candidate or ""
         existing_sources_result = await session.execute(
             select(SourceAlias.canonical_name).distinct().order_by(SourceAlias.canonical_name.asc())
@@ -1068,16 +1107,13 @@ async def _canonize_source(session: AsyncSession, job: Job) -> None:
             session.add(alias)
             await session.flush()
 
-    file_result = await session.execute(
-        select(LabFile).options(selectinload(LabFile.tags)).where(LabFile.source_candidate_key == source_key)
-    )
-    files = file_result.scalars().unique().all()
     canonical_name = alias.canonical_name if alias is not None else None
     for file in files:
         await _mark_source_resolved(session, file, canonical_name)
         await _request_file_ensure(session, file.id)
 
     await job_service.mark_job_resolved(session, job)
+    _log_task_span_finish(job, files, started_at)
 
 
 async def _canonize_source_jobs(session: AsyncSession, jobs: list[Job]) -> None:
@@ -1465,9 +1501,11 @@ async def _refresh_search(session: AsyncSession, job: Job) -> None:
     if not await _file_needs_search_refresh(session, file):
         await job_service.mark_job_resolved(session, job, {"skipped": True})
         return
+    started_at = _log_task_span_start(job, [file])
     await search_service.refresh_lab_search_document(file.id, session)
     file.search_indexed_at = utc_now()
     await job_service.mark_job_resolved(session, job)
+    _log_task_span_finish(job, [file], started_at)
 
 
 async def get_file_progress(session: AsyncSession, file: LabFile) -> FileProgressSnapshot:

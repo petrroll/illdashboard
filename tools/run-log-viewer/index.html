@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>run.log waterfall viewer</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="page-shell">
+      <header class="hero panel">
+        <div>
+          <p class="eyebrow">Developer tool</p>
+          <h1>run.log waterfall viewer</h1>
+          <p class="hero-copy">
+            Visualize extraction jobs, Copilot requests, batch sizes, summaries, normalization work, and worker crashes as a timeline.
+          </p>
+        </div>
+        <div class="hero-note">
+          <p>Open this page directly and upload or paste a log, or serve the repo root and load <code>run.log</code> with one click.</p>
+        </div>
+      </header>
+
+      <section class="panel source-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Input</p>
+            <h2>Load log data</h2>
+          </div>
+          <p class="panel-copy">
+            The parser understands the current pipeline log shapes for extraction jobs, PDF batches, render spans, Copilot request lifecycles, summaries, source normalization, marker normalization, and worker crashes.
+          </p>
+        </div>
+
+        <div class="source-actions">
+          <label class="button button--secondary file-button">
+            <input id="file-input" type="file" accept=".log,.txt,text/plain" />
+            <span>Upload <code>run.log</code></span>
+          </label>
+          <button id="load-repo-log" class="button" type="button">Load repo <code>run.log</code></button>
+          <button id="parse-text" class="button button--secondary" type="button">Parse textarea</button>
+          <button id="clear-log" class="button button--ghost" type="button">Clear</button>
+        </div>
+
+        <label class="field-label" for="source-text">Paste or inspect log text</label>
+        <textarea
+          id="source-text"
+          spellcheck="false"
+          placeholder="Paste run.log here, or upload the file above."
+        ></textarea>
+
+        <div id="status-banner" class="status-banner status-banner--info">
+          Ready. Upload a log, paste one in, or serve the repo root and click <span class="nowrap">Load repo <code>run.log</code></span>.
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Summary</p>
+            <h2>Overview</h2>
+          </div>
+          <p class="panel-copy">High-level metrics update as filters change, while batch, lane, and file tables stay anchored to the full parsed log.</p>
+        </div>
+        <div id="summary-cards" class="summary-grid"></div>
+      </section>
+
+      <section class="panel filters-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Filters</p>
+            <h2>Focus the waterfall</h2>
+          </div>
+          <p class="panel-copy">The default zoom fits the full parsed range to the panel, and rows group under file sections whenever the log includes explicit file-aware task metadata.</p>
+        </div>
+
+        <div class="controls-grid">
+          <label class="control">
+            <span>Search spans</span>
+            <input id="search-input" type="search" placeholder="filename, request, lane, job id, error..." />
+          </label>
+
+          <label class="control">
+            <span>Sort rows</span>
+            <select id="sort-select">
+              <option value="start">Start time</option>
+              <option value="duration">Longest first</option>
+              <option value="type">Span type</option>
+            </select>
+          </label>
+
+          <label class="control">
+            <span>Timeline zoom <strong id="zoom-value">1.00x</strong></span>
+            <input id="zoom-range" type="range" min="1" max="4" step="0.25" value="1" />
+          </label>
+        </div>
+
+        <div class="filter-actions">
+          <div id="type-filters" class="type-filter-list"></div>
+          <button id="reset-filters" class="button button--ghost" type="button">Show all types</button>
+        </div>
+      </section>
+
+      <section class="panel timeline-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Waterfall</p>
+            <h2>Timeline</h2>
+          </div>
+          <p id="timeline-caption" class="panel-copy">Parsed spans will appear here.</p>
+        </div>
+
+        <div id="timeline-empty" class="empty-state">
+          No spans yet. Load a log to build the waterfall.
+        </div>
+        <div id="timeline-root" class="timeline-root" hidden></div>
+      </section>
+
+      <section class="insights-grid">
+        <section class="panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Batch sizes</p>
+              <h2>Extraction distribution</h2>
+            </div>
+          </div>
+          <div id="batch-summary" class="table-host"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Copilot lanes</p>
+              <h2>Request pressure</h2>
+            </div>
+          </div>
+          <div id="lane-summary" class="table-host"></div>
+        </section>
+
+        <section class="panel panel--full">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Files</p>
+              <h2>Observed activity</h2>
+            </div>
+          </div>
+          <div id="file-summary" class="table-host"></div>
+        </section>
+
+        <section class="panel panel--full">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Details</p>
+              <h2>Selected span</h2>
+            </div>
+          </div>
+          <div id="selection-detail" class="selection-detail empty-state">
+            Select a row in the waterfall to inspect the derived metadata and source log lines.
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

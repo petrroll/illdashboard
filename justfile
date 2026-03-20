@@ -79,6 +79,11 @@ fmt:
 
 # ── Utilities ────────────────────────────────────────────────────────────────
 
+# Serve the standalone run.log viewer from the repository root
+run-log-viewer:
+    @echo "Open http://localhost:4173/tools/run-log-viewer/index.html"
+    python -m http.server 4173
+
 # Remove build artifacts and caches
 clean:
     rm -rf backend/.venv backend/dist backend/data/health.db

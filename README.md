@@ -82,6 +82,7 @@ just build           # Build backend package + frontend bundle
 just test            # Run all tests (pytest + tsc)
 just lint            # Lint everything (ruff + tsc)
 just fmt             # Auto-format & fix backend code
+just run-log-viewer  # Serve the standalone run.log viewer on :4173
 just clean           # Remove build artifacts and caches
 just help            # List all recipes
 ```
@@ -90,15 +91,16 @@ just help            # List all recipes
 
 The repository includes a standalone `run.log` waterfall viewer at `tools/run-log-viewer/index.html`.
 
-You can open the HTML file directly and upload or paste a log, or serve the repository root and let the page fetch `run.log` for you:
+You can open the HTML file directly and upload or paste a log, or run a tiny local server from the repository root so the page can fetch `run.log` for you:
 
 ```bash
-python -m http.server 4173
+just run-log-viewer
 ```
 
 Then visit `http://localhost:4173/tools/run-log-viewer/index.html`.
 
 The viewer highlights extraction jobs, page-batch sizes, Copilot request lifecycles, summaries, normalization spans, and worker crashes in one timeline.
+Newer logs also emit file-aware task spans for summary, search, text assembly, measurement processing, and source canonization so the viewer can group shared work under each related file more accurately.
 
 ### 3. Usage
 
