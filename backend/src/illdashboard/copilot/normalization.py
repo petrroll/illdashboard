@@ -335,13 +335,23 @@ CRP, TSH, HDL, LDL, or HbA1c, prefer that standard abbreviation as the canonical
 name unless there is a clearly more established English database label already present.
 - Prefer concise English medical names such as \"White Blood Cell (WBC) Count\" \
 or \"Platelet Count\" over local-language labels.
-- Treat abbreviations like \"Abs\" carefully: in immunology or assay contexts it often \
-means \"Absorbance\", not \"Absolute\". Only expand it to \"Absolute\" when the \
-source label clearly indicates an absolute count.
+- When two labels exist for the same analyte and one has a trailing \"Abs\" (or \
+similar suffix indicating an absolute/quantitative value) while the other does not, \
+keep them as two separate canonical types. The short form without \"Abs\" is the \
+positivity/qualitative test and the form with \"Abs\" is the absolute numeric count. \
+For example, \"Cytomegalovirus (CMV) IgG Antibodies\" is the qualitative positivity \
+result and \"Cytomegalovirus (CMV) IgG Antibodies Abs\" is the quantitative titer. \
+Do NOT merge them into one canonical name.
+- More generally, when the same analyte appears with both a qualitative variant \
+(positive/negative, reactive/non-reactive) and a quantitative variant (numeric \
+value with units), preserve them as distinct canonical names so they track \
+different measurement kinds.
 
 Return ONLY valid JSON: a mapping object where keys are the original new names \
 and values are the canonical names.
-Example: {"Lymfocyty -abs.počet": "Absolute Lymphocyte Count", "Hemoglobin": "Hemoglobin"}
+Example: {"Lymfocyty -abs.počet": "Absolute Lymphocyte Count", "Hemoglobin": "Hemoglobin", \
+"CMV IgG protilátky": "Cytomegalovirus (CMV) IgG Antibodies", \
+"CMV IgG protilátky Abs": "Cytomegalovirus (CMV) IgG Antibodies Abs"}
 Do not include any commentary outside the JSON.\
 """
 
