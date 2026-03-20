@@ -384,6 +384,26 @@
 
     if (
       (match = message.match(
+        /^Copilot request starting request_name=(\S+) request_id=(\w+) model=(\S+) reasoning_effort=(\S+) timeout=([\d.]+)s attachments=(\d+) prompt_chars=(\d+) context=(\S+)$/
+      ))
+    ) {
+      return {
+        ...header,
+        eventType: "requestStart",
+        requestName: match[1],
+        requestId: match[2],
+        model: match[3],
+        reasoningEffort: match[4],
+        timeoutMs: secondsToMs(match[5]),
+        attachments: Number(match[6]),
+        promptChars: Number(match[7]),
+        requestContext: match[8] === "none" ? null : match[8],
+      };
+    }
+
+    // Legacy format without context field
+    if (
+      (match = message.match(
         /^Copilot request starting request_name=(\S+) request_id=(\w+) model=(\S+) reasoning_effort=(\S+) timeout=([\d.]+)s attachments=(\d+) prompt_chars=(\d+)$/
       ))
     ) {
@@ -397,6 +417,7 @@
         timeoutMs: secondsToMs(match[5]),
         attachments: Number(match[6]),
         promptChars: Number(match[7]),
+        requestContext: null,
       };
     }
 
@@ -462,6 +483,30 @@
       };
     }
 
+    if (
+      (match = message.match(
+        /^Copilot request finished request_name=(\S+) request_id=(\w+) model=(\S+) reasoning_effort=(\S+) attachments=(\d+) duration=([\d.]+)s response_chars=(\d+) usage_cost=([\d.]+) input_tokens=(\d+) output_tokens=(\d+) cache_read_tokens=(\d+) context=(\S+)$/
+      ))
+    ) {
+      return {
+        ...header,
+        eventType: "requestFinished",
+        requestName: match[1],
+        requestId: match[2],
+        model: match[3],
+        reasoningEffort: match[4],
+        attachments: Number(match[5]),
+        durationMs: secondsToMs(match[6]),
+        responseChars: Number(match[7]),
+        usageCost: Number(match[8]),
+        inputTokens: Number(match[9]),
+        outputTokens: Number(match[10]),
+        cacheReadTokens: Number(match[11]),
+        requestContext: match[12] === "none" ? null : match[12],
+      };
+    }
+
+    // Tokens present but no context field
     if (
       (match = message.match(
         /^Copilot request finished request_name=(\S+) request_id=(\w+) model=(\S+) reasoning_effort=(\S+) attachments=(\d+) duration=([\d.]+)s response_chars=(\d+) usage_cost=([\d.]+) input_tokens=(\d+) output_tokens=(\d+) cache_read_tokens=(\d+)$/
