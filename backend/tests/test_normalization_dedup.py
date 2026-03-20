@@ -329,6 +329,51 @@ async def test_enqueue_job_marks_rerun_requested_while_task_is_leased(session_fa
 
 
 @pytest.mark.asyncio
+async def test_process_measurements_logs_noop_outcome_when_pass_changes_nothing(session_factory, caplog):
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="noop.png",
+            filepath="/tmp/noop.png",
+            mime_type="image/png",
+        )
+        session.add(lab_file)
+        await session.flush()
+        session.add(
+            Measurement(
+                lab_file_id=lab_file.id,
+                raw_marker_name="CRP",
+                normalized_marker_key=normalize_marker_alias_key("CRP"),
+                normalization_status=pipeline.MEASUREMENT_STATE_PENDING,
+            )
+        )
+        job = Job(
+            file_id=lab_file.id,
+            task_type=pipeline.TASK_PROCESS_MEASUREMENTS,
+            task_key=f"file:{lab_file.id}:process-measurements",
+            status=job_service.JOB_STATUS_LEASED,
+            priority=10,
+            lease_owner="worker-1",
+            lease_until=utc_now(),
+            payload_json=job_service.json_dumps({"file_id": lab_file.id}),
+        )
+        session.add(job)
+        await session.commit()
+
+        caplog.set_level("INFO", logger="illdashboard.services.pipeline")
+        with patch(
+            "illdashboard.services.pipeline._apply_known_measurement_rules",
+            new=AsyncMock(return_value=False),
+        ):
+            await pipeline._process_measurements(session, job)
+
+    assert any(
+        "Task span finish task_type=process.measurements" in record.getMessage()
+        and "outcome=noop" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_rescaling_rule_upsert_deduplicates_equivalent_units(session_factory):
     async with session_factory() as session:
         measurement_type = MeasurementType(name="Glucose", normalized_key="glucose", group_name="Metabolic")
