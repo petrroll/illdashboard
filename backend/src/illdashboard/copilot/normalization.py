@@ -162,7 +162,13 @@ async def _run_json_batches(
     )
 
 
-def _build_marker_name_normalization_user_text(batch_names: list[str], existing_canonical: list[str]) -> str:
+def _build_marker_name_normalization_user_text(
+    batch_names: list[str],
+    existing_canonical: list[str],
+    *,
+    raw_examples_by_name: dict[str, list[str]] | None = None,
+    observed_units_by_name: dict[str, list[str]] | None = None,
+) -> str:
     user_text = "EXISTING canonical marker names:\n"
     if existing_canonical:
         for name in existing_canonical:
@@ -170,9 +176,23 @@ def _build_marker_name_normalization_user_text(batch_names: list[str], existing_
     else:
         user_text += "(none yet)\n"
 
-    user_text += "\nNEW marker names to normalize:\n"
+    user_text += "\nNEW marker entries to normalize:\n"
     for name in batch_names:
-        user_text += f"- {name}\n"
+        user_text += f"\n- Representative name: {name}\n"
+        raw_examples = raw_examples_by_name.get(name) if raw_examples_by_name else None
+        user_text += "  Raw examples:\n"
+        if raw_examples:
+            for raw_example in raw_examples:
+                user_text += f"  - {raw_example}\n"
+        else:
+            user_text += "  - (none)\n"
+        observed_units = observed_units_by_name.get(name) if observed_units_by_name else None
+        user_text += "  Observed units:\n"
+        if observed_units:
+            for observed_unit in observed_units:
+                user_text += f"  - {observed_unit}\n"
+        else:
+            user_text += "  - (none)\n"
     return user_text
 
 
@@ -317,9 +337,10 @@ def _parse_marker_group_response(payload: dict, batch_names: list[str]) -> dict[
 NORMALIZE_SYSTEM_PROMPT = """\
 You are a medical lab data normalization assistant. The user will give you:
 1. A list of EXISTING canonical marker names already in the database.
-2. A list of NEW marker names extracted from an OCR result.
+2. A list of NEW marker entries extracted from OCR. Each entry includes a
+   representative name, optional raw example labels, and optional observed units.
 
-For each new marker name, decide:
+For each new marker entry, decide:
 - If it matches an existing canonical name (same test, just different formatting, \
 spacing, abbreviation, or punctuation), map it to that existing canonical name.
 - If multiple NEW marker names refer to the same biomarker, map all of them to the \
@@ -346,10 +367,19 @@ Do NOT merge them into one canonical name.
 (positive/negative, reactive/non-reactive) and a quantitative variant (numeric \
 value with units), preserve them as distinct canonical names so they track \
 different measurement kinds.
+- For blood-cell subset markers, keep relative/percentage measurements separate from \
+absolute count measurements. Labels such as \"absolute\", \"absolut\", \"abs.\", \
+\"count\", \"počet\", or German \"gesamt\" often indicate the absolute-count variant \
+and should map to names such as \"Absolute Lymphocyte Count\" rather than the \
+percentage/fraction marker.
+- Use observed units as strong context when they are provided. Count units such as \
+\"cells/µL\", \"Zellen/µl\", \"/µL\", \"G/L\", or \"10^9/L\" indicate an absolute-count \
+marker family, while \"%\" or \"1\" indicate a relative or fraction-style marker family.
 
 Return ONLY valid JSON: a mapping object where keys are the original new names \
 and values are the canonical names.
 Example: {"Lymfocyty -abs.počet": "Absolute Lymphocyte Count", "Hemoglobin": "Hemoglobin", \
+"Lymphozyten gesamt": "Absolute Lymphocyte Count", \
 "CMV IgG protilátky": "Cytomegalovirus (CMV) IgG Antibodies", \
 "CMV IgG protilátky Abs": "Cytomegalovirus (CMV) IgG Antibodies Abs"}
 Do not include any commentary outside the JSON.\
@@ -587,7 +617,13 @@ def _can_skip_canonical_unit_selection(group: MarkerUnitGroup) -> bool:
     return not _unit_key_likely_requires_llm(next(iter(observation_unit_keys)))
 
 
-async def normalize_marker_names(new_names: list[str], existing_canonical: list[str]) -> dict[str, str]:
+async def normalize_marker_names(
+    new_names: list[str],
+    existing_canonical: list[str],
+    *,
+    raw_examples_by_name: dict[str, list[str]] | None = None,
+    observed_units_by_name: dict[str, list[str]] | None = None,
+) -> dict[str, str]:
     """Map raw marker names to canonical forms."""
     if not new_names:
         return {}
@@ -647,7 +683,12 @@ async def normalize_marker_names(new_names: list[str], existing_canonical: list[
         )
         payload = await _ask_json(
             NORMALIZE_SYSTEM_PROMPT,
-            _build_marker_name_normalization_user_text(batch_names, evolving_canonical),
+            _build_marker_name_normalization_user_text(
+                batch_names,
+                evolving_canonical,
+                raw_examples_by_name=raw_examples_by_name,
+                observed_units_by_name=observed_units_by_name,
+            ),
             default={},
             request_name="normalize_marker_names",
         )
