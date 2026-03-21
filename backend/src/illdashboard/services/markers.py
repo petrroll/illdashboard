@@ -141,8 +141,26 @@ def marker_group_tag(group_name: str) -> str:
     return f"group:{group_name}"
 
 
-def measurement_range_tag_bucket(measurement: Measurement) -> str:
-    status = measurement_status(measurement)
+def measurement_range_tag_bucket(
+    measurement: Measurement,
+    reference_low: float | None = None,
+    reference_high: float | None = None,
+) -> str:
+    effective_reference_low = (
+        measurement.canonical_reference_low
+        if measurement.canonical_reference_low is not None
+        else reference_low
+    )
+    effective_reference_high = (
+        measurement.canonical_reference_high
+        if measurement.canonical_reference_high is not None
+        else reference_high
+    )
+    status = measurement_status_for_range(
+        measurement,
+        effective_reference_low,
+        effective_reference_high,
+    )
     if status in {"negative", "in_range"}:
         return "in_range"
     if status in {"positive", "low", "high"}:
@@ -154,11 +172,16 @@ def derived_range_tags(measurements: list[Measurement]) -> list[str]:
     in_range_count = 0
     out_of_range_count = 0
     no_range_count = 0
+    history_reference_low, history_reference_high = latest_reference_range_for_history(measurements)
 
-    # History-level tags should reflect each reading's own normalized status,
-    # not the marker-summary fallback range reused for the latest snapshot.
+    # Reuse the marker's newest usable canonical interval when older readings
+    # omit the same range so tags stay aligned with the UI status rendering.
     for measurement in measurements:
-        bucket = measurement_range_tag_bucket(measurement)
+        bucket = measurement_range_tag_bucket(
+            measurement,
+            history_reference_low,
+            history_reference_high,
+        )
         if bucket == "in_range":
             in_range_count += 1
         elif bucket == "out_of_range":

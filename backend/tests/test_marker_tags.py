@@ -87,10 +87,19 @@ def test_derived_range_tags_use_boolean_projection(
     assert derived_range_tags([_measurement(qualitative_bool=qualitative_bool)]) == [expected_tag]
 
 
-def test_combine_marker_tags_keeps_norange_additive_for_mixed_history():
+def test_derived_range_tags_reuse_marker_history_reference_for_missing_ranges():
+    measurements = [
+        _measurement(value=1826.0),
+        _measurement(value=1712.0, reference_high=150.0),
+    ]
+
+    assert derived_range_tags(measurements) == [OUT_OF_RANGE_TAG]
+
+
+def test_combine_marker_tags_keeps_norange_when_history_still_has_unclassifiable_rows():
     measurements = [
         _measurement(value=4.0, reference_low=0.0, reference_high=5.0),
-        _measurement(value=12.0),
+        _measurement(unit_conversion_missing=True),
     ]
 
     assert combine_marker_tags(["custom"], "Inflammation & Infection", measurements) == [

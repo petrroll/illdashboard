@@ -1350,3 +1350,62 @@ async def test_set_marker_tags_strips_reserved_range_tags_but_returns_derived_ta
             .order_by(MarkerTag.tag.asc())
         )
         assert result.scalars().all() == ["manual-tag"]
+
+
+@pytest.mark.asyncio
+async def test_marker_detail_reuses_history_reference_for_missing_range_rows(client, session_factory):
+    async with session_factory() as session:
+        first_file = LabFile(
+            filename="v1.pdf",
+            filepath="/tmp/v1.pdf",
+            mime_type="application/pdf",
+        )
+        second_file = LabFile(
+            filename="v2.pdf",
+            filepath="/tmp/v2.pdf",
+            mime_type="application/pdf",
+        )
+        marker_type = MeasurementType(
+            name="Varicella Zoster Virus (VZV) IgG Antibodies Abs",
+            normalized_key="vzg-igg-abs",
+            group_name="Immunity & Serology",
+            canonical_unit="IU/mL",
+        )
+        session.add_all([first_file, second_file, marker_type])
+        await session.flush()
+        session.add_all(
+            [
+                Measurement(
+                    lab_file_id=first_file.id,
+                    measurement_type_id=marker_type.id,
+                    raw_marker_name="VZV IgG abs.",
+                    normalized_marker_key="vzg-igg-abs",
+                    canonical_value=1826.0,
+                    canonical_unit="IU/mL",
+                    measured_at=utc_now(),
+                    normalization_status="resolved",
+                ),
+                Measurement(
+                    lab_file_id=second_file.id,
+                    measurement_type_id=marker_type.id,
+                    raw_marker_name="VZV IgG abs.",
+                    normalized_marker_key="vzg-igg-abs",
+                    canonical_value=1712.0,
+                    canonical_unit="IU/mL",
+                    canonical_reference_high=150.0,
+                    measured_at=utc_now(),
+                    normalization_status="resolved",
+                ),
+            ]
+        )
+        await session.commit()
+
+    response = await client.get(
+        "/api/measurements/detail",
+        params={"marker_name": "Varicella Zoster Virus (VZV) IgG Antibodies Abs"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["reference_high"] == 150.0
+    assert "outofrange" in body["marker_tags"]
+    assert "norange" not in body["marker_tags"]
