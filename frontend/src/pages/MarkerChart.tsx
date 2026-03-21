@@ -821,7 +821,7 @@ export default function MarkerChart() {
                     )}
                     {timeWeightedAxisActive && chartSeries.undatedCount > 0 && timeAxisFallbackLabel && (
                       <p className="measurement-warning-note" style={{ marginBottom: "0.75rem" }}>
-                        {chartSeries.undatedCount === 1 ? "One undated result is" : `${chartSeries.undatedCount} undated results are`} placed on {timeAxisFallbackLabel} so the time-proportional axis stays in the first recorded month instead of jumping to 1970.
+                        {chartSeries.undatedCount === 1 ? "One undated result is" : `${chartSeries.undatedCount} undated results are`} placed on {timeAxisFallbackLabel}.
                       </p>
                     )}
                     <ResponsiveContainer width="100%" height={320}>
@@ -854,19 +854,14 @@ export default function MarkerChart() {
                         />
                         <Tooltip
                           formatter={(value) => formatMeasurementValue(Number(value ?? 0), unit)}
-                          labelFormatter={(
-                            _label: string | number,
-                            payload: Array<{ payload?: MarkerChartPoint }>,
-                          ) => {
-                            const point = payload[0]?.payload;
+                          labelFormatter={(_label, payload) => {
+                            const point = payload[0]?.payload as MarkerChartPoint | undefined;
                             if (!point) {
                               return "Date: —";
                             }
 
                             const label = timeWeightedAxisActive ? point.axisDateLabel : point.dateLabel;
-                            return point.hasEstimatedDate && timeWeightedAxisActive
-                              ? `Date: ${label} (estimated)`
-                              : `Date: ${label}`;
+                            return `Date: ${label}`;
                           }}
                           contentStyle={{ background: "#161d27", border: "1px solid #303c4d", borderRadius: "8px", color: "#edf1f7" }}
                         />
