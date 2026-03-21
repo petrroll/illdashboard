@@ -25,7 +25,9 @@ class Settings(BaseSettings):
     # benefits from extra reasoning.
     COPILOT_TEXT_EXTRACTION_REASONING_EFFORT: Literal["low", "medium", "high", "xhigh"] | None = None
     COPILOT_NORMALIZATION_MODEL: str = "gpt-5.4-mini"
-    COPILOT_NORMALIZATION_REASONING_EFFORT: Literal["low", "medium", "high", "xhigh"] = "high"
+    # Keep mini-model normalization valid by default; the client only forwards
+    # reasoning when the selected model explicitly advertises support.
+    COPILOT_NORMALIZATION_REASONING_EFFORT: Literal["low", "medium", "high", "xhigh"] | None = None
     # Token is read from environment – set GITHUB_TOKEN before running
     GITHUB_TOKEN: str = ""
 

@@ -913,21 +913,34 @@ async def test_ask_adds_observed_premium_usage_cost():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("request_name", "expected_model", "expected_reasoning_effort"),
+    ("request_name", "expected_model", "expected_reasoning_effort", "supports_reasoning_effort"),
     [
-        ("structured_medical_extraction", "measurement-model", None),
-        ("document_text_extraction", "text-model", None),
-        ("normalize_marker_names", "normalization-model", "high"),
-        ("medical_summary", "default-model", None),
+        ("structured_medical_extraction", "measurement-model", None, False),
+        ("document_text_extraction", "text-model", None, False),
+        ("normalize_marker_names", "normalization-model", "high", True),
+        ("medical_summary", "default-model", None, False),
     ],
 )
 async def test_ask_uses_request_specific_session_settings(
     request_name: str,
     expected_model: str,
     expected_reasoning_effort: str | None,
+    supports_reasoning_effort: bool,
 ):
     session = DummySession(response=SimpleNamespace(data=SimpleNamespace(content="ok")))
-    client = SimpleNamespace(create_session=AsyncMock(return_value=session))
+    client = SimpleNamespace(
+        create_session=AsyncMock(return_value=session),
+        list_models=AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    id="normalization-model",
+                    capabilities=SimpleNamespace(
+                        supports=SimpleNamespace(reasoning_effort=supports_reasoning_effort)
+                    ),
+                )
+            ]
+        ),
+    )
 
     with (
         patch.object(copilot_client.settings, "COPILOT_DEFAULT_MODEL", "default-model"),
@@ -945,6 +958,41 @@ async def test_ask_uses_request_specific_session_settings(
     session_config = client.create_session.await_args.args[0]
     assert session_config["model"] == expected_model
     assert session_config.get("reasoning_effort") == expected_reasoning_effort
+    if expected_reasoning_effort is None:
+        client.list_models.assert_not_awaited()
+    else:
+        client.list_models.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ask_omits_reasoning_effort_for_models_without_support():
+    session = DummySession(response=SimpleNamespace(data=SimpleNamespace(content="ok")))
+    client = SimpleNamespace(
+        create_session=AsyncMock(return_value=session),
+        list_models=AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    id="normalization-model",
+                    capabilities=SimpleNamespace(
+                        supports=SimpleNamespace(reasoning_effort=False)
+                    ),
+                )
+            ]
+        ),
+    )
+
+    with (
+        patch.object(copilot_client.settings, "COPILOT_NORMALIZATION_MODEL", "normalization-model"),
+        patch.object(copilot_client.settings, "COPILOT_NORMALIZATION_REASONING_EFFORT", "high"),
+        patch("illdashboard.copilot.client._get_client", new=AsyncMock(return_value=client)),
+    ):
+        result = await copilot_client._ask("system", "user", request_name="normalize_marker_names")
+
+    assert result == "ok"
+    session_config = client.create_session.await_args.args[0]
+    assert session_config["model"] == "normalization-model"
+    assert "reasoning_effort" not in session_config
+    client.list_models.assert_awaited_once()
 
 
 @pytest.mark.asyncio
