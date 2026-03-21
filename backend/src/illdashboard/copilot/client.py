@@ -396,9 +396,10 @@ async def _ask(
                                 request_settings.reasoning_effort,
                                 exc,
                             )
-                            session_config.pop("reasoning_effort", None)
+                            retry_session_config = dict(session_config)
+                            retry_session_config.pop("reasoning_effort", None)
                             applied_reasoning_effort = None
-                            session = await client.create_session(session_config)
+                            session = await client.create_session(retry_session_config)
 
                         session_create_ms = (time.perf_counter() - session_create_started_at) * 1000
                         logger.info(

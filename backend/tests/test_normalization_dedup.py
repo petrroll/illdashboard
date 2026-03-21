@@ -282,6 +282,45 @@ async def test_common_canonize_handlers_use_fresh_job_session(session_factory):
 
 
 @pytest.mark.asyncio
+async def test_worker_failure_handler_survives_expired_jobs_after_rollback(session_factory):
+    runtime = pipeline.PipelineRuntime(session_factory)
+
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="rollback.png",
+            filepath="/tmp/rollback.png",
+            mime_type="image/png",
+        )
+        session.add(lab_file)
+        await session.flush()
+
+        job = Job(
+            file_id=lab_file.id,
+            task_type=pipeline.TASK_CANONIZE_MARKER,
+            task_key="rollback-marker",
+            status=job_service.JOB_STATUS_LEASED,
+            lease_owner="test-runtime",
+            lease_until=utc_now() + timedelta(minutes=5),
+            payload_json=job_service.json_dumps({}),
+        )
+        session.add(job)
+        await session.commit()
+
+        job_id = job.id
+        leased_jobs = list((await session.execute(select(Job).where(Job.id == job_id))).scalars())
+
+        await session.rollback()
+        await runtime._handle_worker_failure(session, leased_jobs, RuntimeError("boom"))
+        await session.commit()
+
+        refreshed = await session.get(Job, job_id)
+
+    assert refreshed is not None
+    assert refreshed.status == job_service.JOB_STATUS_PENDING
+    assert refreshed.error_text == "boom"
+
+
+@pytest.mark.asyncio
 async def test_enqueue_job_marks_rerun_requested_while_task_is_leased(session_factory):
     async with session_factory() as session:
         lab_file = LabFile(
@@ -451,6 +490,72 @@ async def test_apply_known_measurement_rules_marks_unusable_unit_normalization_a
 
     assert measurement.normalization_status == pipeline.MEASUREMENT_STATE_ERROR
     assert measurement.normalization_error == "Unsupported unit normalization for Glucose"
+
+
+@pytest.mark.asyncio
+async def test_apply_known_measurement_rules_falls_back_to_original_value_when_scale_factor_is_null(
+    session_factory,
+):
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="null-scale.png",
+            filepath="/tmp/null-scale.png",
+            mime_type="image/png",
+        )
+        group = MarkerGroup(name="Blood Function Test", display_order=10)
+        measurement_type = MeasurementType(
+            name="Absolute Lymphocyte Count",
+            normalized_key="absolute lymphocyte count",
+            group_name=group.name,
+            group=group,
+            canonical_unit="10^9/L",
+        )
+        alias = MeasurementAlias(
+            alias_name="Lymphozyten gesamt",
+            normalized_key=normalize_marker_alias_key("Lymphozyten gesamt"),
+            measurement_type=measurement_type,
+        )
+        measurement = Measurement(
+            lab_file=lab_file,
+            raw_marker_name="Lymphozyten gesamt",
+            normalized_marker_key=normalize_marker_alias_key("Lymphozyten gesamt"),
+            original_value=1033,
+            original_unit="Zellen/µl",
+        )
+        session.add_all([lab_file, group, measurement_type, alias, measurement])
+        await session.flush()
+        await rescaling.upsert_rescaling_rules(
+            session,
+            [
+                {
+                    "measurement_type": measurement_type,
+                    "original_unit": "Zellen/µl",
+                    "canonical_unit": "10^9/L",
+                    "scale_factor": None,
+                }
+            ],
+        )
+        await session.commit()
+
+        await pipeline._apply_known_measurement_rules(session, [measurement])
+        await session.commit()
+        await session.refresh(measurement)
+        missing_ids = await rescaling.annotate_missing_rescaling_measurements(session, [measurement])
+        conversion_jobs = list(
+            (
+                await session.execute(
+                    select(Job).where(Job.task_type == pipeline.TASK_CANONIZE_CONVERSION)
+                )
+            ).scalars()
+        )
+
+    assert measurement.normalization_status == pipeline.MEASUREMENT_STATE_RESOLVED
+    assert measurement.normalization_error is None
+    assert measurement.canonical_unit == "10^9/L"
+    assert measurement.canonical_value is None
+    assert measurement.id in missing_ids
+    assert getattr(measurement, "unit_conversion_missing", False) is True
+    assert conversion_jobs == []
 
 
 @pytest.mark.asyncio

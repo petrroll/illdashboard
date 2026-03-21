@@ -32,8 +32,8 @@ Write a short markdown explanation with these sections:
 
 Do not add a generic caution or disclaimer section. Do not say that this is not a diagnosis and do
 not tell the user to ask a clinician unless the supplied data itself requires a specific limitation
-to be mentioned. The user already understands this is not medical advice, so no disclaimer is
-necessary. If only a single value is supplied, do not dwell on the lack of a trend; focus on
+to be mentioned. The user already understands this is not medical advice, so no disclaimer is necessary.
+If only a single value is supplied, do not dwell on the lack of a trend; focus on
 explaining what that value means.
 
 Keep the language plain, factual, and concise. Do not invent causes that are not \

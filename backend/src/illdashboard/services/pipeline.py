@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TypeVar
 
 import fitz
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, inspect, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
@@ -362,8 +362,11 @@ class PipelineRuntime:
                 await asyncio.sleep(WORKER_IDLE_SECONDS)
 
     async def _handle_worker_failure(self, session: AsyncSession, jobs: list[Job], exc: Exception) -> None:
-        for job in jobs:
-            refreshed = await session.get(Job, job.id)
+        # AsyncSession.rollback() expires ORM attributes, so derive stable identity
+        # keys from the instance state before refreshing the rows in this session.
+        job_ids = [identity[0] for job in jobs if (identity := inspect(job).identity) and isinstance(identity[0], int)]
+        for job_id in job_ids:
+            refreshed = await session.get(Job, job_id)
             if refreshed is None or refreshed.status != job_service.JOB_STATUS_LEASED:
                 continue
             if refreshed.attempt_count < MAX_JOB_ATTEMPTS:
@@ -1208,17 +1211,26 @@ async def _canonize_marker_jobs(session: AsyncSession, jobs: list[Job]) -> None:
 
     started_at = _log_batch_span_start(TASK_CANONIZE_MARKER, [job for _, job in marker_jobs])
     raw_name_result = await session.execute(
-        select(Measurement.normalized_marker_key, Measurement.raw_marker_name)
+        select(Measurement.normalized_marker_key, Measurement.raw_marker_name, Measurement.original_unit)
         .where(Measurement.normalized_marker_key.in_(marker_keys))
-        .order_by(Measurement.normalized_marker_key.asc(), Measurement.raw_marker_name.asc())
+        .order_by(
+            Measurement.normalized_marker_key.asc(),
+            Measurement.raw_marker_name.asc(),
+            Measurement.original_unit.asc(),
+        )
     )
     raw_names_by_key: dict[str, list[str]] = {}
-    for marker_key, raw_name in raw_name_result.all():
+    observed_units_by_key: dict[str, list[str]] = {}
+    for marker_key, raw_name, original_unit in raw_name_result.all():
         if not raw_name:
             continue
         names = raw_names_by_key.setdefault(marker_key, [])
         if raw_name not in names and len(names) < 8:
             names.append(raw_name)
+        if original_unit:
+            units = observed_units_by_key.setdefault(marker_key, [])
+            if original_unit not in units and len(units) < 8:
+                units.append(original_unit)
 
     all_raw_names = [name for names in raw_names_by_key.values() for name in names]
     unresolved_names_by_key: dict[str, str] = {}
@@ -1235,10 +1247,20 @@ async def _canonize_marker_jobs(session: AsyncSession, jobs: list[Job]) -> None:
         )
         existing_canonical = existing_canonical_result.scalars().all()
         representative_names = list(unresolved_names_by_key.values())
+        raw_examples_by_name = {
+            representative_name: raw_names_by_key.get(marker_key, [representative_name])
+            for marker_key, representative_name in unresolved_names_by_key.items()
+        }
+        observed_units_by_name = {
+            representative_name: observed_units_by_key.get(marker_key, [])
+            for marker_key, representative_name in unresolved_names_by_key.items()
+        }
         await _commit_before_external_normalization_call(session)
         normalized_map = await copilot_normalization.normalize_marker_names(
             representative_names,
             existing_canonical,
+            raw_examples_by_name=raw_examples_by_name,
+            observed_units_by_name=observed_units_by_name,
         )
         canonical_names = [
             normalized_map.get(representative_name, representative_name)
@@ -1885,7 +1907,7 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
                     else:
                         task_key = _conversion_task_key(measurement_type.normalized_key, original_key, canonical_key)
                         rule = conversion_rule_map.get((measurement_type.id, original_key, canonical_key))
-                        if rule is None or rule.scale_factor is None:
+                        if rule is None:
                             if conversion_job_statuses.get(task_key) == job_service.JOB_STATUS_FAILED:
                                 measurement.normalization_status = MEASUREMENT_STATE_ERROR
                                 measurement.normalization_error = (
@@ -1907,6 +1929,17 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
                                 or requested_new_work
                             )
                             resolved = False
+                        elif rule.scale_factor is None:
+                            # A persisted null scale factor means the
+                            # normalization lane already concluded there is no
+                            # safe simple multiplicative conversion for this
+                            # unit pair, so re-enqueueing would only spin.
+                            # Keep the measurement resolved and let the API/UI
+                            # fall back to the original value/unit with a
+                            # conversion-missing warning.
+                            measurement.normalization_status = MEASUREMENT_STATE_RESOLVED
+                            measurement.normalization_error = None
+                            continue
                         else:
                             measurement.canonical_value = rescaling.apply_scale_factor(
                                 measurement.original_value, rule.scale_factor
