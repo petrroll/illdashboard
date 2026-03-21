@@ -324,6 +324,8 @@ export default function MarkerChart() {
   const summarySource = detail ?? selectedOverviewItem ?? null;
   const refLow = summarySource?.reference_low ?? null;
   const refHigh = summarySource?.reference_high ?? null;
+  const refLowLabel = refLow == null ? null : `Low ${formatSignificantValue(refLow)}`;
+  const refHighLabel = refHigh == null ? null : `High ${formatSignificantValue(refHigh)}`;
 
   const unit = getDisplayUnit(latestChartMeasurement?.canonical_unit) ?? "";
   const yAxisScale = useMemo(() => {
@@ -785,10 +787,10 @@ export default function MarkerChart() {
                           <ReferenceArea y1={refLow} y2={refHigh} fill="#12c78e" fillOpacity={0.1} />
                         )}
                         {refLow != null && (
-                          <ReferenceLine y={refLow} stroke="#12c78e" strokeDasharray="5 5" label="Low" />
+                          <ReferenceLine y={refLow} stroke="#12c78e" strokeDasharray="5 5" label={refLowLabel} />
                         )}
                         {refHigh != null && (
-                          <ReferenceLine y={refHigh} stroke="#f85149" strokeDasharray="5 5" label="High" />
+                          <ReferenceLine y={refHigh} stroke="#f85149" strokeDasharray="5 5" label={refHighLabel} />
                         )}
                         <Line
                           type="monotone"
