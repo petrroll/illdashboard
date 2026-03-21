@@ -15,7 +15,15 @@ from pathlib import Path
 
 import fitz
 
-from illdashboard.copilot.client import COPILOT_REQUEST_TIMEOUT, _ask_json, get_copilot_request_load
+from illdashboard.config import settings
+from illdashboard.copilot import mistral_client
+from illdashboard.copilot.client import (
+    COPILOT_REQUEST_TIMEOUT,
+    get_copilot_request_load,
+)
+from illdashboard.copilot.client import (
+    _ask_json as copilot_ask_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +260,99 @@ Do not include any commentary outside the JSON.\
 """
 
 
+MISTRAL_TRANSLATE_TEXT_SYSTEM_PROMPT = """\
+You translate OCR text into English.
+
+Rules:
+- Preserve the original ordering and meaning of the document.
+- Keep marker names, numbers, ranges, and units exact.
+- If the source text is already English, return it unchanged except for obvious OCR cleanup.
+- Return only the translated text and nothing else.\
+"""
+
+
+MISTRAL_MEDICAL_ANNOTATION_FORMAT = {
+    "type": "json_schema",
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "lab_date": {
+                "type": ["string", "null"],
+                "description": "Report date as an ISO date string when visible, otherwise null.",
+            },
+            "source": {
+                "type": ["string", "null"],
+                "description": "Short raw lab or provider name when visible, otherwise null.",
+            },
+            "measurements": {
+                "type": "array",
+                "description": "Every measured lab value found in the document, including qualitative results.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "marker_name": {
+                            "type": "string",
+                            "description": (
+                                "Specific lab marker name, including organism and antibody class when present."
+                            ),
+                        },
+                        "value": {
+                            "description": "Numeric results as numbers and qualitative results as short strings.",
+                            "anyOf": [{"type": "number"}, {"type": "string"}],
+                        },
+                        "unit": {
+                            "type": ["string", "null"],
+                            "description": "Reported unit or null when none is shown.",
+                        },
+                        "reference_low": {
+                            "type": ["number", "null"],
+                            "description": "Lower reference bound when present, otherwise null.",
+                        },
+                        "reference_high": {
+                            "type": ["number", "null"],
+                            "description": "Upper reference bound when present, otherwise null.",
+                        },
+                        "measured_at": {
+                            "type": ["string", "null"],
+                            "description": "ISO date string for the measurement when explicitly shown, otherwise null.",
+                        },
+                        "page_number": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "1-indexed page number within the attached batch.",
+                        },
+                    },
+                    "required": [
+                        "marker_name",
+                        "value",
+                        "unit",
+                        "reference_low",
+                        "reference_high",
+                        "measured_at",
+                        "page_number",
+                    ],
+                },
+            },
+        },
+        "required": ["lab_date", "source", "measurements"],
+    },
+}
+
+
+MISTRAL_MEDICAL_ANNOTATION_PROMPT = """\
+Extract all lab values from this lab report.
+
+Requirements:
+- Include every measured marker, including qualitative serology and immunology results.
+- Keep marker names specific.
+- Use a JSON number for numeric values and a short string for qualitative values.
+- Set page_number relative to the attached batch, starting from 1.
+- Return an empty measurements array when the document is not a lab report.\
+"""
+
+
 MEDICAL_SUMMARY_SYSTEM_PROMPT = """\
 You are a medical document summarization assistant.
 
@@ -361,7 +462,7 @@ async def _extract_structured_medical_data_from_attachments(
     if filename:
         prompt = f"Original filename: {filename}\n\n{prompt}"
 
-    return await _ask_json(
+    return await copilot_ask_json(
         MEDICAL_OCR_SYSTEM_PROMPT,
         prompt,
         attachments=attachments,
@@ -371,12 +472,17 @@ async def _extract_structured_medical_data_from_attachments(
     )
 
 
-async def _extract_document_text_from_attachments(attachments: list[dict], *, filename: str | None = None, request_context: str = "") -> dict:
+async def _extract_document_text_from_attachments(
+    attachments: list[dict],
+    *,
+    filename: str | None = None,
+    request_context: str = "",
+) -> dict:
     prompt = "Transcribe all visible text from the attached document and translate it to English."
     if filename:
         prompt = f"Original filename: {filename}\n\n{prompt}"
 
-    return await _ask_json(
+    return await copilot_ask_json(
         TEXT_OCR_SYSTEM_PROMPT,
         prompt,
         attachments=attachments,
@@ -386,11 +492,94 @@ async def _extract_document_text_from_attachments(attachments: list[dict], *, fi
     )
 
 
-async def _generate_medical_summary(
-    raw_text: str | None,
+def _normalized_medical_annotation(annotation: dict) -> dict:
+    measurements = annotation.get("measurements")
+    if not isinstance(measurements, list):
+        measurements = []
+    return {
+        "lab_date": annotation.get("lab_date"),
+        "source": annotation.get("source"),
+        "measurements": [measurement for measurement in measurements if isinstance(measurement, dict)],
+    }
+
+
+async def _extract_structured_medical_data_from_file_mistral(
+    file_path: str,
+    *,
+    start_page: int | None = None,
+    stop_page: int | None = None,
+    filename: str | None = None,
+    request_context: str = "",
+) -> dict:
+    prompt = MISTRAL_MEDICAL_ANNOTATION_PROMPT
+    if filename:
+        prompt = f"Original filename: {filename}\n\n{prompt}"
+    result = await mistral_client.process_ocr_file(
+        file_path,
+        start_page=start_page,
+        stop_page=stop_page,
+        request_name="structured_medical_extraction",
+        request_context=request_context,
+        document_annotation_format=MISTRAL_MEDICAL_ANNOTATION_FORMAT,
+        document_annotation_prompt=prompt,
+        timeout=OCR_ASK_TIMEOUT,
+    )
+    return _normalized_medical_annotation(mistral_client.document_annotation(result))
+
+
+async def _translate_document_text_to_english_mistral(
+    raw_text: str,
     *,
     filename: str | None = None,
-) -> dict[str, str | None]:
+    request_context: str = "",
+) -> str:
+    prompt = raw_text.strip()
+    if filename:
+        prompt = f"Original filename: {filename}\n\nOCR text:\n{prompt}"
+    translated = await mistral_client.ask_text(
+        MISTRAL_TRANSLATE_TEXT_SYSTEM_PROMPT,
+        prompt,
+        request_name="document_text_translation",
+        request_context=request_context,
+        timeout=OCR_ASK_TIMEOUT,
+    )
+    cleaned = translated.strip()
+    if not cleaned:
+        raise RuntimeError("Mistral translation returned empty text")
+    return cleaned
+
+
+async def _extract_document_text_from_file_mistral(
+    file_path: str,
+    *,
+    start_page: int | None = None,
+    stop_page: int | None = None,
+    filename: str | None = None,
+    request_context: str = "",
+) -> dict:
+    result = await mistral_client.process_ocr_file(
+        file_path,
+        start_page=start_page,
+        stop_page=stop_page,
+        request_name="document_text_extraction",
+        request_context=request_context,
+        timeout=OCR_ASK_TIMEOUT,
+    )
+    raw_text = mistral_client.document_markdown_text(result).strip()
+    if not raw_text:
+        return {"raw_text": None, "translated_text_english": None}
+    translated = await _translate_document_text_to_english_mistral(
+        raw_text,
+        filename=filename,
+        request_context=request_context,
+    )
+    return {
+        "raw_text": raw_text,
+        "translated_text_english": translated,
+    }
+
+
+async def _generate_medical_summary(raw_text: str | None, *, filename: str | None = None) -> dict[str, str | None]:
     started_at = time.perf_counter()
     logger.info(
         "Medical summary start filename=%s raw_text=%s",
@@ -403,7 +592,7 @@ async def _generate_medical_summary(
         "filename": filename,
         "raw_text": raw_text,
     }
-    parsed = await _ask_json(
+    parsed = await copilot_ask_json(
         MEDICAL_SUMMARY_SYSTEM_PROMPT,
         json.dumps(user_payload, ensure_ascii=False, indent=2),
         request_name="medical_summary",
@@ -488,6 +677,23 @@ def _combine_ocr_outputs(medical_result: dict, text_result: dict | None, summary
     if summary_result and summary_result.get("summary_english"):
         combined["summary_english"] = summary_result["summary_english"]
     return combined
+
+
+def _pdf_page_count(file_path: str) -> int:
+    with fitz.open(file_path) as document:
+        return document.page_count
+
+
+def _mistral_request_context(
+    filename: str | None,
+    *,
+    start_page: int | None = None,
+    stop_page: int | None = None,
+) -> str:
+    label = filename or "document"
+    if start_page is not None and stop_page is not None:
+        return f"{label}:p{start_page + 1}-{stop_page}"
+    return f"{label}:full"
 
 
 @dataclass(frozen=True)
@@ -938,36 +1144,62 @@ async def ocr_extract(
     """Run the full OCR extraction pipeline for one uploaded file."""
     started_at = time.perf_counter()
     logger.info("OCR pipeline start path=%s filename=%s", file_path, filename)
-    render_cache = (
-        _PdfRenderCache(file_path) if Path(file_path).suffix.lower() == ".pdf" else _ImageRenderCache(file_path)
-    )
     usable_text_result: dict | None = None
     summary_result: dict | None = None
     medical_task: asyncio.Task[dict] | None = None
     text_task: asyncio.Task[dict] | None = None
+    render_cache: _PdfRenderCache | _ImageRenderCache | None = None
 
-    async def _extract_medical_result() -> dict:
-        if on_medical_batch is None:
-            return await _extract_file(file_path, _MEDICAL_EXTRACTION, filename=filename, render_cache=render_cache)
+    if settings.EXTRACTION_PROVIDER == "mistral":
 
-        medical_batches: list[_ExtractionBatch] = []
-        async for batch in _extract_file_batches(
-            file_path,
-            _MEDICAL_EXTRACTION,
-            filename=filename,
-            render_cache=render_cache,
-        ):
-            medical_batches.append(batch)
-            await on_medical_batch(batch.batch_index, batch.result)
+        async def _extract_medical_result() -> dict:
+            start_page = 0 if Path(file_path).suffix.lower() == ".pdf" else None
+            stop_page = _pdf_page_count(file_path) if start_page is not None else None
+            result = await _extract_structured_medical_data_from_file_mistral(
+                file_path,
+                start_page=start_page,
+                stop_page=stop_page,
+                filename=filename,
+                request_context=_mistral_request_context(filename, start_page=start_page, stop_page=stop_page),
+            )
+            # Mistral OCR processes the requested file range directly, so the
+            # optional callback becomes one whole-file batch notification.
+            if on_medical_batch is not None:
+                await on_medical_batch(0, result)
+            return result
 
-        return _MEDICAL_EXTRACTION.merge_fn(
-            [batch.result for batch in sorted(medical_batches, key=lambda current: current.batch_index)]
+        medical_task = asyncio.create_task(_extract_medical_result(), name="ocr:medical")
+        text_task = asyncio.create_task(
+            _extract_document_text_from_file_mistral(
+                file_path,
+                filename=filename,
+                request_context=_mistral_request_context(filename),
+            ),
+            name="ocr:text",
+        )
+    else:
+        render_cache = (
+            _PdfRenderCache(file_path) if Path(file_path).suffix.lower() == ".pdf" else _ImageRenderCache(file_path)
         )
 
-    try:
-        # Keep batch-streaming for medical extraction, but let full-document
-        # text OCR run at the same time so the durable pipeline helper and the
-        # single-call helper do not serialize independent OCR work.
+        async def _extract_medical_result() -> dict:
+            if on_medical_batch is None:
+                return await _extract_file(file_path, _MEDICAL_EXTRACTION, filename=filename, render_cache=render_cache)
+
+            medical_batches: list[_ExtractionBatch] = []
+            async for batch in _extract_file_batches(
+                file_path,
+                _MEDICAL_EXTRACTION,
+                filename=filename,
+                render_cache=render_cache,
+            ):
+                medical_batches.append(batch)
+                await on_medical_batch(batch.batch_index, batch.result)
+
+            return _MEDICAL_EXTRACTION.merge_fn(
+                [batch.result for batch in sorted(medical_batches, key=lambda current: current.batch_index)]
+            )
+
         medical_task = asyncio.create_task(_extract_medical_result(), name="ocr:medical")
         text_task = asyncio.create_task(
             extract_text(
@@ -978,6 +1210,7 @@ async def ocr_extract(
             name="ocr:text",
         )
 
+    try:
         try:
             medical_result = await medical_task
         except Exception:
@@ -1016,8 +1249,8 @@ async def ocr_extract(
                 time.perf_counter() - started_at,
             )
             try:
-                # Keep text OCR and summarization in separate calls so each text
-                # batch stays small and summary sees the fully merged document.
+                # Keep text OCR and summarization in separate calls so summary
+                # always sees the merged document text, independent of provider.
                 summary_result = await generate_summary(
                     (usable_text_result or {}).get("raw_text"),
                     filename=filename,
@@ -1068,7 +1301,14 @@ async def extract_text(
     )
 
     try:
-        result = await _extract_file(file_path, _TEXT_EXTRACTION, filename=filename, render_cache=render_cache)
+        if settings.EXTRACTION_PROVIDER == "mistral":
+            result = await _extract_document_text_from_file_mistral(
+                file_path,
+                filename=filename,
+                request_context=_mistral_request_context(filename),
+            )
+        else:
+            result = await _extract_file(file_path, _TEXT_EXTRACTION, filename=filename, render_cache=render_cache)
         logger.info(
             "Document text extraction finished path=%s filename=%s has_raw_text=%s has_translated_text=%s "
             "duration=%.2fs",
@@ -1097,6 +1337,19 @@ async def extract_measurement_batch(
     dpi: int,
     filename: str | None = None,
 ) -> dict:
+    if settings.EXTRACTION_PROVIDER == "mistral":
+        pdf_range = Path(file_path).suffix.lower() == ".pdf"
+        return await _extract_structured_medical_data_from_file_mistral(
+            file_path,
+            start_page=start_page if pdf_range else None,
+            stop_page=stop_page if pdf_range else None,
+            filename=filename,
+            request_context=_mistral_request_context(
+                filename,
+                start_page=start_page if pdf_range else None,
+                stop_page=stop_page if pdf_range else None,
+            ),
+        )
     if Path(file_path).suffix.lower() != ".pdf":
         return await _image_with_retries(
             file_path,
@@ -1126,6 +1379,19 @@ async def extract_text_batch(
     dpi: int,
     filename: str | None = None,
 ) -> dict:
+    if settings.EXTRACTION_PROVIDER == "mistral":
+        pdf_range = Path(file_path).suffix.lower() == ".pdf"
+        return await _extract_document_text_from_file_mistral(
+            file_path,
+            start_page=start_page if pdf_range else None,
+            stop_page=stop_page if pdf_range else None,
+            filename=filename,
+            request_context=_mistral_request_context(
+                filename,
+                start_page=start_page if pdf_range else None,
+                stop_page=stop_page if pdf_range else None,
+            ),
+        )
     if Path(file_path).suffix.lower() != ".pdf":
         return await _image_with_retries(
             file_path,

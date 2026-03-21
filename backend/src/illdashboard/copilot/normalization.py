@@ -11,11 +11,19 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
-from illdashboard.copilot.client import COPILOT_REQUEST_TIMEOUT, _ask
+from illdashboard.config import settings
+from illdashboard.copilot import mistral_client
+from illdashboard.copilot.client import (
+    COPILOT_REQUEST_TIMEOUT,
+)
+from illdashboard.copilot.client import (
+    _ask as copilot_ask,
+)
 from illdashboard.services.markers import normalize_marker_alias_key
 from illdashboard.services.rescaling import normalize_unit_key
 
 logger = logging.getLogger(__name__)
+_ask = copilot_ask
 
 
 # Real marker normalization runs can still exceed 180s, and this lane stays
@@ -56,6 +64,15 @@ async def _ask_json(
     default: dict | None = None,
     request_name: str = "normalization_json_request",
 ) -> dict:
+    if settings.NORMALIZATION_PROVIDER == "mistral":
+        return await mistral_client._ask_json(
+            system_prompt,
+            user_prompt,
+            request_name=request_name,
+            timeout=timeout,
+            default=default,
+        )
+
     from illdashboard.copilot.client import _format_json_user_prompt, _parse_json_response, _repair_json_response
 
     raw = await _ask(

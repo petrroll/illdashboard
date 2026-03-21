@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 from illdashboard.copilot import client as copilot_client
 from illdashboard.copilot import explanations as copilot_explanations
 from illdashboard.copilot import extraction as copilot_ocr
+from illdashboard.copilot import mistral_client
 from illdashboard.copilot import normalization as copilot_normalization
 from illdashboard.services import pipeline
 
@@ -82,6 +84,18 @@ class DummyDoc:
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class DummyAsyncMistralClient:
+    def __init__(self, *, ocr_response=None, chat_response=None):
+        self.ocr = SimpleNamespace(process_async=AsyncMock(return_value=ocr_response))
+        self.chat = SimpleNamespace(complete_async=AsyncMock(return_value=chat_response))
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
         return False
 
 
@@ -480,6 +494,163 @@ async def test_extract_text_batch_uses_retrying_pdf_range_path():
         ("/tmp/report.pdf", 0, 1, 144),
         ("/tmp/report.pdf", 1, 2, 144),
     ]
+
+
+@pytest.mark.asyncio
+async def test_extract_measurement_batch_uses_direct_mistral_file_path_when_configured():
+    with (
+        patch.object(copilot_ocr.settings, "EXTRACTION_PROVIDER", "mistral"),
+        patch(
+            "illdashboard.copilot.extraction._extract_structured_medical_data_from_file_mistral",
+            new=AsyncMock(
+                return_value={
+                    "lab_date": None,
+                    "source": None,
+                    "measurements": [
+                        {
+                            "marker_name": "Sodium",
+                            "value": 141,
+                            "unit": "mmol/l",
+                            "reference_low": 136,
+                            "reference_high": 145,
+                            "measured_at": None,
+                            "page_number": 1,
+                        }
+                    ],
+                }
+            ),
+        ) as extract_mock,
+    ):
+        result = await copilot_ocr.extract_measurement_batch(
+            "/tmp/report.pdf",
+            start_page=0,
+            stop_page=1,
+            dpi=144,
+        )
+
+    assert result["measurements"][0]["marker_name"] == "Sodium"
+    extract_mock.assert_awaited_once_with(
+        "/tmp/report.pdf",
+        start_page=0,
+        stop_page=1,
+        filename=None,
+        request_context="document:p1-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_extract_text_batch_uses_direct_mistral_file_path_when_configured():
+    with (
+        patch.object(copilot_ocr.settings, "EXTRACTION_PROVIDER", "mistral"),
+        patch(
+            "illdashboard.copilot.extraction._extract_document_text_from_file_mistral",
+            new=AsyncMock(return_value={"raw_text": "rohtext", "translated_text_english": "raw text"}),
+        ) as extract_mock,
+    ):
+        result = await copilot_ocr.extract_text_batch(
+            "/tmp/report.pdf",
+            start_page=0,
+            stop_page=1,
+            dpi=144,
+        )
+
+    assert result == {
+        "raw_text": "rohtext",
+        "translated_text_english": "raw text",
+    }
+    extract_mock.assert_awaited_once_with(
+        "/tmp/report.pdf",
+        start_page=0,
+        stop_page=1,
+        filename=None,
+        request_context="document:p1-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_mistral_process_ocr_file_slices_requested_pdf_range(tmp_path):
+    pdf_path = tmp_path / "report.pdf"
+    document = fitz.open()
+    for _ in range(3):
+        document.new_page(width=200, height=200)
+    document.save(pdf_path)
+    document.close()
+
+    sdk_client = DummyAsyncMistralClient(ocr_response={"pages": []})
+    with patch(
+        "illdashboard.copilot.mistral_client._sdk_client",
+        return_value=sdk_client,
+    ):
+        result = await mistral_client.process_ocr_file(
+            str(pdf_path),
+            start_page=1,
+            stop_page=3,
+            request_name="structured_medical_extraction",
+        )
+
+    assert result == {"pages": []}
+    document_payload = sdk_client.ocr.process_async.await_args.kwargs["document"]
+    assert document_payload["type"] == "document_url"
+    encoded_pdf = document_payload["document_url"].split(",", 1)[1]
+    sliced_pdf = fitz.open(stream=base64.b64decode(encoded_pdf), filetype="pdf")
+    try:
+        assert sliced_pdf.page_count == 2
+    finally:
+        sliced_pdf.close()
+
+
+@pytest.mark.asyncio
+async def test_mistral_process_ocr_file_uses_image_url_for_images(tmp_path):
+    image_path = tmp_path / "page.png"
+    pixmap = fitz.Pixmap(fitz.csGRAY, fitz.IRect(0, 0, 16, 16), False)
+    pixmap.clear_with(200)
+    pixmap.save(image_path)
+
+    sdk_client = DummyAsyncMistralClient(ocr_response={"pages": []})
+    with patch(
+        "illdashboard.copilot.mistral_client._sdk_client",
+        return_value=sdk_client,
+    ):
+        await mistral_client.process_ocr_file(
+            str(image_path),
+            request_name="document_text_extraction",
+        )
+
+    document_payload = sdk_client.ocr.process_async.await_args.kwargs["document"]
+    assert document_payload["type"] == "image_url"
+    assert document_payload["image_url"].startswith("data:image/png;base64,")
+
+
+def test_mistral_document_annotation_falls_back_to_page_annotations():
+    result = {
+        "pages": [
+            {
+                "index": 1,
+                "annotations": {
+                    "lab_date": None,
+                    "source": "Example Lab",
+                    "measurements": [],
+                },
+            }
+        ]
+    }
+
+    assert mistral_client.document_annotation(result)["source"] == "Example Lab"
+
+
+@pytest.mark.asyncio
+async def test_normalization_ask_json_routes_to_mistral_when_configured():
+    with (
+        patch.object(copilot_normalization.settings, "NORMALIZATION_PROVIDER", "mistral"),
+        patch(
+            "illdashboard.copilot.normalization.mistral_client._ask_json",
+            new=AsyncMock(return_value={"ok": True}),
+        ) as ask_mock,
+    ):
+        result = await copilot_normalization._ask_json("system", "user", request_name="normalize_marker_names")
+
+    assert result == {"ok": True}
+    ask_mock.assert_awaited_once()
 
 
 @pytest.mark.asyncio

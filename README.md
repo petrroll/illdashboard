@@ -114,11 +114,22 @@ Newer logs also emit file-aware task spans for summary, search, text assembly, m
 
 ## Configuration
 
-Environment variables (or `.env` file in `backend/`):
+Environment variables (or a local `.env` file in `backend/`):
 
 | Variable | Default | Description |
 |---|---|---|
 | `GITHUB_TOKEN` | (required) | GitHub token with Copilot access |
-| `COPILOT_MODEL` | `gpt-5.4` | Model to use for OCR and explanations |
+| `EXTRACTION_PROVIDER` | `copilot` | Global extraction provider: `copilot` or `mistral` |
+| `NORMALIZATION_PROVIDER` | `copilot` | Global normalization provider: `copilot` or `mistral` |
+| `COPILOT_DEFAULT_MODEL` | `gpt-5.4` | Default Copilot model for summary and general requests |
+| `COPILOT_MEASUREMENT_EXTRACTION_MODEL` | `gpt-5.4-mini` | Copilot model for measurement extraction |
+| `COPILOT_TEXT_EXTRACTION_MODEL` | `gpt-5.4-mini` | Copilot model for text OCR and translation |
+| `COPILOT_NORMALIZATION_MODEL` | `gpt-5.4-mini` | Copilot model for normalization jobs |
+| `MISTRAL_API_KEY` | (optional) | Local-only Mistral API key; keep it in env or an untracked `.env`, never in committed files |
+| `MISTRAL_API_BASE_URL` | `https://api.mistral.ai` | Base URL for the Mistral API |
+| `MISTRAL_OCR_MODEL` | `mistral-ocr-latest` | Mistral OCR/Document AI model used for OCR and annotations |
+| `MISTRAL_CHAT_MODEL` | `mistral-large-latest` | Mistral chat model used for translation and normalization |
 | `DATABASE_URL` | `sqlite+aiosqlite:///./data/health.db` | SQLite database path |
 | `UPLOAD_DIR` | `backend/data/uploads` | Directory for uploaded files |
+
+If you switch `EXTRACTION_PROVIDER=mistral`, measurement extraction uses Mistral Document AI annotations and text OCR uses Mistral OCR plus an English translation step through the configured Mistral chat model.
