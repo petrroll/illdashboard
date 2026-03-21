@@ -758,6 +758,27 @@ async def test_normalize_marker_names_reuses_new_canonical_names_across_batches(
 
 
 @pytest.mark.asyncio
+async def test_normalize_marker_names_includes_raw_examples_and_units_in_prompt():
+    with patch(
+        "illdashboard.copilot.normalization._ask",
+        new=AsyncMock(return_value='{"Lymphozyten gesamt": "Absolute Lymphocyte Count"}'),
+    ) as ask_mock:
+        result = await copilot_normalization.normalize_marker_names(
+            ["Lymphozyten gesamt"],
+            ["Lymphocytes", "Absolute Lymphocyte Count"],
+            raw_examples_by_name={"Lymphozyten gesamt": ["Lymphozyten gesamt", "Lymphocytes total"]},
+            observed_units_by_name={"Lymphozyten gesamt": ["Zellen/µl", "10^9/L"]},
+        )
+
+    assert result == {"Lymphozyten gesamt": "Absolute Lymphocyte Count"}
+    user_prompt = ask_mock.await_args.args[1]
+    assert "Raw examples:" in user_prompt
+    assert "Observed units:" in user_prompt
+    assert "Lymphocytes total" in user_prompt
+    assert "Zellen/µl" in user_prompt
+
+
+@pytest.mark.asyncio
 async def test_choose_canonical_units_skips_homogeneous_units_without_llm():
     with patch("illdashboard.copilot.normalization._ask", new=AsyncMock()) as ask_mock:
         result = await copilot_normalization.choose_canonical_units(
@@ -996,6 +1017,47 @@ async def test_ask_omits_reasoning_effort_for_models_without_support():
 
 
 @pytest.mark.asyncio
+async def test_ask_retries_session_create_without_reasoning_when_model_rejects_it():
+    session = DummySession(response=SimpleNamespace(data=SimpleNamespace(content="ok")))
+    client = SimpleNamespace(
+        create_session=AsyncMock(
+            side_effect=[
+                RuntimeError(
+                    "JSON-RPC Error -32603: Request session.create failed with message: "
+                    "Model 'gpt-5.4-mini' does not support reasoning effort configuration."
+                ),
+                session,
+            ]
+        ),
+        list_models=AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    id="normalization-model",
+                    capabilities=SimpleNamespace(
+                        supports=SimpleNamespace(reasoning_effort=True)
+                    ),
+                )
+            ]
+        ),
+    )
+
+    with (
+        patch.object(copilot_client.settings, "COPILOT_NORMALIZATION_MODEL", "normalization-model"),
+        patch.object(copilot_client.settings, "COPILOT_NORMALIZATION_REASONING_EFFORT", "high"),
+        patch("illdashboard.copilot.client._get_client", new=AsyncMock(return_value=client)),
+    ):
+        result = await copilot_client._ask("system", "user", request_name="normalize_marker_names")
+
+    assert result == "ok"
+    assert client.create_session.await_count == 2
+    first_config = client.create_session.await_args_list[0].args[0]
+    second_config = client.create_session.await_args_list[1].args[0]
+    assert first_config["reasoning_effort"] == "high"
+    assert "reasoning_effort" not in second_config
+    session.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_ask_logs_session_warning_payloads():
     session = WarningSession(response=SimpleNamespace(data=SimpleNamespace(content="ok")))
     client = SimpleNamespace(create_session=AsyncMock(return_value=session))
@@ -1192,5 +1254,8 @@ async def test_explain_marker_history_prompt_avoids_generic_caution_and_trend_fi
     assert ask_mock.await_args is not None
     system_prompt, user_prompt = ask_mock.await_args.args
     assert "Do not add a generic caution or disclaimer section" in system_prompt
+    assert "no disclaimer is necessary" in system_prompt
     assert "do not dwell on the lack of a trend" in system_prompt
-    assert "Please explain the history of Potassium." in user_prompt
+    assert "Please explain what the Potassium values mean based on these results." in user_prompt
+    assert "whether that is commonly seen" in user_prompt
+    assert "We understand this is not medical advice, so no disclaimer is necessary." in user_prompt
