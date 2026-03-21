@@ -120,7 +120,7 @@ function scoreAxisTicks(
 export function buildNiceNumericAxis(
   values: readonly number[],
   options?: {
-    highlightedValues?: readonly number[];
+    highlightedValues?: readonly (number | null | undefined)[];
     minTickCount?: number;
     targetTickCount?: number;
     maxTickCount?: number;
