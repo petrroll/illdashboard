@@ -103,4 +103,4 @@ async def set_marker_tags(marker_name: str, body: TagsUpdate, db: AsyncSession =
         for measurement in await marker_service.load_measurements_for_marker(db, marker_name)
         if measurement.normalization_status == VISIBLE_MEASUREMENT_STATUS
     ]
-    return marker_service.combine_marker_tags(unique_tags, measurement_type.group_name, len(measurements))
+    return marker_service.combine_marker_tags(unique_tags, measurement_type.group_name, measurements)

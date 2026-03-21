@@ -161,7 +161,7 @@ async def measurement_detail(
     marker_tags = marker_service.combine_marker_tags(
         list(tag_result.scalars().all()),
         measurement_type.group_name,
-        len(measurements),
+        measurements,
     )
     file_tags = marker_service.build_marker_file_tag_map({marker_name: measurements}).get(marker_name, [])
 

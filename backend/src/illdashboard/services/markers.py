@@ -76,6 +76,10 @@ async def load_marker_groups(db: AsyncSession) -> dict[str, MarkerGroup]:
 
 SINGLE_MEASUREMENT_TAG = "singlemeasurement"
 MULTIPLE_MEASUREMENTS_TAG = "multiplemeasurements"
+ONLY_IN_RANGE_TAG = "onlyinrange"
+MOSTLY_OUT_OF_RANGE_TAG = "mostlyoutofrange"
+OUT_OF_RANGE_TAG = "outofrange"
+NO_RANGE_TAG = "norange"
 SOURCE_TAG_PREFIX = "source:"
 
 
@@ -137,17 +141,57 @@ def marker_group_tag(group_name: str) -> str:
     return f"group:{group_name}"
 
 
-def derived_marker_tags(group_name: str, measurement_count: int) -> list[str]:
+def measurement_range_tag_bucket(measurement: Measurement) -> str:
+    status = measurement_status(measurement)
+    if status in {"negative", "in_range"}:
+        return "in_range"
+    if status in {"positive", "low", "high"}:
+        return "out_of_range"
+    return "no_range"
+
+
+def derived_range_tags(measurements: list[Measurement]) -> list[str]:
+    in_range_count = 0
+    out_of_range_count = 0
+    no_range_count = 0
+
+    # History-level tags should reflect each reading's own normalized status,
+    # not the marker-summary fallback range reused for the latest snapshot.
+    for measurement in measurements:
+        bucket = measurement_range_tag_bucket(measurement)
+        if bucket == "in_range":
+            in_range_count += 1
+        elif bucket == "out_of_range":
+            out_of_range_count += 1
+        else:
+            no_range_count += 1
+
+    derived_tags: list[str] = []
+    if in_range_count or out_of_range_count:
+        if out_of_range_count == 0:
+            derived_tags.append(ONLY_IN_RANGE_TAG)
+        elif in_range_count == 0:
+            derived_tags.append(OUT_OF_RANGE_TAG)
+        elif out_of_range_count > in_range_count:
+            derived_tags.append(MOSTLY_OUT_OF_RANGE_TAG)
+    if no_range_count:
+        derived_tags.append(NO_RANGE_TAG)
+    return derived_tags
+
+
+def derived_marker_tags(group_name: str, measurements: list[Measurement]) -> list[str]:
+    measurement_count = len(measurements)
     derived_tags = [marker_group_tag(group_name)] if group_name else []
     if measurement_count == 1:
         derived_tags.append(SINGLE_MEASUREMENT_TAG)
     elif measurement_count > 1:
         derived_tags.append(MULTIPLE_MEASUREMENTS_TAG)
+    derived_tags.extend(derived_range_tags(measurements))
     return derived_tags
 
 
-def combine_marker_tags(stored_tags: list[str], group_name: str, measurement_count: int) -> list[str]:
-    return normalize_unique_tags([*stored_tags, *derived_marker_tags(group_name, measurement_count)])
+def combine_marker_tags(stored_tags: list[str], group_name: str, measurements: list[Measurement]) -> list[str]:
+    return normalize_unique_tags([*stored_tags, *derived_marker_tags(group_name, measurements)])
 
 
 async def all_reserved_marker_tags(db: AsyncSession, group_name: str | None = None) -> set[str]:
@@ -155,6 +199,10 @@ async def all_reserved_marker_tags(db: AsyncSession, group_name: str | None = No
     reserved_tags = {
         SINGLE_MEASUREMENT_TAG,
         MULTIPLE_MEASUREMENTS_TAG,
+        ONLY_IN_RANGE_TAG,
+        MOSTLY_OUT_OF_RANGE_TAG,
+        OUT_OF_RANGE_TAG,
+        NO_RANGE_TAG,
         *(marker_group_tag(group) for group in group_names),
     }
     if group_name:
@@ -554,7 +602,7 @@ def build_marker_tag_map(
         marker_name: combine_marker_tags(
             stored_marker_tags.get(marker_name, []),
             marker_measurements[-1].group_name,
-            len(marker_measurements),
+            marker_measurements,
         )
         for marker_name, marker_measurements in by_marker.items()
     }

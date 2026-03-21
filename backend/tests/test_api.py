@@ -13,6 +13,7 @@ from illdashboard.models import (
     Job,
     LabFile,
     LabFileTag,
+    MarkerTag,
     Measurement,
     MeasurementAlias,
     MeasurementBatch,
@@ -46,6 +47,18 @@ async def _wait_for_file_complete(session_factory, file_id: int, *, timeout_seco
                 raise AssertionError(file.processing_error or "file entered error state")
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError("timed out waiting for file completion")
+        await asyncio.sleep(0.05)
+
+
+async def _wait_for_jobs_resolved(session_factory, *, timeout_seconds: float = 10.0) -> list[str]:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while True:
+        async with session_factory() as session:
+            job_statuses = list((await session.execute(select(Job.status))).scalars())
+            if job_statuses and all(status == job_service.JOB_STATUS_RESOLVED for status in job_statuses):
+                return job_statuses
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("timed out waiting for jobs to resolve")
         await asyncio.sleep(0.05)
 
 
@@ -254,6 +267,7 @@ async def test_pipeline_runtime_processes_file_end_to_end(session_factory):
             assert queued_file_ids == [file_id]
 
             complete_file = await _wait_for_file_complete(session_factory, file_id)
+            await _wait_for_jobs_resolved(session_factory)
     finally:
         await runtime.stop()
 
@@ -1219,3 +1233,120 @@ async def test_rescaling_rules_are_type_specific(session_factory):
 
     assert rules[(glucose.id, "mg/dl", "mmol/l")].scale_factor == pytest.approx(0.0555)
     assert rules[(cholesterol.id, "mg/dl", "mmol/l")].scale_factor == pytest.approx(0.0259)
+
+
+@pytest.mark.asyncio
+async def test_marker_tag_endpoints_expose_and_filter_range_derived_tags(client, session_factory):
+    async with session_factory() as session:
+        file = LabFile(
+            filename="markers.pdf",
+            filepath="/tmp/markers.pdf",
+            mime_type="application/pdf",
+        )
+        crp = MeasurementType(
+            name="CRP",
+            normalized_key="crp",
+            group_name="Inflammation & Infection",
+            canonical_unit="mg/L",
+        )
+        hemoglobin = MeasurementType(
+            name="Hemoglobin",
+            normalized_key="hemoglobin",
+            group_name="Blood Function",
+            canonical_unit="g/dL",
+        )
+        session.add_all([file, crp, hemoglobin])
+        await session.flush()
+        session.add_all(
+            [
+                Measurement(
+                    lab_file_id=file.id,
+                    measurement_type_id=crp.id,
+                    raw_marker_name="CRP",
+                    normalized_marker_key="crp",
+                    canonical_value=15.0,
+                    canonical_unit="mg/L",
+                    canonical_reference_low=0.0,
+                    canonical_reference_high=5.0,
+                    measured_at=utc_now(),
+                    normalization_status="resolved",
+                ),
+                Measurement(
+                    lab_file_id=file.id,
+                    measurement_type_id=hemoglobin.id,
+                    raw_marker_name="Hemoglobin",
+                    normalized_marker_key="hemoglobin",
+                    canonical_value=14.0,
+                    canonical_unit="g/dL",
+                    canonical_reference_low=13.0,
+                    canonical_reference_high=17.0,
+                    measured_at=utc_now(),
+                    normalization_status="resolved",
+                ),
+            ]
+        )
+        await session.commit()
+
+    tags_response = await client.get("/api/tags/markers")
+    assert tags_response.status_code == 200
+    assert "outofrange" in tags_response.json()
+    assert "onlyinrange" in tags_response.json()
+
+    overview_response = await client.get("/api/measurements/overview", params=[("tags", "outofrange")])
+    assert overview_response.status_code == 200
+
+    groups = overview_response.json()
+    markers = [marker for group in groups for marker in group["markers"]]
+    assert [marker["marker_name"] for marker in markers] == ["CRP"]
+    assert "outofrange" in markers[0]["marker_tags"]
+
+
+@pytest.mark.asyncio
+async def test_set_marker_tags_strips_reserved_range_tags_but_returns_derived_tags(client, session_factory):
+    async with session_factory() as session:
+        file = LabFile(
+            filename="marker-tags.pdf",
+            filepath="/tmp/marker-tags.pdf",
+            mime_type="application/pdf",
+        )
+        crp = MeasurementType(
+            name="CRP",
+            normalized_key="crp",
+            group_name="Inflammation & Infection",
+            canonical_unit="mg/L",
+        )
+        session.add_all([file, crp])
+        await session.flush()
+        session.add(
+            Measurement(
+                lab_file_id=file.id,
+                measurement_type_id=crp.id,
+                raw_marker_name="CRP",
+                normalized_marker_key="crp",
+                canonical_value=15.0,
+                canonical_unit="mg/L",
+                canonical_reference_low=0.0,
+                canonical_reference_high=5.0,
+                measured_at=utc_now(),
+                normalization_status="resolved",
+            )
+        )
+        await session.commit()
+
+    response = await client.put(
+        "/api/markers/CRP/tags",
+        json={"tags": ["outofrange", "manual-tag", "norange"]},
+    )
+    assert response.status_code == 200
+    assert "manual-tag" in response.json()
+    assert "outofrange" in response.json()
+    assert "norange" not in response.json()
+
+    async with session_factory() as session:
+        result = await session.execute(
+            select(MarkerTag.tag)
+            .join(MarkerTag.measurement_type)
+            .where(MeasurementType.name == "CRP")
+            .order_by(MarkerTag.tag.asc())
+        )
+        assert result.scalars().all() == ["manual-tag"]
