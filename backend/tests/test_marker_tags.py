@@ -10,7 +10,8 @@ from illdashboard.services.markers import (
     MULTIPLE_MEASUREMENTS_TAG,
     NO_RANGE_TAG,
     ONLY_IN_RANGE_TAG,
-    OUT_OF_RANGE_TAG,
+    ONLY_OUT_OF_RANGE_TAG,
+    SOME_OUT_OF_RANGE_TAG,
     combine_marker_tags,
     derived_range_tags,
     marker_group_tag,
@@ -50,7 +51,14 @@ def _measurement(
         ),
         (
             [_measurement(value=12.0, reference_low=0.0, reference_high=5.0)],
-            [OUT_OF_RANGE_TAG],
+            [ONLY_OUT_OF_RANGE_TAG],
+        ),
+        (
+            [
+                _measurement(value=12.0, reference_low=0.0, reference_high=5.0),
+                _measurement(value=4.0, reference_low=0.0, reference_high=5.0),
+            ],
+            [SOME_OUT_OF_RANGE_TAG],
         ),
         (
             [
@@ -77,7 +85,7 @@ def test_derived_range_tags_cover_requested_numeric_states(
     ("qualitative_bool", "expected_tag"),
     [
         (False, ONLY_IN_RANGE_TAG),
-        (True, OUT_OF_RANGE_TAG),
+        (True, ONLY_OUT_OF_RANGE_TAG),
     ],
 )
 def test_derived_range_tags_use_boolean_projection(
@@ -93,7 +101,7 @@ def test_derived_range_tags_reuse_marker_history_reference_for_missing_ranges():
         _measurement(value=1712.0, reference_high=150.0),
     ]
 
-    assert derived_range_tags(measurements) == [OUT_OF_RANGE_TAG]
+    assert derived_range_tags(measurements) == [ONLY_OUT_OF_RANGE_TAG]
 
 
 def test_combine_marker_tags_keeps_norange_when_history_still_has_unclassifiable_rows():

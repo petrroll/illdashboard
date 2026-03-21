@@ -121,6 +121,34 @@ function renderPreferredMeasurementValue(
       );
 }
 
+function getMeasurementStatusClassName(
+  measurement: Measurement | null,
+  fallbackReferenceLow: number | null,
+  fallbackReferenceHigh: number | null,
+) {
+  if (!measurement) {
+    return "value-neutral";
+  }
+
+  const conversionMissing = isUnitConversionMissing(measurement);
+  const statusValue = conversionMissing
+    ? getOriginalMeasurementValue(measurement)
+    : measurement.canonical_value;
+  const statusReferenceLow = conversionMissing
+    ? getOriginalMeasurementReferenceLow(measurement)
+    : measurement.canonical_reference_low ?? fallbackReferenceLow;
+  const statusReferenceHigh = conversionMissing
+    ? getOriginalMeasurementReferenceHigh(measurement)
+    : measurement.canonical_reference_high ?? fallbackReferenceHigh;
+
+  return getMeasurementValueClass({
+    value: statusValue,
+    reference_low: statusReferenceLow,
+    reference_high: statusReferenceHigh,
+    qualitative_bool: measurement.qualitative_bool,
+  });
+}
+
 export default function MarkerChart() {
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedMarker = searchParams.get("marker") ?? "";
@@ -326,6 +354,20 @@ export default function MarkerChart() {
   const refHigh = summarySource?.reference_high ?? null;
   const refLowLabel = refLow == null ? undefined : `Low ${formatSignificantValue(refLow)}`;
   const refHighLabel = refHigh == null ? undefined : `High ${formatSignificantValue(refHigh)}`;
+  const latestDetailValueClassName = summarySource
+    ? getMeasurementStatusClassName(
+        summarySource.latest_measurement,
+        summarySource.reference_low,
+        summarySource.reference_high,
+      )
+    : "value-neutral";
+  const previousDetailValueClassName = summarySource
+    ? getMeasurementStatusClassName(
+        summarySource.previous_measurement,
+        summarySource.reference_low,
+        summarySource.reference_high,
+      )
+    : "value-neutral";
 
   const unit = getDisplayUnit(latestChartMeasurement?.canonical_unit) ?? "";
   const yAxisScale = useMemo(() => {
@@ -535,52 +577,16 @@ export default function MarkerChart() {
                     const latest = item.latest_measurement;
                     const previous = item.previous_measurement;
                     const latestWarning = getUnitConversionWarning(latest);
-                    const latestOriginalValue = getOriginalMeasurementValue(latest);
-                    const latestOriginalReferenceLow = getOriginalMeasurementReferenceLow(latest);
-                    const latestOriginalReferenceHigh = getOriginalMeasurementReferenceHigh(latest);
-                    const latestConversionMissing = isUnitConversionMissing(latest);
-                    const latestStatusValue = latestConversionMissing
-                      ? latestOriginalValue
-                      : latest.canonical_value;
-                    const latestStatusReferenceLow = latestConversionMissing
-                      ? latestOriginalReferenceLow
-                      : latest.canonical_reference_low ?? item.reference_low;
-                    const latestStatusReferenceHigh = latestConversionMissing
-                      ? latestOriginalReferenceHigh
-                      : latest.canonical_reference_high ?? item.reference_high;
-                    const latestValueClassName = getMeasurementValueClass({
-                      value: latestStatusValue,
-                      reference_low: latestStatusReferenceLow,
-                      reference_high: latestStatusReferenceHigh,
-                      qualitative_bool: latest.qualitative_bool,
-                    });
-                    const previousOriginalValue = previous ? getOriginalMeasurementValue(previous) : null;
-                    const previousOriginalReferenceLow = previous ? getOriginalMeasurementReferenceLow(previous) : null;
-                    const previousOriginalReferenceHigh = previous ? getOriginalMeasurementReferenceHigh(previous) : null;
-                    const previousConversionMissing = previous ? isUnitConversionMissing(previous) : false;
-                    const previousStatusValue = previous
-                      ? previousConversionMissing
-                        ? previousOriginalValue
-                        : previous.canonical_value
-                      : null;
-                    const previousStatusReferenceLow = previous
-                      ? previousConversionMissing
-                        ? previousOriginalReferenceLow
-                        : previous.canonical_reference_low ?? item.reference_low
-                      : null;
-                    const previousStatusReferenceHigh = previous
-                      ? previousConversionMissing
-                        ? previousOriginalReferenceHigh
-                        : previous.canonical_reference_high ?? item.reference_high
-                      : null;
-                    const previousValueClassName = previous
-                      ? getMeasurementValueClass({
-                          value: previousStatusValue,
-                          reference_low: previousStatusReferenceLow,
-                          reference_high: previousStatusReferenceHigh,
-                          qualitative_bool: previous.qualitative_bool,
-                        })
-                      : "value-neutral";
+                    const latestValueClassName = getMeasurementStatusClassName(
+                      latest,
+                      item.reference_low,
+                      item.reference_high,
+                    );
+                    const previousValueClassName = getMeasurementStatusClassName(
+                      previous,
+                      item.reference_low,
+                      item.reference_high,
+                    );
                     const latestTrendValue = getCanonicalTrendValue(latest);
                     const previousTrendValue = previous ? getCanonicalTrendValue(previous) : null;
                     const delta =
@@ -688,7 +694,7 @@ export default function MarkerChart() {
             </div>
 
             <div className="detail-summary-grid">
-              <div className="detail-stat-card">
+              <div className={`detail-stat-card detail-stat-card-measurement ${latestDetailValueClassName}`}>
                 <span>Latest</span>
                 <strong>{formatPreferredMeasurementValue(summarySource.latest_measurement)}</strong>
                 <small>{formatDate(summarySource.latest_measurement.measured_at)}</small>
@@ -697,7 +703,7 @@ export default function MarkerChart() {
                 )}
               </div>
 
-              <div className="detail-stat-card">
+              <div className={`detail-stat-card detail-stat-card-measurement ${previousDetailValueClassName}`}>
                 <span>Previous</span>
                 <strong>
                   {summarySource.previous_measurement
@@ -829,32 +835,21 @@ export default function MarkerChart() {
                           const filename = measurement.lab_file_filename || `File ${measurement.lab_file_id}`;
                           const originalValue = getOriginalMeasurementValue(measurement);
                           const originalUnit = getOriginalMeasurementUnit(measurement);
-                          const originalReferenceLow = getOriginalMeasurementReferenceLow(measurement);
-                          const originalReferenceHigh = getOriginalMeasurementReferenceHigh(measurement);
                           const conversionMissing = isUnitConversionMissing(measurement);
                           const conversionWarning = getUnitConversionWarning(measurement);
+                          const measurementValueClassName = getMeasurementStatusClassName(
+                            measurement,
+                            detail.reference_low,
+                            detail.reference_high,
+                          );
                           const showOriginalValue = !conversionMissing
                             && measurement.qualitative_value == null
                             && hasRescaledMeasurementValue(measurement);
-                          const fallbackReferenceLow = conversionMissing
-                            ? originalReferenceLow
-                            : measurement.canonical_reference_low ?? detail.reference_low;
-                          const fallbackReferenceHigh = conversionMissing
-                            ? originalReferenceHigh
-                            : measurement.canonical_reference_high ?? detail.reference_high;
-                          const statusValue = conversionMissing
-                            ? originalValue
-                            : measurement.canonical_value;
 
                           return (
                             <tr key={measurement.id}>
                               <td>{formatDate(measurement.measured_at)}</td>
-                              <td className={getMeasurementValueClass({
-                                value: statusValue,
-                                reference_low: fallbackReferenceLow,
-                                reference_high: fallbackReferenceHigh,
-                                qualitative_bool: measurement.qualitative_bool,
-                              })}>
+                              <td className={measurementValueClassName}>
                                 <StackedMeasurementValue
                                   primary={renderPreferredMeasurementValue(measurement)}
                                   secondary={conversionMissing

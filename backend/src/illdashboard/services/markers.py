@@ -76,10 +76,12 @@ async def load_marker_groups(db: AsyncSession) -> dict[str, MarkerGroup]:
 
 SINGLE_MEASUREMENT_TAG = "singleMeasurement"
 MULTIPLE_MEASUREMENTS_TAG = "multipleMeasurements"
-ONLY_IN_RANGE_TAG = "onlyInRange"
-MOSTLY_OUT_OF_RANGE_TAG = "mostlyOutOfRange"
-OUT_OF_RANGE_TAG = "outOfRange"
-NO_RANGE_TAG = "noRange"
+RANGE_TAG_PREFIX = "range:"
+ONLY_IN_RANGE_TAG = f"{RANGE_TAG_PREFIX}onlyInRange"
+ONLY_OUT_OF_RANGE_TAG = f"{RANGE_TAG_PREFIX}onlyOutOfRange"
+MOSTLY_OUT_OF_RANGE_TAG = f"{RANGE_TAG_PREFIX}mostlyOutOfRange"
+SOME_OUT_OF_RANGE_TAG = f"{RANGE_TAG_PREFIX}someOutOfRange"
+NO_RANGE_TAG = f"{RANGE_TAG_PREFIX}noRange"
 SOURCE_TAG_PREFIX = "source:"
 
 
@@ -190,13 +192,17 @@ def derived_range_tags(measurements: list[Measurement]) -> list[str]:
             no_range_count += 1
 
     derived_tags: list[str] = []
+    # Keep missing-range coverage additive so callers can distinguish incomplete
+    # reference intervals from the dominant in/out-of-range history trend.
     if in_range_count or out_of_range_count:
         if out_of_range_count == 0:
             derived_tags.append(ONLY_IN_RANGE_TAG)
         elif in_range_count == 0:
-            derived_tags.append(OUT_OF_RANGE_TAG)
-        elif out_of_range_count >= in_range_count:
+            derived_tags.append(ONLY_OUT_OF_RANGE_TAG)
+        elif out_of_range_count > in_range_count:
             derived_tags.append(MOSTLY_OUT_OF_RANGE_TAG)
+        else:
+            derived_tags.append(SOME_OUT_OF_RANGE_TAG)
     if no_range_count:
         derived_tags.append(NO_RANGE_TAG)
     return derived_tags
@@ -223,8 +229,9 @@ async def all_reserved_marker_tags(db: AsyncSession, group_name: str | None = No
         SINGLE_MEASUREMENT_TAG,
         MULTIPLE_MEASUREMENTS_TAG,
         ONLY_IN_RANGE_TAG,
+        ONLY_OUT_OF_RANGE_TAG,
         MOSTLY_OUT_OF_RANGE_TAG,
-        OUT_OF_RANGE_TAG,
+        SOME_OUT_OF_RANGE_TAG,
         NO_RANGE_TAG,
         *(marker_group_tag(group) for group in group_names),
     }

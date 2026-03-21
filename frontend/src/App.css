@@ -1161,6 +1161,7 @@ input[type="file"] {
   background: #1a2230;
   display: grid;
   gap: 0.3rem;
+  transition: border-color 160ms ease, background 160ms ease;
 }
 
 .detail-stat-card span {
@@ -1168,6 +1169,32 @@ input[type="file"] {
   font-size: 0.78rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+.detail-stat-card-measurement.value-low,
+.detail-stat-card-measurement.value-high,
+.detail-stat-card-measurement.value-positive {
+  border-color: rgba(245, 162, 84, 0.28);
+  background: linear-gradient(180deg, rgba(245, 162, 84, 0.08) 0%, #1a2230 72%);
+}
+
+.detail-stat-card-measurement.value-normal {
+  border-color: rgba(70, 209, 96, 0.28);
+  background: linear-gradient(180deg, rgba(70, 209, 96, 0.08) 0%, #1a2230 72%);
+}
+
+.detail-stat-card-measurement.value-low strong,
+.detail-stat-card-measurement.value-high strong,
+.detail-stat-card-measurement.value-positive strong {
+  color: var(--value-attention);
+}
+
+.detail-stat-card-measurement.value-normal strong {
+  color: var(--value-ok);
+}
+
+.detail-stat-card-measurement.value-neutral strong {
+  color: var(--text-muted);
 }
 
 .detail-history {
