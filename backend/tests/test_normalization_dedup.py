@@ -595,6 +595,12 @@ async def test_apply_known_measurement_rules_marks_unusable_qualitative_normaliz
     assert measurement.normalization_error == "Unsupported qualitative normalization for []"
 
 
+def test_normalize_qualitative_key_preserves_symbolic_values():
+    assert qualitative_values.normalize_qualitative_key("-") == "-"
+    assert qualitative_values.normalize_qualitative_key(" (+/-) ") == "+/-"
+    assert qualitative_values.normalize_qualitative_key("non-reactive") == "non reactive"
+
+
 @pytest.mark.asyncio
 async def test_qualitative_rule_upsert_deduplicates_equivalent_values(session_factory):
     async with session_factory() as session:
@@ -620,3 +626,64 @@ async def test_qualitative_rule_upsert_deduplicates_equivalent_values(session_fa
     assert len(rules) == 1
     assert rules[0].normalized_original_value == qualitative_values.normalize_qualitative_key("Positive")
     assert rules[0].canonical_value == "Positive"
+
+
+@pytest.mark.asyncio
+async def test_qualitative_canonization_reuses_symbolic_rule_keys(session_factory):
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="qual-loop.png",
+            filepath="/tmp/qual-loop.png",
+            mime_type="image/png",
+        )
+        measurement = Measurement(
+            lab_file=lab_file,
+            raw_marker_name="COVID serology",
+            normalized_marker_key=normalize_marker_alias_key("COVID serology"),
+            original_qualitative_value="-",
+        )
+        session.add_all([lab_file, measurement])
+        await session.flush()
+
+        job_key = qualitative_values.normalize_qualitative_key(measurement.original_qualitative_value)
+        assert job_key is not None
+        job = Job(
+            task_type=pipeline.TASK_CANONIZE_QUALITATIVE,
+            task_key=job_key,
+            status=job_service.JOB_STATUS_LEASED,
+            lease_owner="test-runtime",
+            lease_until=utc_now(),
+            payload_json=job_service.json_dumps({"original_value": measurement.original_qualitative_value}),
+        )
+        session.add(job)
+        await session.commit()
+
+        with patch(
+            "illdashboard.services.pipeline.copilot_normalization.normalize_qualitative_values",
+            new=AsyncMock(return_value={job_key: ("negative", False)}),
+        ) as normalize_mock:
+            await pipeline._canonize_qualitative_jobs(session, [job])
+            await session.commit()
+
+        rules = await qualitative_values.load_qualitative_rules(session, [job.task_key])
+        queued_jobs = list((await session.execute(select(Job).order_by(Job.id.asc()))).scalars())
+
+    normalize_mock.assert_awaited_once()
+    assert rules[job_key].canonical_value == "negative"
+    assert rules[job_key].boolean_value is False
+    assert any(
+        queued_job.task_type == pipeline.TASK_PROCESS_MEASUREMENTS and queued_job.file_id == lab_file.id
+        for queued_job in queued_jobs
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_job_rejects_blank_task_keys(session_factory):
+    async with session_factory() as session:
+        with pytest.raises(ValueError, match="empty task key"):
+            await pipeline._request_job(
+                session,
+                task_type=pipeline.TASK_CANONIZE_QUALITATIVE,
+                task_key="   ",
+                priority=pipeline.PRIORITY_CANONIZE,
+            )

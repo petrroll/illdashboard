@@ -9,6 +9,8 @@ from sqlalchemy.orm import selectinload
 
 from illdashboard.models import QualitativeRule
 
+_SYMBOLIC_QUALITATIVE_VALUE_RE = re.compile(r"[+\-/]+")
+
 
 def normalize_qualitative_key(value: str | None) -> str | None:
     if value is None:
@@ -20,9 +22,14 @@ def normalize_qualitative_key(value: str | None) -> str | None:
 
     normalized = unicodedata.normalize("NFKD", normalized).encode("ascii", "ignore").decode("ascii")
     normalized = normalized.casefold().strip()
+    # Standalone symbolic results like "-", "++", or "+/-" carry the entire
+    # meaning, so replacing "-" with whitespace would collapse their job keys.
+    symbolic_value = normalized.strip(".:;,()[]{}").strip()
+    if _SYMBOLIC_QUALITATIVE_VALUE_RE.fullmatch(symbolic_value):
+        return symbolic_value
     normalized = normalized.replace("-", " ")
     normalized = re.sub(r"\s+", " ", normalized)
-    normalized = normalized.strip(".:;,()[]{}")
+    normalized = normalized.strip(".:;,()[]{}").strip()
     return normalized or None
 
 

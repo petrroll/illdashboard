@@ -2038,6 +2038,9 @@ async def _request_job(
     file_id: int | None = None,
     priority: int,
 ) -> bool:
+    task_key = task_key.strip()
+    if not task_key:
+        raise ValueError(f"Cannot enqueue {task_type} with an empty task key")
     existing_status_result = await session.execute(
         select(Job.status, Job.rerun_requested)
         .where(Job.task_type == task_type, Job.task_key == task_key)
