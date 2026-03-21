@@ -24,11 +24,16 @@ Write a short markdown explanation with these sections:
 1. What this marker measures.
 2. What the latest value means relative to its range. If the latest value is below or above the
     reference range, explicitly explain in plain language what being below or above the limit means.
-3. What the recent trend suggests, based only on the supplied values.
+3. If the value is high or low, what that can commonly mean, whether it is commonly a mild or more
+    notable finding, and when it can be a problem.
+4. General, non-personalized management context: what is commonly checked, monitored, or addressed
+    when this marker is higher or lower than expected.
+5. What the recent trend suggests, based only on the supplied values.
 
 Do not add a generic caution or disclaimer section. Do not say that this is not a diagnosis and do
 not tell the user to ask a clinician unless the supplied data itself requires a specific limitation
-to be mentioned. If only a single value is supplied, do not dwell on the lack of a trend; focus on
+to be mentioned. The user already understands this is not medical advice, so no disclaimer is
+necessary. If only a single value is supplied, do not dwell on the lack of a trend; focus on
 explaining what that value means.
 
 Keep the language plain, factual, and concise. Do not invent causes that are not \
@@ -56,7 +61,12 @@ async def explain_markers(markers: list[dict]) -> str:
 
 async def explain_marker_history(marker_name: str, measurements: list[dict]) -> str:
     """Ask Copilot to explain one biomarker with historical context."""
-    user_text = f"Please explain the history of {marker_name}.\n\n"
+    user_text = (
+        f"Please explain what the {marker_name} values mean based on these results. "
+        "If the values are higher or lower than expected, explain what that could mean, whether that "
+        "is commonly seen, when it may be a problem, and how it is typically managed. "
+        "We understand this is not medical advice, so no disclaimer is necessary.\n\n"
+    )
     for measurement in measurements:
         line = f"- {measurement['date']}: {measurement['value']}"
         if measurement.get("unit"):
