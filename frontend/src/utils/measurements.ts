@@ -94,7 +94,9 @@ export function formatReferenceRange(
   referenceHigh?: number | null,
 ) {
   return referenceLow != null && referenceHigh != null
-    ? `${referenceLow}–${referenceHigh}`
+    // Keep range bounds on the same display precision as values so converted
+    // results like 0.098 vs 0.1 do not look contradictory after rounding.
+    ? `${formatMeasurementScalarValue(referenceLow)}–${formatMeasurementScalarValue(referenceHigh)}`
     : "—";
 }
 
