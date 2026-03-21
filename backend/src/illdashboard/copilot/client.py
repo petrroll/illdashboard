@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 from copilot import CopilotClient, PermissionHandler
 from copilot.generated.session_events import SessionEventType
-from copilot.types import CopilotClientOptions, MessageOptions, ReasoningEffort
+from copilot.types import Attachment, CopilotClientOptions, MessageOptions, ReasoningEffort, SessionConfig
 
 from illdashboard.config import settings
 from illdashboard.metrics import add_premium_requests
@@ -70,6 +70,63 @@ _active_request_count = 0
 class _RequestSessionSettings:
     model: str
     reasoning_effort: ReasoningEffort | None = None
+
+
+async def _model_supports_reasoning_effort(client: CopilotClient, model: str) -> bool | None:
+    try:
+        models = await client.list_models()
+    except Exception as exc:
+        logger.warning(
+            "Copilot model capability lookup failed model=%s error=%s",
+            model,
+            exc,
+        )
+        return None
+
+    for model_info in models:
+        if model_info.id == model:
+            return bool(model_info.capabilities.supports.reasoning_effort)
+
+    logger.warning("Copilot model capability lookup did not include configured model=%s", model)
+    return None
+
+
+async def _resolved_reasoning_effort(
+    client: CopilotClient,
+    request_settings: _RequestSessionSettings,
+    *,
+    request_name: str,
+    request_id: str,
+) -> ReasoningEffort | None:
+    if request_settings.reasoning_effort is None:
+        return None
+
+    # The SDK rejects session.create when reasoning_effort is sent for a model
+    # that does not advertise support, so gate the option on live model metadata.
+    supports_reasoning_effort = await _model_supports_reasoning_effort(client, request_settings.model)
+    if supports_reasoning_effort is True:
+        return request_settings.reasoning_effort
+
+    if supports_reasoning_effort is False:
+        logger.info(
+            "Copilot request omitting unsupported reasoning_effort request_name=%s request_id=%s "
+            "model=%s configured_reasoning_effort=%s",
+            request_name,
+            request_id,
+            request_settings.model,
+            request_settings.reasoning_effort,
+        )
+        return None
+
+    logger.warning(
+        "Copilot request omitting reasoning_effort because model capabilities are unavailable "
+        "request_name=%s request_id=%s model=%s configured_reasoning_effort=%s",
+        request_name,
+        request_id,
+        request_settings.model,
+        request_settings.reasoning_effort,
+    )
+    return None
 
 
 def _request_session_settings(request_name: str) -> _RequestSessionSettings:
@@ -212,6 +269,11 @@ def _is_retryable_session_error(exc: Exception) -> bool:
     return "failed to list models" in str(exc).lower()
 
 
+def _is_unsupported_reasoning_effort_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "reasoning effort" in message and "does not support" in message
+
+
 async def shutdown_client() -> None:
     """Stop the shared Copilot client."""
     global _client
@@ -241,7 +303,7 @@ async def _ask(
     system_prompt: str,
     user_prompt: str,
     *,
-    attachments: list[dict] | None = None,
+    attachments: list[Attachment] | None = None,
     timeout: float = COPILOT_REQUEST_TIMEOUT,
     request_name: str = "copilot_request",
     request_context: str = "",
@@ -252,7 +314,7 @@ async def _ask(
     request_id = uuid.uuid4().hex[:12]
     request_settings = _request_session_settings(request_name)
     logger.info(
-        "Copilot request starting request_name=%s request_id=%s model=%s reasoning_effort=%s timeout=%ss "
+        "Copilot request starting request_name=%s request_id=%s model=%s configured_reasoning_effort=%s timeout=%ss "
         "attachments=%s prompt_chars=%s context=%s",
         request_name,
         request_id,
@@ -275,6 +337,7 @@ async def _ask(
         observed_output_tokens = 0
         observed_cache_read_tokens = 0
         request_error: Exception | None = None
+        applied_reasoning_effort: ReasoningEffort | None = None
         queued_registered = False
 
         try:
@@ -293,102 +356,134 @@ async def _ask(
                 queued_registered = False
                 _active_request_count += 1
                 try:
-                    client_wait_started_at = time.perf_counter()
-                    client = await _get_client()
-                    client_wait_ms = (time.perf_counter() - client_wait_started_at) * 1000
-                    session_create_started_at = time.perf_counter()
-                    session_config = {
-                        "model": request_settings.model,
-                        "system_message": {"mode": "replace", "content": system_prompt},
-                        "available_tools": [],
-                        "on_permission_request": PermissionHandler.approve_all,
-                    }
-                    if request_settings.reasoning_effort is not None:
-                        session_config["reasoning_effort"] = request_settings.reasoning_effort
-                    session = await client.create_session(session_config)
-                    session_create_ms = (time.perf_counter() - session_create_started_at) * 1000
-                    logger.info(
-                        "Copilot request ready request_name=%s request_id=%s attempt=%s/%s lane=%s "
-                        "lane_wait_ms=%.1f semaphore_wait_ms=%.1f client_wait_ms=%.1f "
-                        "session_create_ms=%.1f queued_requests=%s active_requests=%s",
-                        request_name,
-                        request_id,
-                        attempt,
-                        COPILOT_TRANSIENT_RETRY_ATTEMPTS,
-                        lane_name,
-                        lane_wait_ms,
-                        semaphore_wait_ms,
-                        client_wait_ms,
-                        session_create_ms,
-                        _queued_request_count,
-                        _active_request_count,
-                    )
-
-                    def handle_session_event(event) -> None:
-                        nonlocal observed_usage_cost
-                        nonlocal observed_input_tokens, observed_output_tokens
-                        nonlocal observed_cache_read_tokens
-
-                        if event.type == SessionEventType.ASSISTANT_USAGE:
-                            cost = getattr(event.data, "cost", None)
-                            if isinstance(cost, int | float) and cost > 0:
-                                observed_usage_cost += float(cost)
-                            in_tok = getattr(event.data, "input_tokens", None)
-                            if isinstance(in_tok, int | float) and in_tok > 0:
-                                observed_input_tokens += int(in_tok)
-                            out_tok = getattr(event.data, "output_tokens", None)
-                            if isinstance(out_tok, int | float) and out_tok > 0:
-                                observed_output_tokens += int(out_tok)
-                            cache_tok = getattr(event.data, "cache_read_tokens", None)
-                            if isinstance(cache_tok, int | float) and cache_tok > 0:
-                                observed_cache_read_tokens += int(cache_tok)
-                            return
-
-                        if event.type == SessionEventType.SESSION_WARNING:
-                            logger.warning(
-                                "Copilot session warning request_name=%s request_id=%s event_type=%s "
-                                "warning_type=%s status_code=%s message=%s reason=%s error_reason=%s",
-                                request_name,
-                                request_id,
-                                getattr(event.type, "value", event.type),
-                                getattr(event.data, "warning_type", None),
-                                getattr(event.data, "status_code", None),
-                                getattr(event.data, "message", None),
-                                getattr(event.data, "reason", None),
-                                getattr(event.data, "error_reason", None),
-                            )
-                            return
-
-                        if event.type == SessionEventType.SESSION_INFO:
-                            logger.info(
-                                "Copilot session info request_name=%s request_id=%s event_type=%s "
-                                "info_type=%s status_code=%s message=%s",
-                                request_name,
-                                request_id,
-                                getattr(event.type, "value", event.type),
-                                getattr(event.data, "info_type", None),
-                                getattr(event.data, "status_code", None),
-                                getattr(event.data, "message", None),
-                            )
-                            return
-
-                        if event.type == SessionEventType.SESSION_ERROR:
-                            logger.warning(
-                                "Copilot session error event request_name=%s request_id=%s event_type=%s "
-                                "error_type=%s status_code=%s message=%s reason=%s error_reason=%s",
-                                request_name,
-                                request_id,
-                                getattr(event.type, "value", event.type),
-                                getattr(event.data, "error_type", None),
-                                getattr(event.data, "status_code", None),
-                                getattr(event.data, "message", None),
-                                getattr(event.data, "reason", None),
-                                getattr(event.data, "error_reason", None),
-                            )
-
-                    unsubscribe = session.on(handle_session_event)
+                    session = None
+                    unsubscribe = None
                     progress_task: asyncio.Task[None] | None = None
                     try:
+                        client_wait_started_at = time.perf_counter()
+                        client = await _get_client()
+                        client_wait_ms = (time.perf_counter() - client_wait_started_at) * 1000
+                        effective_reasoning_effort = await _resolved_reasoning_effort(
+                            client,
+                            request_settings,
+                            request_name=request_name,
+                            request_id=request_id,
+                        )
+                        session_create_started_at = time.perf_counter()
+                        session_config: SessionConfig = {
+                            "model": request_settings.model,
+                            "system_message": {"mode": "replace", "content": system_prompt},
+                            "available_tools": [],
+                            "on_permission_request": PermissionHandler.approve_all,
+                        }
+                        if effective_reasoning_effort is not None:
+                            session_config["reasoning_effort"] = effective_reasoning_effort
+                        applied_reasoning_effort = effective_reasoning_effort
+                        try:
+                            session = await client.create_session(session_config)
+                        except Exception as exc:
+                            # Some SDK model listings still claim reasoning support for mini
+                            # models that reject it at session.create time, so fall back to
+                            # the same request without the optional knob.
+                            if applied_reasoning_effort is None or not _is_unsupported_reasoning_effort_error(exc):
+                                raise
+                            logger.warning(
+                                "Copilot session.create rejected reasoning_effort; retrying without it "
+                                "request_name=%s request_id=%s model=%s configured_reasoning_effort=%s error=%s",
+                                request_name,
+                                request_id,
+                                request_settings.model,
+                                request_settings.reasoning_effort,
+                                exc,
+                            )
+                            session_config.pop("reasoning_effort", None)
+                            applied_reasoning_effort = None
+                            session = await client.create_session(session_config)
+
+                        session_create_ms = (time.perf_counter() - session_create_started_at) * 1000
+                        logger.info(
+                            "Copilot request ready request_name=%s request_id=%s attempt=%s/%s lane=%s "
+                            "lane_wait_ms=%.1f semaphore_wait_ms=%.1f client_wait_ms=%.1f "
+                            "session_create_ms=%.1f applied_reasoning_effort=%s queued_requests=%s "
+                            "active_requests=%s",
+                            request_name,
+                            request_id,
+                            attempt,
+                            COPILOT_TRANSIENT_RETRY_ATTEMPTS,
+                            lane_name,
+                            lane_wait_ms,
+                            semaphore_wait_ms,
+                            client_wait_ms,
+                            session_create_ms,
+                            applied_reasoning_effort,
+                            _queued_request_count,
+                            _active_request_count,
+                        )
+
+                        def handle_session_event(event) -> None:
+                            nonlocal observed_usage_cost
+                            nonlocal observed_input_tokens, observed_output_tokens
+                            nonlocal observed_cache_read_tokens
+
+                            if event.type == SessionEventType.ASSISTANT_USAGE:
+                                cost = getattr(event.data, "cost", None)
+                                if isinstance(cost, int | float) and cost > 0:
+                                    observed_usage_cost += float(cost)
+                                in_tok = getattr(event.data, "input_tokens", None)
+                                if isinstance(in_tok, int | float) and in_tok > 0:
+                                    observed_input_tokens += int(in_tok)
+                                out_tok = getattr(event.data, "output_tokens", None)
+                                if isinstance(out_tok, int | float) and out_tok > 0:
+                                    observed_output_tokens += int(out_tok)
+                                cache_tok = getattr(event.data, "cache_read_tokens", None)
+                                if isinstance(cache_tok, int | float) and cache_tok > 0:
+                                    observed_cache_read_tokens += int(cache_tok)
+                                return
+
+                            if event.type == SessionEventType.SESSION_WARNING:
+                                logger.warning(
+                                    "Copilot session warning request_name=%s request_id=%s event_type=%s "
+                                    "warning_type=%s status_code=%s message=%s reason=%s error_reason=%s",
+                                    request_name,
+                                    request_id,
+                                    getattr(event.type, "value", event.type),
+                                    getattr(event.data, "warning_type", None),
+                                    getattr(event.data, "status_code", None),
+                                    getattr(event.data, "message", None),
+                                    getattr(event.data, "reason", None),
+                                    getattr(event.data, "error_reason", None),
+                                )
+                                return
+
+                            if event.type == SessionEventType.SESSION_INFO:
+                                logger.info(
+                                    "Copilot session info request_name=%s request_id=%s event_type=%s "
+                                    "info_type=%s status_code=%s message=%s",
+                                    request_name,
+                                    request_id,
+                                    getattr(event.type, "value", event.type),
+                                    getattr(event.data, "info_type", None),
+                                    getattr(event.data, "status_code", None),
+                                    getattr(event.data, "message", None),
+                                )
+                                return
+
+                            if event.type == SessionEventType.SESSION_ERROR:
+                                logger.warning(
+                                    "Copilot session error event request_name=%s request_id=%s event_type=%s "
+                                    "error_type=%s status_code=%s message=%s reason=%s error_reason=%s",
+                                    request_name,
+                                    request_id,
+                                    getattr(event.type, "value", event.type),
+                                    getattr(event.data, "error_type", None),
+                                    getattr(event.data, "status_code", None),
+                                    getattr(event.data, "message", None),
+                                    getattr(event.data, "reason", None),
+                                    getattr(event.data, "error_reason", None),
+                                )
+
+                        unsubscribe = session.on(handle_session_event)
+
                         async def _log_request_progress() -> None:
                             while True:
                                 await asyncio.sleep(COPILOT_REQUEST_PROGRESS_INTERVAL)
@@ -423,11 +518,13 @@ async def _ask(
                                 await progress_task
                             except asyncio.CancelledError:
                                 pass
-                        unsubscribe()
-                        try:
-                            await session.disconnect()
-                        except Exception as exc:
-                            logger.warning("Copilot session disconnect had errors: %s", exc)
+                        if unsubscribe is not None:
+                            unsubscribe()
+                        if session is not None:
+                            try:
+                                await session.disconnect()
+                            except Exception as exc:
+                                logger.warning("Copilot session disconnect had errors: %s", exc)
                 finally:
                     _active_request_count -= 1
         finally:
@@ -440,13 +537,15 @@ async def _ask(
         if request_error is None:
             add_premium_requests(observed_usage_cost_total)
             logger.info(
-                "Copilot request finished request_name=%s request_id=%s model=%s reasoning_effort=%s "
-                "attachments=%s duration=%.2fs response_chars=%s usage_cost=%.4f "
+                "Copilot request finished request_name=%s request_id=%s model=%s "
+                "configured_reasoning_effort=%s applied_reasoning_effort=%s attachments=%s "
+                "duration=%.2fs response_chars=%s usage_cost=%.4f "
                 "input_tokens=%s output_tokens=%s cache_read_tokens=%s context=%s",
                 request_name,
                 request_id,
                 request_settings.model,
                 request_settings.reasoning_effort,
+                applied_reasoning_effort,
                 attachment_count,
                 duration,
                 len(content),
@@ -461,7 +560,7 @@ async def _ask(
         if _is_retryable_session_error(request_error) and attempt < COPILOT_TRANSIENT_RETRY_ATTEMPTS:
             logger.warning(
                 "Copilot request retrying request_name=%s request_id=%s attempt=%s/%s model=%s "
-                "reasoning_effort=%s "
+                "configured_reasoning_effort=%s applied_reasoning_effort=%s "
                 "attachments=%s duration=%.2fs delay=%ss error=%s",
                 request_name,
                 request_id,
@@ -469,6 +568,7 @@ async def _ask(
                 COPILOT_TRANSIENT_RETRY_ATTEMPTS,
                 request_settings.model,
                 request_settings.reasoning_effort,
+                applied_reasoning_effort,
                 attachment_count,
                 duration,
                 COPILOT_TRANSIENT_RETRY_DELAY,
@@ -480,12 +580,14 @@ async def _ask(
 
         add_premium_requests(observed_usage_cost_total)
         logger.warning(
-            "Copilot request failed request_name=%s request_id=%s model=%s reasoning_effort=%s "
-            "attachments=%s duration=%.2fs error=%s",
+            "Copilot request failed request_name=%s request_id=%s model=%s "
+            "configured_reasoning_effort=%s applied_reasoning_effort=%s attachments=%s "
+            "duration=%.2fs error=%s",
             request_name,
             request_id,
             request_settings.model,
             request_settings.reasoning_effort,
+            applied_reasoning_effort,
             attachment_count,
             duration,
             request_error,
@@ -571,7 +673,7 @@ async def _ask_json(
     system_prompt: str,
     user_prompt: str,
     *,
-    attachments: list[dict] | None = None,
+    attachments: list[Attachment] | None = None,
     timeout: float = COPILOT_REQUEST_TIMEOUT,
     default: dict | None = None,
     request_name: str = "copilot_json_request",
