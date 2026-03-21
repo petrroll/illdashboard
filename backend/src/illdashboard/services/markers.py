@@ -74,12 +74,12 @@ async def load_marker_groups(db: AsyncSession) -> dict[str, MarkerGroup]:
     return {group.name: group for group in result.scalars().all()}
 
 
-SINGLE_MEASUREMENT_TAG = "singlemeasurement"
-MULTIPLE_MEASUREMENTS_TAG = "multiplemeasurements"
-ONLY_IN_RANGE_TAG = "onlyinrange"
-MOSTLY_OUT_OF_RANGE_TAG = "mostlyoutofrange"
-OUT_OF_RANGE_TAG = "outofrange"
-NO_RANGE_TAG = "norange"
+SINGLE_MEASUREMENT_TAG = "singleMeasurement"
+MULTIPLE_MEASUREMENTS_TAG = "multipleMeasurements"
+ONLY_IN_RANGE_TAG = "onlyInRange"
+MOSTLY_OUT_OF_RANGE_TAG = "mostlyOutOfRange"
+OUT_OF_RANGE_TAG = "outOfRange"
+NO_RANGE_TAG = "noRange"
 SOURCE_TAG_PREFIX = "source:"
 
 
@@ -195,7 +195,7 @@ def derived_range_tags(measurements: list[Measurement]) -> list[str]:
             derived_tags.append(ONLY_IN_RANGE_TAG)
         elif in_range_count == 0:
             derived_tags.append(OUT_OF_RANGE_TAG)
-        elif out_of_range_count > in_range_count:
+        elif out_of_range_count >= in_range_count:
             derived_tags.append(MOSTLY_OUT_OF_RANGE_TAG)
     if no_range_count:
         derived_tags.append(NO_RANGE_TAG)

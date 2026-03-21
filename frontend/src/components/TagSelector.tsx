@@ -21,16 +21,17 @@ export default function TagSelector({
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [highlightIndex, setHighlightIndex] = useState(-1);
   const wrapperRef = useRef<HTMLDivElement>(null);
-  const normalizedInput = input.trim().toLowerCase();
+  const trimmedInput = input.trim();
+  const searchInput = trimmedInput.toLowerCase();
 
   const suggestions = useMemo(() => {
     return allTags.filter((tag) => {
-      const matchesSearch = normalizedInput
-        ? tag.toLowerCase().includes(normalizedInput)
+      const matchesSearch = searchInput
+        ? tag.toLowerCase().includes(searchInput)
         : true;
       return matchesSearch && !tags.includes(tag);
     });
-  }, [allTags, normalizedInput, tags]);
+  }, [allTags, searchInput, tags]);
 
   useEffect(() => {
     const handleClick = (event: MouseEvent) => {
@@ -46,9 +47,9 @@ export default function TagSelector({
   const highlightedSuggestion =
     showSuggestions && highlightIndex >= 0 ? suggestions[highlightIndex] : undefined;
 
-  const exactMatch = normalizedInput
+  const exactMatch = trimmedInput
     ? allTags.find(
-        (tag) => tag.toLowerCase() === normalizedInput && !tags.includes(tag),
+        (tag) => tag === trimmedInput && !tags.includes(tag),
       )
     : undefined;
 

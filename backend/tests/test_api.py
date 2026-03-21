@@ -1289,16 +1289,16 @@ async def test_marker_tag_endpoints_expose_and_filter_range_derived_tags(client,
 
     tags_response = await client.get("/api/tags/markers")
     assert tags_response.status_code == 200
-    assert "outofrange" in tags_response.json()
-    assert "onlyinrange" in tags_response.json()
+    assert "outOfRange" in tags_response.json()
+    assert "onlyInRange" in tags_response.json()
 
-    overview_response = await client.get("/api/measurements/overview", params=[("tags", "outofrange")])
+    overview_response = await client.get("/api/measurements/overview", params=[("tags", "outOfRange")])
     assert overview_response.status_code == 200
 
     groups = overview_response.json()
     markers = [marker for group in groups for marker in group["markers"]]
     assert [marker["marker_name"] for marker in markers] == ["CRP"]
-    assert "outofrange" in markers[0]["marker_tags"]
+    assert "outOfRange" in markers[0]["marker_tags"]
 
 
 @pytest.mark.asyncio
@@ -1335,12 +1335,12 @@ async def test_set_marker_tags_strips_reserved_range_tags_but_returns_derived_ta
 
     response = await client.put(
         "/api/markers/CRP/tags",
-        json={"tags": ["outofrange", "manual-tag", "norange"]},
+        json={"tags": ["outOfRange", "manual-tag", "noRange"]},
     )
     assert response.status_code == 200
     assert "manual-tag" in response.json()
-    assert "outofrange" in response.json()
-    assert "norange" not in response.json()
+    assert "outOfRange" in response.json()
+    assert "noRange" not in response.json()
 
     async with session_factory() as session:
         result = await session.execute(
@@ -1407,5 +1407,5 @@ async def test_marker_detail_reuses_history_reference_for_missing_range_rows(cli
     assert response.status_code == 200
     body = response.json()
     assert body["reference_high"] == 150.0
-    assert "outofrange" in body["marker_tags"]
-    assert "norange" not in body["marker_tags"]
+    assert "outOfRange" in body["marker_tags"]
+    assert "noRange" not in body["marker_tags"]
