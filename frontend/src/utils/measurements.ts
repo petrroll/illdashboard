@@ -5,8 +5,15 @@ const SIGNIFICANT_VALUE_FORMATTER = new Intl.NumberFormat(undefined, {
   maximumSignificantDigits: 6,
   useGrouping: false,
 });
+const DEFAULT_NUMERIC_AXIS_DOMAIN: [number, number] = [0, 1];
+const DEFAULT_NUMERIC_AXIS_TICKS = [0, 0.5, 1];
+const NICE_AXIS_STEP_FACTORS = [1, 2, 2.5, 5, 10] as const;
 
 export type MarkerStatus = "low" | "high" | "in_range" | "no_range" | "positive" | "negative";
+export type NumericAxisScale = {
+  domain: [number, number];
+  ticks: number[];
+};
 
 function normalizeUnitKey(unit?: string | null) {
   if (unit == null) {
@@ -37,6 +44,147 @@ export function formatSignificantValue(value?: number | null) {
   }
 
   return SIGNIFICANT_VALUE_FORMATTER.format(Object.is(value, -0) ? 0 : value);
+}
+
+function getAxisStepPrecision(value: number) {
+  if (!Number.isFinite(value) || Number.isInteger(value)) {
+    return 0;
+  }
+
+  const serialized = value.toString().toLowerCase();
+  if (serialized.includes("e-")) {
+    const [mantissa, exponent] = serialized.split("e-");
+    return (mantissa.split(".")[1]?.length ?? 0) + Number(exponent);
+  }
+
+  return serialized.split(".")[1]?.length ?? 0;
+}
+
+function roundAxisNumber(value: number, precision: number) {
+  const factor = 10 ** precision;
+  return Math.round(value * factor) / factor;
+}
+
+function getNiceAxisStep(rawStep: number) {
+  if (!Number.isFinite(rawStep) || rawStep <= 0) {
+    return 1;
+  }
+
+  const magnitude = 10 ** Math.floor(Math.log10(rawStep));
+  const normalized = rawStep / magnitude;
+  const factor = NICE_AXIS_STEP_FACTORS.find((candidate) => normalized <= candidate) ?? 10;
+  return factor * magnitude;
+}
+
+function buildAxisTicks(min: number, max: number, step: number) {
+  const stepPrecision = getAxisStepPrecision(step);
+  const roundingPrecision = stepPrecision + 6;
+  const start = roundAxisNumber(Math.floor(min / step) * step, roundingPrecision);
+  const stop = roundAxisNumber(Math.ceil(max / step) * step, roundingPrecision);
+  const tickCount = Math.max(2, Math.round((stop - start) / step) + 1);
+
+  return Array.from({ length: tickCount }, (_, index) =>
+    roundAxisNumber(start + step * index, roundingPrecision),
+  );
+}
+
+function scoreAxisTicks(
+  ticks: number[],
+  rawSpan: number,
+  targetTickCount: number,
+  minTickCount: number,
+  maxTickCount: number,
+  highlightedValues: number[],
+) {
+  const step = ticks[1] - ticks[0];
+  const stepPrecision = getAxisStepPrecision(step);
+  const matchTolerance = Math.max(step * 0.05, 10 ** (-(stepPrecision + 2)));
+  const highlightedMisses = highlightedValues.filter(
+    (value) => !ticks.some((tick) => Math.abs(tick - value) <= matchTolerance),
+  ).length;
+  const overflowPenalty = ticks.length > maxTickCount ? (ticks.length - maxTickCount) * 4 : 0;
+  const underflowPenalty = ticks.length < minTickCount ? (minTickCount - ticks.length) * 4 : 0;
+  const tickCountPenalty = Math.abs(ticks.length - targetTickCount);
+  const extraPadding = Math.max(0, (ticks.at(-1) ?? ticks[0]) - ticks[0] - rawSpan);
+  const paddingPenalty = rawSpan === 0 ? 0 : extraPadding / rawSpan;
+  const precisionPenalty = stepPrecision * 0.25;
+
+  return highlightedMisses * 3
+    + overflowPenalty
+    + underflowPenalty
+    + tickCountPenalty
+    + paddingPenalty
+    + precisionPenalty;
+}
+
+export function buildNiceNumericAxis(
+  values: readonly number[],
+  options?: {
+    highlightedValues?: readonly number[];
+    minTickCount?: number;
+    targetTickCount?: number;
+    maxTickCount?: number;
+  },
+): NumericAxisScale {
+  const finiteValues = values.filter((value): value is number => Number.isFinite(value));
+  if (finiteValues.length === 0) {
+    return {
+      domain: DEFAULT_NUMERIC_AXIS_DOMAIN,
+      ticks: DEFAULT_NUMERIC_AXIS_TICKS,
+    };
+  }
+
+  const highlightedValues = (options?.highlightedValues ?? []).filter(
+    (value): value is number => Number.isFinite(value),
+  );
+  const minTickCount = options?.minTickCount ?? 4;
+  const targetTickCount = options?.targetTickCount ?? 6;
+  const maxTickCount = options?.maxTickCount ?? 8;
+  let rawMin = Math.min(...finiteValues);
+  let rawMax = Math.max(...finiteValues);
+
+  if (rawMin === rawMax) {
+    const padding = rawMin === 0 ? 1 : Math.abs(rawMin) * 0.2;
+    rawMin -= padding;
+    rawMax += padding;
+  }
+
+  const rawSpan = rawMax - rawMin;
+  const candidateSteps = new Set<number>();
+  for (let tickCount = minTickCount; tickCount <= maxTickCount; tickCount += 1) {
+    candidateSteps.add(getNiceAxisStep(rawSpan / Math.max(tickCount - 1, 1)));
+  }
+
+  let bestScale: NumericAxisScale | null = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  // Score a few nearby round steps so converted values can snap to a readable
+  // axis without always forcing the exact reference bounds into the tick list.
+  for (const step of Array.from(candidateSteps).sort((left, right) => left - right)) {
+    const ticks = buildAxisTicks(rawMin, rawMax, step);
+    const score = scoreAxisTicks(
+      ticks,
+      rawSpan,
+      targetTickCount,
+      minTickCount,
+      maxTickCount,
+      highlightedValues,
+    );
+    if (score >= bestScore) {
+      continue;
+    }
+
+    bestScore = score;
+    bestScale = {
+      domain: [ticks[0], ticks.at(-1) ?? ticks[0]],
+      ticks,
+    };
+  }
+
+  return bestScale ?? {
+    domain: DEFAULT_NUMERIC_AXIS_DOMAIN,
+    ticks: DEFAULT_NUMERIC_AXIS_TICKS,
+  };
 }
 
 export function isUnitConversionMissing(

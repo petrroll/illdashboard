@@ -30,6 +30,7 @@ import type {
   Measurement,
 } from "../types";
 import {
+  buildNiceNumericAxis,
   formatDate,
   formatMeasurementValue,
   getMeasurementValueClass,
@@ -312,8 +313,20 @@ export default function MarkerChart() {
   );
   const latestChartMeasurement = chartMeasurements.at(-1) ?? null;
 
+  const totalMarkers = overview.reduce((count, group) => count + group.markers.length, 0);
+  const selectedOverviewItem = useMemo(
+    () =>
+      overview
+        .flatMap((group) => group.markers)
+        .find((item) => item.marker_name === selectedMarker),
+    [overview, selectedMarker],
+  );
+  const summarySource = detail ?? selectedOverviewItem ?? null;
+  const refLow = summarySource?.reference_low ?? null;
+  const refHigh = summarySource?.reference_high ?? null;
+
   const unit = getDisplayUnit(latestChartMeasurement?.canonical_unit) ?? "";
-  const yAxisDomain: [number, number] = useMemo(() => {
+  const yAxisScale = useMemo(() => {
     const yAxisValues = chartMeasurements.flatMap((measurement) => {
       const values = [
         measurement.canonical_value,
@@ -326,17 +339,10 @@ export default function MarkerChart() {
       );
     });
 
-    if (yAxisValues.length === 0) {
-      return [0, 1];
-    }
-
-    const min = Math.min(...yAxisValues);
-    const max = Math.max(...yAxisValues);
-    const span = max - min;
-    const padding = span === 0 ? Math.max(Math.abs(max) * 0.1, 1) : span * 0.1;
-
-    return [min - padding, max + padding];
-  }, [chartMeasurements]);
+    return buildNiceNumericAxis(yAxisValues, {
+      highlightedValues: [refLow, refHigh],
+    });
+  }, [chartMeasurements, refLow, refHigh]);
 
   const selectMarker = (markerName: string) => {
     startTransition(() => {
@@ -349,18 +355,6 @@ export default function MarkerChart() {
       setSearchParams(nextParams, { replace: true, preventScrollReset: true });
     });
   };
-
-  const totalMarkers = overview.reduce((count, group) => count + group.markers.length, 0);
-  const selectedOverviewItem = useMemo(
-    () =>
-      overview
-        .flatMap((group) => group.markers)
-        .find((item) => item.marker_name === selectedMarker),
-    [overview, selectedMarker],
-  );
-  const summarySource = detail ?? selectedOverviewItem ?? null;
-  const refLow = summarySource?.reference_low ?? null;
-  const refHigh = summarySource?.reference_high ?? null;
   const hideDetailTrendChart = Boolean(
     detail
       && !detail.has_numeric_history
@@ -770,7 +764,9 @@ export default function MarkerChart() {
                           <XAxis dataKey="dateLabel" stroke="#96a1ae" />
                         )}
                         <YAxis
-                          domain={yAxisDomain}
+                          domain={yAxisScale.domain}
+                          ticks={yAxisScale.ticks}
+                          interval={0}
                           stroke="#96a1ae"
                           width={96}
                           tickFormatter={formatSignificantValue}
