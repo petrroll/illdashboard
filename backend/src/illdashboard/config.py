@@ -12,7 +12,7 @@ class Settings(BaseSettings):
 
     # GitHub Copilot SDK settings
     COPILOT_DEFAULT_MODEL: str = "gpt-5.4"
-    COPILOT_MEASUREMENT_EXTRACTION_MODEL: str = "gpt-5.4"
+    COPILOT_MEASUREMENT_EXTRACTION_MODEL: str = "gpt-5.4-mini"
     # Measurement extraction behaves like OCR/structured parsing, so keep
     # reasoning disabled unless we have evidence it improves accuracy enough to
     # justify the latency.
@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     # Text extraction is OCR/transcription work rather than a task that
     # benefits from extra reasoning.
     COPILOT_TEXT_EXTRACTION_REASONING_EFFORT: Literal["low", "medium", "high", "xhigh"] | None = None
-    COPILOT_NORMALIZATION_MODEL: str = "gpt-5-mini"
+    COPILOT_NORMALIZATION_MODEL: str = "gpt-5.4-mini"
     COPILOT_NORMALIZATION_REASONING_EFFORT: Literal["low", "medium", "high", "xhigh"] = "high"
     # Token is read from environment – set GITHUB_TOKEN before running
     GITHUB_TOKEN: str = ""
