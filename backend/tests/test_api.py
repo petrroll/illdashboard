@@ -25,6 +25,7 @@ from illdashboard.services import admin as admin_service
 from illdashboard.services import jobs as job_service
 from illdashboard.services import pipeline, rescaling
 from illdashboard.services import search as search_service
+from illdashboard.services.markers import normalize_marker_alias_key
 from illdashboard.services.upload_metadata import original_name_sidecar_path
 
 
@@ -1257,6 +1258,13 @@ async def test_marker_tag_endpoints_expose_and_filter_range_derived_tags(client,
         )
         session.add_all([file, crp, hemoglobin])
         await session.flush()
+        session.add(
+            MeasurementAlias(
+                alias_name="C-Reactive Protein",
+                normalized_key=normalize_marker_alias_key("C-Reactive Protein"),
+                measurement_type_id=crp.id,
+            )
+        )
         session.add_all(
             [
                 Measurement(
@@ -1303,6 +1311,7 @@ async def test_marker_tag_endpoints_expose_and_filter_range_derived_tags(client,
     groups = overview_response.json()
     markers = [marker for group in groups for marker in group["markers"]]
     assert [marker["marker_name"] for marker in markers] == ["CRP"]
+    assert markers[0]["aliases"] == ["C-Reactive Protein"]
     assert "range:onlyOutOfRange" in markers[0]["marker_tags"]
     assert "range:mostlyOutOfRange" in markers[0]["marker_tags"]
     assert "range:someOutOfRange" in markers[0]["marker_tags"]
@@ -1398,6 +1407,13 @@ async def test_marker_detail_reuses_history_reference_for_missing_range_rows(cli
         )
         session.add_all([first_file, second_file, marker_type])
         await session.flush()
+        session.add(
+            MeasurementAlias(
+                alias_name="VZV IgG abs.",
+                normalized_key=normalize_marker_alias_key("VZV IgG abs."),
+                measurement_type_id=marker_type.id,
+            )
+        )
         session.add_all(
             [
                 Measurement(
@@ -1431,6 +1447,7 @@ async def test_marker_detail_reuses_history_reference_for_missing_range_rows(cli
     )
     assert response.status_code == 200
     body = response.json()
+    assert body["aliases"] == ["VZV IgG abs."]
     assert body["reference_high"] == 150.0
     assert "range:onlyOutOfRange" in body["marker_tags"]
     assert "range:mostlyOutOfRange" in body["marker_tags"]

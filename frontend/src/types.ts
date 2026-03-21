@@ -59,6 +59,7 @@ export interface Measurement {
 
 export interface MarkerOverviewItem {
   marker_name: string;
+  aliases: string[];
   group_name: string;
   canonical_unit?: string | null;
   latest_measurement: Measurement;
@@ -84,6 +85,7 @@ export interface MarkerOverviewGroup {
 
 export interface MarkerDetailResponse {
   marker_name: string;
+  aliases: string[];
   group_name: string;
   canonical_unit?: string | null;
   latest_measurement: Measurement;

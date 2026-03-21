@@ -62,7 +62,7 @@ async def measurement_overview(
         .join(Measurement.measurement_type)
         .join(Measurement.lab_file)
         .options(
-            selectinload(Measurement.measurement_type),
+            selectinload(Measurement.measurement_type).selectinload(MeasurementType.aliases),
             selectinload(Measurement.lab_file).selectinload(LabFile.tags),
         )
         .where(Measurement.normalization_status == VISIBLE_MEASUREMENT_STATUS)

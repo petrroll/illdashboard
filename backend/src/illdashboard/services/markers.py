@@ -283,6 +283,28 @@ async def load_measurement_type_aliases(db: AsyncSession, names: list[str]) -> d
     return {name: alias_by_key[key] for name, key in keys_by_name.items() if key in alias_by_key}
 
 
+def measurement_alias_names(measurement_type: MeasurementType | None) -> list[str]:
+    """Return distinct non-canonical aliases from an eagerly loaded measurement type."""
+
+    if measurement_type is None:
+        return []
+
+    canonical_key = normalize_marker_alias_key(measurement_type.name)
+    aliases: list[str] = []
+    seen_keys: set[str] = set()
+
+    # Read from __dict__ so response shaping never triggers an async lazy load.
+    for alias in measurement_type.__dict__.get("aliases", []):
+        alias_name = alias.alias_name.strip()
+        alias_key = normalize_marker_alias_key(alias_name)
+        if not alias_name or not alias_key or alias_key == canonical_key or alias_key in seen_keys:
+            continue
+        seen_keys.add(alias_key)
+        aliases.append(alias_name)
+
+    return sorted(aliases, key=str.casefold)
+
+
 async def ensure_measurement_type_aliases(
     db: AsyncSession,
     alias_pairs: list[tuple[str, MeasurementType]],
@@ -447,7 +469,7 @@ async def load_measurements_for_marker(db: AsyncSession, marker_name: str) -> li
     result = await db.execute(
         select(Measurement)
         .options(
-            selectinload(Measurement.measurement_type),
+            selectinload(Measurement.measurement_type).selectinload(MeasurementType.aliases),
             selectinload(Measurement.lab_file).selectinload(LabFile.tags),
         )
         .where(Measurement.measurement_type_id == measurement_type.id)
@@ -601,6 +623,7 @@ def build_marker_payload(measurements: list[Measurement]) -> dict:
     ]
     return {
         "marker_name": latest.marker_name,
+        "aliases": measurement_alias_names(latest.measurement_type),
         "group_name": latest.group_name,
         "canonical_unit": latest.canonical_unit,
         "latest_measurement": latest,

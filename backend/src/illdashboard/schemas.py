@@ -117,6 +117,7 @@ class MeasurementOut(BaseModel):
 
 class MarkerOverviewItem(BaseModel):
     marker_name: str
+    aliases: list[str] = Field(default_factory=list)
     group_name: str
     canonical_unit: str | None = None
     latest_measurement: MeasurementOut
@@ -142,6 +143,7 @@ class MarkerOverviewGroup(BaseModel):
 
 class MarkerDetailResponse(BaseModel):
     marker_name: str
+    aliases: list[str] = Field(default_factory=list)
     group_name: str
     canonical_unit: str | None = None
     latest_measurement: MeasurementOut

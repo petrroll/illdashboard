@@ -316,7 +316,8 @@ export default function MarkerChart() {
         .map((group) => ({
           ...group,
           markers: group.markers.filter((marker) => {
-            const searchText = [marker.marker_name, marker.group_name, ...marker.tags]
+            // Keep canonical biomarker rows discoverable by historical lab aliases too.
+            const searchText = [marker.marker_name, ...marker.aliases, marker.group_name, ...marker.tags]
               .join(" ")
               .toLowerCase();
             return !deferredSearch || searchText.includes(deferredSearch);
