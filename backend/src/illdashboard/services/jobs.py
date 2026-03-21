@@ -192,9 +192,19 @@ async def prune_jobs(session: AsyncSession) -> None:
             Job.status.in_([JOB_STATUS_FAILED, JOB_STATUS_CANCELLED]), Job.updated_at < stale_failed_before
         )
     )
+    # Reset attempt_count so that server restarts (especially via
+    # --reload) do not permanently burn through the retry budget for
+    # long-running jobs like Copilot normalization calls.
     await session.execute(
         update(Job)
         .where(Job.status == JOB_STATUS_LEASED)
-        .values(status=JOB_STATUS_PENDING, lease_owner=None, lease_until=None, updated_at=now)
+        .values(
+            status=JOB_STATUS_PENDING,
+            lease_owner=None,
+            lease_until=None,
+            attempt_count=0,
+            error_text=None,
+            updated_at=now,
+        )
     )
     await session.commit()
