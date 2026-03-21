@@ -324,8 +324,8 @@ export default function MarkerChart() {
   const summarySource = detail ?? selectedOverviewItem ?? null;
   const refLow = summarySource?.reference_low ?? null;
   const refHigh = summarySource?.reference_high ?? null;
-  const refLowLabel = refLow == null ? null : `Low ${formatSignificantValue(refLow)}`;
-  const refHighLabel = refHigh == null ? null : `High ${formatSignificantValue(refHigh)}`;
+  const refLowLabel = refLow == null ? undefined : `Low ${formatSignificantValue(refLow)}`;
+  const refHighLabel = refHigh == null ? undefined : `High ${formatSignificantValue(refHigh)}`;
 
   const unit = getDisplayUnit(latestChartMeasurement?.canonical_unit) ?? "";
   const yAxisScale = useMemo(() => {
