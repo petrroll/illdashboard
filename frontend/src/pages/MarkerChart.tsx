@@ -58,6 +58,40 @@ const DEFAULT_LIST_PANE_WIDTH = 680;
 const MAX_LIST_PANE_WIDTH = 680;
 const MIN_DETAIL_PANE_WIDTH = 380;
 
+type MarkerChartPoint = {
+  dateLabel: string;
+  axisDateLabel: string;
+  timestamp: number;
+  value: number | null;
+  reference_low: number | null;
+  reference_high: number | null;
+  hasEstimatedDate: boolean;
+};
+
+function parseMeasuredAtTimestamp(measuredAt: string | null) {
+  if (!measuredAt) {
+    return null;
+  }
+
+  const timestamp = new Date(measuredAt).getTime();
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function formatTimestampLabel(timestamp: number | null) {
+  if (timestamp == null || !Number.isFinite(timestamp)) {
+    return "—";
+  }
+
+  return new Date(timestamp).toLocaleDateString(undefined);
+}
+
+function getMonthStartTimestamp(timestamp: number) {
+  const date = new Date(timestamp);
+  // Use local noon on day 1 so browser-local formatting stays in the expected
+  // calendar month instead of drifting backward when a time axis is enabled.
+  return new Date(date.getFullYear(), date.getMonth(), 1, 12).getTime();
+}
+
 function mergeUniqueTags(...tagGroups: string[][]) {
   return Array.from(new Set(tagGroups.flat()));
 }
@@ -323,23 +357,47 @@ export default function MarkerChart() {
     () => measurements.filter((measurement) => getCanonicalTrendValue(measurement) != null),
     [measurements],
   );
-  const chartData = useMemo(
-    () =>
-      chartMeasurements.map((measurement) => ({
-        dateLabel: formatDate(measurement.measured_at),
-        measuredAt: measurement.measured_at ?? "",
-        timestamp: measurement.measured_at ? new Date(measurement.measured_at).getTime() : 0,
-        value: getCanonicalTrendValue(measurement),
-        reference_low: measurement.unit_conversion_missing ? null : measurement.canonical_reference_low,
-        reference_high: measurement.unit_conversion_missing ? null : measurement.canonical_reference_high,
-      })),
-    [chartMeasurements],
-  );
+  const chartSeries = useMemo(() => {
+    const measuredTimestamps = chartMeasurements.map((measurement) =>
+      parseMeasuredAtTimestamp(measurement.measured_at),
+    );
+    const firstMeasuredTimestamp = measuredTimestamps.find(
+      (timestamp): timestamp is number => timestamp != null,
+    ) ?? null;
+    const fallbackTimestamp = firstMeasuredTimestamp == null
+      ? null
+      : getMonthStartTimestamp(firstMeasuredTimestamp);
+
+    return {
+      chartData: chartMeasurements.map<MarkerChartPoint>((measurement, index) => {
+        const measuredTimestamp = measuredTimestamps[index];
+        const axisTimestamp = measuredTimestamp ?? fallbackTimestamp ?? index;
+
+        return {
+          dateLabel: formatDate(measurement.measured_at),
+          axisDateLabel: formatTimestampLabel(measuredTimestamp ?? fallbackTimestamp),
+          timestamp: axisTimestamp,
+          value: getCanonicalTrendValue(measurement),
+          reference_low: measurement.unit_conversion_missing ? null : measurement.canonical_reference_low,
+          reference_high: measurement.unit_conversion_missing ? null : measurement.canonical_reference_high,
+          hasEstimatedDate: measuredTimestamp == null && fallbackTimestamp != null,
+        };
+      }),
+      fallbackTimestamp,
+      hasMeasuredDates: firstMeasuredTimestamp != null,
+      undatedCount: measuredTimestamps.filter((timestamp) => timestamp == null).length,
+    };
+  }, [chartMeasurements]);
+  const chartData = chartSeries.chartData;
   const hasMissingUnitConversions = useMemo(
     () => measurements.some((measurement) => isUnitConversionMissing(measurement)),
     [measurements],
   );
   const latestChartMeasurement = chartMeasurements.at(-1) ?? null;
+  const timeWeightedAxisActive = timeWeightedAxis && chartSeries.hasMeasuredDates;
+  const timeAxisFallbackLabel = chartSeries.fallbackTimestamp == null
+    ? null
+    : formatTimestampLabel(chartSeries.fallbackTimestamp);
 
   const totalMarkers = overview.reduce((count, group) => count + group.markers.length, 0);
   const selectedOverviewItem = useMemo(
@@ -756,17 +814,27 @@ export default function MarkerChart() {
                         Time-proportional axis
                       </label>
                     </div>
+                    {timeWeightedAxis && !timeWeightedAxisActive && (
+                      <p className="measurement-warning-note" style={{ marginBottom: "0.75rem" }}>
+                        Time-proportional spacing needs at least one dated result. Showing evenly spaced points instead.
+                      </p>
+                    )}
+                    {timeWeightedAxisActive && chartSeries.undatedCount > 0 && timeAxisFallbackLabel && (
+                      <p className="measurement-warning-note" style={{ marginBottom: "0.75rem" }}>
+                        {chartSeries.undatedCount === 1 ? "One undated result is" : `${chartSeries.undatedCount} undated results are`} placed on {timeAxisFallbackLabel} so the time-proportional axis stays in the first recorded month instead of jumping to 1970.
+                      </p>
+                    )}
                     <ResponsiveContainer width="100%" height={320}>
                       <LineChart data={chartData}>
                         <CartesianGrid strokeDasharray="3 3" stroke="#303c4d" />
-                        {timeWeightedAxis ? (
+                        {timeWeightedAxisActive ? (
                           <XAxis
                             dataKey="timestamp"
                             type="number"
                             scale="time"
                             domain={["dataMin", "dataMax"]}
                             stroke="#96a1ae"
-                            tickFormatter={(ts: number) => formatDate(new Date(ts).toISOString())}
+                            tickFormatter={(ts: number) => formatTimestampLabel(ts)}
                           />
                         ) : (
                           <XAxis dataKey="dateLabel" stroke="#96a1ae" />
@@ -786,7 +854,20 @@ export default function MarkerChart() {
                         />
                         <Tooltip
                           formatter={(value) => formatMeasurementValue(Number(value ?? 0), unit)}
-                          labelFormatter={(label) => `Date: ${label}`}
+                          labelFormatter={(
+                            _label: string | number,
+                            payload: Array<{ payload?: MarkerChartPoint }>,
+                          ) => {
+                            const point = payload[0]?.payload;
+                            if (!point) {
+                              return "Date: —";
+                            }
+
+                            const label = timeWeightedAxisActive ? point.axisDateLabel : point.dateLabel;
+                            return point.hasEstimatedDate && timeWeightedAxisActive
+                              ? `Date: ${label} (estimated)`
+                              : `Date: ${label}`;
+                          }}
                           contentStyle={{ background: "#161d27", border: "1px solid #303c4d", borderRadius: "8px", color: "#edf1f7" }}
                         />
                         {refLow != null && refHigh != null && (

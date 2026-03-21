@@ -51,7 +51,7 @@ def _measurement(
         ),
         (
             [_measurement(value=12.0, reference_low=0.0, reference_high=5.0)],
-            [ONLY_OUT_OF_RANGE_TAG],
+            [ONLY_OUT_OF_RANGE_TAG, MOSTLY_OUT_OF_RANGE_TAG, SOME_OUT_OF_RANGE_TAG],
         ),
         (
             [
@@ -66,7 +66,7 @@ def _measurement(
                 _measurement(value=4.0, reference_low=0.0, reference_high=5.0),
                 _measurement(value=14.0, reference_low=0.0, reference_high=5.0),
             ],
-            [MOSTLY_OUT_OF_RANGE_TAG],
+            [MOSTLY_OUT_OF_RANGE_TAG, SOME_OUT_OF_RANGE_TAG],
         ),
         (
             [_measurement(value=12.0), _measurement(unit_conversion_missing=True)],
@@ -92,7 +92,11 @@ def test_derived_range_tags_use_boolean_projection(
     qualitative_bool: bool,
     expected_tag: str,
 ):
-    assert derived_range_tags([_measurement(qualitative_bool=qualitative_bool)]) == [expected_tag]
+    tags = derived_range_tags([_measurement(qualitative_bool=qualitative_bool)])
+    assert expected_tag in tags
+    if qualitative_bool:
+        assert MOSTLY_OUT_OF_RANGE_TAG in tags
+        assert SOME_OUT_OF_RANGE_TAG in tags
 
 
 def test_derived_range_tags_reuse_marker_history_reference_for_missing_ranges():
@@ -101,7 +105,22 @@ def test_derived_range_tags_reuse_marker_history_reference_for_missing_ranges():
         _measurement(value=1712.0, reference_high=150.0),
     ]
 
-    assert derived_range_tags(measurements) == [ONLY_OUT_OF_RANGE_TAG]
+    assert derived_range_tags(measurements) == [ONLY_OUT_OF_RANGE_TAG, MOSTLY_OUT_OF_RANGE_TAG, SOME_OUT_OF_RANGE_TAG]
+
+
+def test_derived_range_tags_some_out_of_range_is_superset_of_other_out_of_range_buckets():
+    all_out_of_range = derived_range_tags([
+        _measurement(value=12.0, reference_low=0.0, reference_high=5.0),
+    ])
+    mostly_out_of_range = derived_range_tags([
+        _measurement(value=12.0, reference_low=0.0, reference_high=5.0),
+        _measurement(value=14.0, reference_low=0.0, reference_high=5.0),
+        _measurement(value=4.0, reference_low=0.0, reference_high=5.0),
+    ])
+
+    assert SOME_OUT_OF_RANGE_TAG in all_out_of_range
+    assert SOME_OUT_OF_RANGE_TAG in mostly_out_of_range
+    assert MOSTLY_OUT_OF_RANGE_TAG in all_out_of_range
 
 
 def test_combine_marker_tags_keeps_norange_when_history_still_has_unclassifiable_rows():

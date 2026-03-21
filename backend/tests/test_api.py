@@ -1290,6 +1290,8 @@ async def test_marker_tag_endpoints_expose_and_filter_range_derived_tags(client,
     tags_response = await client.get("/api/tags/markers")
     assert tags_response.status_code == 200
     assert "range:onlyOutOfRange" in tags_response.json()
+    assert "range:mostlyOutOfRange" in tags_response.json()
+    assert "range:someOutOfRange" in tags_response.json()
     assert "range:onlyInRange" in tags_response.json()
 
     overview_response = await client.get(
@@ -1302,6 +1304,24 @@ async def test_marker_tag_endpoints_expose_and_filter_range_derived_tags(client,
     markers = [marker for group in groups for marker in group["markers"]]
     assert [marker["marker_name"] for marker in markers] == ["CRP"]
     assert "range:onlyOutOfRange" in markers[0]["marker_tags"]
+    assert "range:mostlyOutOfRange" in markers[0]["marker_tags"]
+    assert "range:someOutOfRange" in markers[0]["marker_tags"]
+
+    mostly_response = await client.get(
+        "/api/measurements/overview",
+        params=[("tags", "range:mostlyOutOfRange")],
+    )
+    assert mostly_response.status_code == 200
+    mostly_markers = [marker for group in mostly_response.json() for marker in group["markers"]]
+    assert [marker["marker_name"] for marker in mostly_markers] == ["CRP"]
+
+    some_response = await client.get(
+        "/api/measurements/overview",
+        params=[("tags", "range:someOutOfRange")],
+    )
+    assert some_response.status_code == 200
+    some_markers = [marker for group in some_response.json() for marker in group["markers"]]
+    assert [marker["marker_name"] for marker in some_markers] == ["CRP"]
 
 
 @pytest.mark.asyncio
@@ -1343,6 +1363,8 @@ async def test_set_marker_tags_strips_reserved_range_tags_but_returns_derived_ta
     assert response.status_code == 200
     assert "manual-tag" in response.json()
     assert "range:onlyOutOfRange" in response.json()
+    assert "range:mostlyOutOfRange" in response.json()
+    assert "range:someOutOfRange" in response.json()
     assert "range:noRange" not in response.json()
 
     async with session_factory() as session:
@@ -1411,4 +1433,6 @@ async def test_marker_detail_reuses_history_reference_for_missing_range_rows(cli
     body = response.json()
     assert body["reference_high"] == 150.0
     assert "range:onlyOutOfRange" in body["marker_tags"]
+    assert "range:mostlyOutOfRange" in body["marker_tags"]
+    assert "range:someOutOfRange" in body["marker_tags"]
     assert "range:noRange" not in body["marker_tags"]

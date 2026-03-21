@@ -192,16 +192,16 @@ def derived_range_tags(measurements: list[Measurement]) -> list[str]:
             no_range_count += 1
 
     derived_tags: list[str] = []
-    # Keep missing-range coverage additive so callers can distinguish incomplete
-    # reference intervals from the dominant in/out-of-range history trend.
+    # These range tags are intentionally additive rather than exclusive so
+    # broader filters remain supersets of stricter ones.
     if in_range_count or out_of_range_count:
         if out_of_range_count == 0:
             derived_tags.append(ONLY_IN_RANGE_TAG)
-        elif in_range_count == 0:
-            derived_tags.append(ONLY_OUT_OF_RANGE_TAG)
-        elif out_of_range_count > in_range_count:
-            derived_tags.append(MOSTLY_OUT_OF_RANGE_TAG)
         else:
+            if in_range_count == 0:
+                derived_tags.append(ONLY_OUT_OF_RANGE_TAG)
+            if in_range_count == 0 or out_of_range_count > in_range_count:
+                derived_tags.append(MOSTLY_OUT_OF_RANGE_TAG)
             derived_tags.append(SOME_OUT_OF_RANGE_TAG)
     if no_range_count:
         derived_tags.append(NO_RANGE_TAG)
