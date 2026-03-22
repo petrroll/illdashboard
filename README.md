@@ -42,7 +42,7 @@ justfile          – build / dev / test / lint commands
 - **Serialized normalization** – DB lookups are used first, and any LLM-backed normalization result is stored back into the DB for reuse
 - **Progressive visibility** – measurements become visible as soon as they are individually resolved
 - **Charts** – visualize any marker's trend over time (with reference range lines)
-- **Meds timeline** – track medications with multiple dose episodes on a shared editable timeline
+- **Shared meds + events timeline** – track medications and dated life/health events together on one editable timeline
 - **Tables** – view all values from a single lab report
 - **AI Explanations** – click "Explain" on any marker or select multiple and get a cross-marker analysis
 - **Shareable HTML export** – download a single self-contained `.html` snapshot with page previews, measurements, biomarker views, OCR text, and search for offline sharing

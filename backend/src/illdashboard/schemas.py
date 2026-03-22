@@ -298,6 +298,65 @@ class MedicationOut(BaseModel):
     updated_at: datetime
 
 
+class TimelineEventOccurrenceWrite(BaseModel):
+    start_on: str = Field(description=EPISODE_DATE_FORMAT_HINT)
+    end_on: str | None = Field(default=None, description=EPISODE_DATE_FORMAT_HINT)
+    notes: str | None = None
+
+    @field_validator("start_on", mode="before")
+    @classmethod
+    def _normalize_start_on(cls, value: Any) -> str:
+        normalized = normalize_episode_date(value, field_name="start_on")
+        if normalized is None:
+            raise ValueError("start_on is required.")
+        return normalized
+
+    @field_validator("end_on", mode="before")
+    @classmethod
+    def _normalize_end_on(cls, value: Any) -> str | None:
+        return normalize_episode_date(value, field_name="end_on", allow_blank=True)
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def _normalize_notes(cls, value: Any) -> str | None:
+        return _normalize_optional_text(value)
+
+    @model_validator(mode="after")
+    def _validate_date_range(self):
+        if self.end_on is not None and parse_episode_end(self.end_on) < parse_episode_start(self.start_on):
+            raise ValueError("end_on cannot be earlier than start_on.")
+        return self
+
+
+class TimelineEventWrite(BaseModel):
+    name: str
+    occurrences: list[TimelineEventOccurrenceWrite] = Field(min_length=1)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _normalize_name(cls, value: Any) -> str:
+        return _normalize_required_text(value, "name")
+
+
+class TimelineEventOccurrenceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    start_on: str
+    end_on: str | None = None
+    notes: str | None = None
+
+
+class TimelineEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    occurrences: list[TimelineEventOccurrenceOut] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+
 class TagsUpdate(BaseModel):
     tags: list[str]
 

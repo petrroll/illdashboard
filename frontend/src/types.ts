@@ -89,6 +89,32 @@ export interface MedicationWrite {
   episodes: MedicationEpisodeWrite[];
 }
 
+export interface TimelineEventOccurrence {
+  id: number;
+  start_on: string;
+  end_on: string | null;
+  notes: string | null;
+}
+
+export interface TimelineEvent {
+  id: number;
+  name: string;
+  occurrences: TimelineEventOccurrence[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TimelineEventOccurrenceWrite {
+  start_on: string;
+  end_on: string | null;
+  notes: string | null;
+}
+
+export interface TimelineEventWrite {
+  name: string;
+  occurrences: TimelineEventOccurrenceWrite[];
+}
+
 export interface MarkerOverviewItem {
   marker_name: string;
   aliases: string[];

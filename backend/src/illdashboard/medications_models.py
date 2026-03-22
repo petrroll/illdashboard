@@ -55,3 +55,45 @@ class MedicationEpisode(MedicationsBase):
     )
 
     medication: Mapped[Medication] = relationship(back_populates="episodes")
+
+
+class TimelineEvent(MedicationsBase):
+    __tablename__ = "timeline_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    occurrences: Mapped[list[TimelineEventOccurrence]] = relationship(
+        back_populates="event",
+        cascade="all, delete-orphan",
+        order_by="TimelineEventOccurrence.position, TimelineEventOccurrence.id",
+    )
+
+
+class TimelineEventOccurrence(MedicationsBase):
+    __tablename__ = "timeline_event_occurrences"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[int] = mapped_column(
+        ForeignKey("timeline_events.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    start_on: Mapped[str] = mapped_column(String, nullable=False)
+    end_on: Mapped[str | None] = mapped_column(String, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    event: Mapped[TimelineEvent] = relationship(back_populates="occurrences")
