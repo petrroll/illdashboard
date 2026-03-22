@@ -1,6 +1,7 @@
-import { BrowserRouter, Routes, Route, NavLink, Navigate } from "react-router-dom";
+import { BrowserRouter, HashRouter, Routes, Route, NavLink, Navigate } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { fetchMarkerNames } from "./api";
+import { getShareExportBundle, isShareExportMode } from "./export/runtime";
 import Settings from "./pages/Settings";
 import Files from "./pages/Files";
 import FileDetail from "./pages/FileDetail";
@@ -29,12 +30,16 @@ function HomeRedirect() {
 }
 
 function App() {
+  const shareExportMode = isShareExportMode();
+  const shareExport = getShareExportBundle();
+  const Router = shareExportMode ? HashRouter : BrowserRouter;
+
   return (
-    <BrowserRouter>
+    <Router>
       <div className="app">
         <nav className="sidebar">
           <h1 className="logo">
-            <img className="logo-mark" src="/favicon.svg" alt="" aria-hidden="true" />
+            {!shareExportMode && <img className="logo-mark" src="/favicon.svg" alt="" aria-hidden="true" />}
             <span>Health Dashboard</span>
           </h1>
           {navigationItems.map((item) => (
@@ -44,6 +49,14 @@ function App() {
           ))}
         </nav>
         <main className="content">
+          {shareExportMode && shareExport && (
+            <div className="card" style={{ marginBottom: "1rem", padding: "0.9rem 1rem" }}>
+              <strong>Shareable snapshot.</strong>{" "}
+              Opened from a single exported HTML file created{" "}
+              {new Date(shareExport.exported_at).toLocaleString()}. Browsing and search work locally,
+              but uploads, reprocessing, and summaries are disabled.
+            </div>
+          )}
           <Routes>
             <Route path="/" element={<HomeRedirect />} />
             <Route path="/files" element={<Files />} />
@@ -54,7 +67,7 @@ function App() {
           </Routes>
         </main>
       </div>
-    </BrowserRouter>
+    </Router>
   );
 }
 

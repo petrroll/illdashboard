@@ -10,6 +10,11 @@ import {
   purgeExplanationCache,
   resetDatabase,
 } from "../api";
+import {
+  getShareExportBundle,
+  getShareExportMeasurements,
+  isShareExportMode,
+} from "../export/runtime";
 import type {
   LabFile,
   Measurement,
@@ -17,6 +22,7 @@ import type {
 } from "../types";
 import {
   formatDate,
+  formatDateTime,
   formatMeasurementScalarValue,
   formatReferenceRange,
   getDisplayUnit,
@@ -88,7 +94,54 @@ async function performSettingsAction(action: SettingsAction) {
   }
 }
 
-export default function Settings() {
+function ExportSettings() {
+  const bundle = getShareExportBundle();
+  const recentMeasurements = getShareExportMeasurements();
+  const latestMeasurement = recentMeasurements[recentMeasurements.length - 1] ?? null;
+
+  return (
+    <>
+      <h2>Settings</h2>
+
+      <div className="card" style={{ marginBottom: "1.5rem" }}>
+        <h3 style={{ marginBottom: "0.75rem" }}>Share export</h3>
+        <p style={{ color: "var(--text-muted)", lineHeight: 1.5 }}>
+          This file is a standalone export created {bundle ? formatDateTime(bundle.exported_at) : "offline"}.
+          Browsing and search work locally, but uploads, reprocessing, admin actions, and generated summaries
+          are intentionally disabled.
+        </p>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: "1rem", marginBottom: "1.5rem" }}>
+        <div className="card" style={{ textAlign: "center" }}>
+          <div style={{ fontSize: "2rem", fontWeight: 700 }}>{bundle?.files.length ?? 0}</div>
+          <div style={{ color: "var(--text-muted)" }}>Lab Files</div>
+        </div>
+        <div className="card" style={{ textAlign: "center" }}>
+          <div style={{ fontSize: "2rem", fontWeight: 700 }}>{bundle?.marker_names.length ?? 0}</div>
+          <div style={{ color: "var(--text-muted)" }}>Unique Markers</div>
+        </div>
+        <div className="card" style={{ textAlign: "center" }}>
+          <div style={{ fontSize: "2rem", fontWeight: 700 }}>
+            {formatDate(latestMeasurement?.measured_at ?? null)}
+          </div>
+          <div style={{ color: "var(--text-muted)" }}>Latest Result</div>
+        </div>
+        <div className="card" style={{ textAlign: "center" }}>
+          <div style={{ fontSize: "2rem", fontWeight: 700 }}>{bundle ? formatDate(bundle.exported_at) : "—"}</div>
+          <div style={{ color: "var(--text-muted)" }}>Exported</div>
+        </div>
+      </div>
+
+      <div className="flex-row gap-1 mt-1">
+        <Link to="/files" className="btn btn-primary">Browse Files</Link>
+        <Link to="/charts" className="btn btn-outline">Browse Biomarkers</Link>
+      </div>
+    </>
+  );
+}
+
+function OnlineSettings() {
   const [files, setFiles] = useState<LabFile[]>([]);
   const [markers, setMarkers] = useState<string[]>([]);
   const [recentMeasurements, setRecentMeasurements] = useState<Measurement[]>([]);
@@ -167,6 +220,21 @@ export default function Settings() {
           </div>
           <div style={{ color: "var(--text-muted)" }}>Copilot Requests</div>
         </div>
+      </div>
+
+      <div className="card" style={{ marginBottom: "1.5rem" }}>
+        <h3 style={{ marginBottom: "0.75rem" }}>Share export</h3>
+        <p style={{ color: "var(--text-muted)", marginBottom: "0.75rem", lineHeight: 1.5 }}>
+          Download a single HTML snapshot that bundles page previews, OCR text, measurements, search data,
+          and biomarker views for sharing. The export is read-only and intentionally omits generated summaries.
+        </p>
+        <a
+          className="btn btn-primary"
+          style={{ textDecoration: "none" }}
+          href="/api/export/share-html"
+        >
+          Download shareable HTML
+        </a>
       </div>
 
       <div className="card" style={{ marginBottom: "1.5rem" }}>
@@ -272,4 +340,8 @@ export default function Settings() {
       </div>
     </>
   );
+}
+
+export default function Settings() {
+  return isShareExportMode() ? <ExportSettings /> : <OnlineSettings />;
 }

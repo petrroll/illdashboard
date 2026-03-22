@@ -51,6 +51,10 @@ import {
   hasRescaledMeasurementValue,
   isUnitConversionMissing,
 } from "../utils/measurements";
+import {
+  getShareExportMarkerSparklineUrl,
+  isShareExportMode,
+} from "../export/runtime";
 
 const LIST_PANE_STORAGE_KEY = "illdashboard.markerListWidth";
 const MIN_LIST_PANE_WIDTH = 300;
@@ -184,6 +188,7 @@ function getMeasurementStatusClassName(
 }
 
 export default function MarkerChart() {
+  const shareExportMode = isShareExportMode();
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedMarker = searchParams.get("marker") ?? "";
   const [overview, setOverview] = useState<MarkerOverviewGroup[]>([]);
@@ -277,8 +282,13 @@ export default function MarkerChart() {
         const response = await fetchMarkerDetail(selectedMarker);
         if (!cancelled) {
           setDetail(response);
-          setInsight(response.explanation);
-          setInsightCached(response.explanation_cached);
+          if (shareExportMode) {
+            setInsight(null);
+            setInsightCached(false);
+          } else {
+            setInsight(response.explanation);
+            setInsightCached(response.explanation_cached);
+          }
         }
       } finally {
         if (!cancelled) {
@@ -302,13 +312,17 @@ export default function MarkerChart() {
       }
     };
 
-    loadDetail();
-    loadInsight();
+    void loadDetail();
+    if (shareExportMode) {
+      setLoadingInsight(false);
+    } else {
+      void loadInsight();
+    }
 
     return () => {
       cancelled = true;
     };
-  }, [selectedMarker]);
+  }, [selectedMarker, shareExportMode]);
 
   const filteredOverview = useMemo(
     () =>
@@ -465,16 +479,20 @@ export default function MarkerChart() {
   );
 
   const rangeMeter = (item: MarkerOverviewItem) => {
+    const sparklineSrc = shareExportMode
+      ? getShareExportMarkerSparklineUrl(item.marker_name)
+      : `/api/measurements/sparkline?marker_name=${encodeURIComponent(item.marker_name)}&v=6`;
+
     if (!item.has_numeric_history) {
       return (
         <div className="range-meter">
           <span className={`status-pill ${getQualitativeStatusClassName(item)}`}>
             {formatQualitativeStatusLabel(item)}
           </span>
-          {item.has_qualitative_trend && (
+          {item.has_qualitative_trend && sparklineSrc && (
             <img
               className="sparkline-img"
-              src={`/api/measurements/sparkline?marker_name=${encodeURIComponent(item.marker_name)}&v=6`}
+              src={sparklineSrc}
               alt={`Sparkline for ${item.marker_name}`}
               loading="lazy"
               decoding="async"
@@ -487,13 +505,15 @@ export default function MarkerChart() {
     return (
       <div className="range-meter">
         <span className={`status-pill status-${item.status}`}>{getMarkerStatusLabel(item.status)}</span>
-        <img
-          className="sparkline-img"
-          src={`/api/measurements/sparkline?marker_name=${encodeURIComponent(item.marker_name)}&v=6`}
-          alt={`Sparkline for ${item.marker_name}`}
-          loading="lazy"
-          decoding="async"
-        />
+        {sparklineSrc && (
+          <img
+            className="sparkline-img"
+            src={sparklineSrc}
+            alt={`Sparkline for ${item.marker_name}`}
+            loading="lazy"
+            decoding="async"
+          />
+        )}
       </div>
     );
   };
@@ -732,12 +752,26 @@ export default function MarkerChart() {
                   Latest result on {formatDate(summarySource.latest_measurement.measured_at)}
                 </p>
                 <div style={{ marginTop: "0.35rem" }}>
-                  <TagInput
-                    tags={detail?.marker_tags ?? summarySource.marker_tags}
-                    allTags={allMarkerTags}
-                    onChange={(newTags) => handleMarkerTagsChange(summarySource.marker_name, newTags)}
-                    placeholder="Add marker tag…"
-                  />
+                  {shareExportMode ? (
+                    <div className="tag-list" style={{ minHeight: "1.5rem" }}>
+                      {(detail?.marker_tags ?? summarySource.marker_tags).length > 0 ? (
+                        (detail?.marker_tags ?? summarySource.marker_tags).map((tag) => (
+                          <span key={tag} className="tag-pill">{tag}</span>
+                        ))
+                      ) : (
+                        <span style={{ color: "var(--text-muted)", fontSize: "0.8rem" }}>
+                          No marker tags
+                        </span>
+                      )}
+                    </div>
+                  ) : (
+                    <TagInput
+                      tags={detail?.marker_tags ?? summarySource.marker_tags}
+                      allTags={allMarkerTags}
+                      onChange={(newTags) => handleMarkerTagsChange(summarySource.marker_name, newTags)}
+                      placeholder="Add marker tag…"
+                    />
+                  )}
                 </div>
                 {summarySource.file_tags.length > 0 && (
                   <div className="tag-list" style={{ marginTop: "0.45rem" }}>
@@ -961,25 +995,27 @@ export default function MarkerChart() {
               </>
             )}
 
-            <div className="explanation-panel">
-              <div className="explanation-header">
-                <h3>Interpretation</h3>
-                {insight && (
-                  <span className="cache-note">
-                    {insightCached ? "served from cache" : "freshly generated"}
-                  </span>
+            {!shareExportMode && (
+              <div className="explanation-panel">
+                <div className="explanation-header">
+                  <h3>Interpretation</h3>
+                  {insight && (
+                    <span className="cache-note">
+                      {insightCached ? "served from cache" : "freshly generated"}
+                    </span>
+                  )}
+                </div>
+                {insight ? (
+                  <ReactMarkdown>{insight}</ReactMarkdown>
+                ) : loadingInsight ? (
+                  <div className="card-empty detail-loading-block">
+                    <span className="spinner" /> Generating interpretation…
+                  </div>
+                ) : (
+                  <p className="marker-subtitle">Interpretation is not available yet.</p>
                 )}
               </div>
-              {insight ? (
-                <ReactMarkdown>{insight}</ReactMarkdown>
-              ) : loadingInsight ? (
-                <div className="card-empty detail-loading-block">
-                  <span className="spinner" /> Generating interpretation…
-                </div>
-              ) : (
-                <p className="marker-subtitle">Interpretation is not available yet.</p>
-              )}
-            </div>
+            )}
           </>
         )}
       </aside>

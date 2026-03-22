@@ -11,6 +11,7 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = "sqlite+aiosqlite:///./data/health.db"
     UPLOAD_DIR: str = str(Path(__file__).resolve().parent.parent / "data" / "uploads")
+    FRONTEND_DIST_DIR: str = str(Path(__file__).resolve().parents[3] / "frontend" / "dist")
     # Keep the first pass as a global provider switch so the durable pipeline can
     # reuse its existing job graph without adding per-request provider state.
     EXTRACTION_PROVIDER: ProviderName = "copilot"

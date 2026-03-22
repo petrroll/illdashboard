@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -210,6 +210,35 @@ class SearchResultOut(BaseModel):
     tags: list[str] = Field(default_factory=list)
     marker_names: list[str] = Field(default_factory=list)
     snippets: list[SearchSnippet] = Field(default_factory=list)
+
+
+class ShareExportFileAssets(BaseModel):
+    page_image_urls: list[str] = Field(default_factory=list)
+
+
+class ShareExportSearchDocument(BaseModel):
+    file_id: int
+    marker_names: list[str] = Field(default_factory=list)
+    filename_text: str = ""
+    tags_text: str = ""
+    raw_text: str = ""
+    translated_text: str = ""
+    measurements_text: str = ""
+
+
+class ShareExportBundle(BaseModel):
+    kind: Literal["share-export-v1"] = "share-export-v1"
+    exported_at: datetime
+    files: list[LabFileOut] = Field(default_factory=list)
+    file_measurements: dict[str, list[MeasurementOut]] = Field(default_factory=dict)
+    file_assets: dict[str, ShareExportFileAssets] = Field(default_factory=dict)
+    file_tags: list[str] = Field(default_factory=list)
+    marker_tags: list[str] = Field(default_factory=list)
+    marker_names: list[str] = Field(default_factory=list)
+    marker_overview: list[MarkerOverviewGroup] = Field(default_factory=list)
+    marker_details: dict[str, MarkerDetailResponse] = Field(default_factory=dict)
+    marker_sparkline_urls: dict[str, str] = Field(default_factory=dict)
+    search_documents: list[ShareExportSearchDocument] = Field(default_factory=list)
 
 
 class RescalingRuleOut(BaseModel):

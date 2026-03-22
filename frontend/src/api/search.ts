@@ -1,4 +1,5 @@
 import { apiClient } from "./client";
+import { isShareExportMode, searchShareExportFiles } from "../export/runtime";
 import type { SearchResult } from "../types";
 
 function buildSearchParams(query: string, tags: string[]) {
@@ -11,6 +12,9 @@ function buildSearchParams(query: string, tags: string[]) {
 }
 
 export async function searchFiles(query: string, tags: string[] = []) {
+  if (isShareExportMode()) {
+    return searchShareExportFiles(query, tags);
+  }
   const response = await apiClient.get<SearchResult[]>("/search", {
     params: buildSearchParams(query, tags),
   });

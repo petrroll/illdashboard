@@ -34,6 +34,10 @@ import {
   hasRescaledMeasurementValue,
   isUnitConversionMissing,
 } from "../utils/measurements";
+import {
+  getShareExportPageImageUrl,
+  isShareExportMode,
+} from "../export/runtime";
 
 const FILE_POLL_INTERVAL_MS = 3000;
 
@@ -104,6 +108,7 @@ function renderStatusBadge(file: LabFile) {
 }
 
 export default function FileDetail() {
+  const shareExportMode = isShareExportMode();
   const { id } = useParams<{ id: string }>();
   const fileId = id ?? null;
   const [file, setFile] = useState<LabFile | null>(null);
@@ -146,7 +151,7 @@ export default function FileDetail() {
   }, [load]);
 
   useEffect(() => {
-    if (!isFileActive(file)) {
+    if (shareExportMode || !isFileActive(file)) {
       return;
     }
 
@@ -175,7 +180,7 @@ export default function FileDetail() {
         window.clearTimeout(timeoutId);
       }
     };
-  }, [file, load]);
+  }, [file, load, shareExportMode]);
 
   useEffect(() => {
     return () => {
@@ -273,6 +278,7 @@ export default function FileDetail() {
   if (!fileId) return <p>File not found.</p>;
   if (!file) return <p>Loading…</p>;
 
+  const canExplain = !shareExportMode;
   const hasPages = pageInfo && pageInfo.page_count > 0;
   const showPageColumn = (pageInfo?.page_count ?? 0) > 1;
   const searchLower = search.toLowerCase();
@@ -331,34 +337,48 @@ export default function FileDetail() {
           Tags
         </span>
         <div style={{ flex: "1 1 320px", minWidth: "220px", maxWidth: "560px" }}>
-          <TagInput
-            tags={file.tags}
-            allTags={allFileTags}
-            onChange={async (newTags) => {
-              const savedTags = await setFileTags(file.id, newTags);
-              setFile((previousFile) =>
-                previousFile ? { ...previousFile, tags: savedTags } : previousFile,
-              );
-              setAllFileTags(await fetchFileTags());
-            }}
-            placeholder="Add tag…"
-          />
+          {shareExportMode ? (
+            <div className="tag-list" style={{ minHeight: "1.5rem" }}>
+              {file.tags.length > 0 ? (
+                file.tags.map((tag) => (
+                  <span key={tag} className="tag-pill">{tag}</span>
+                ))
+              ) : (
+                <span style={{ color: "var(--text-muted)", fontSize: "0.8rem" }}>No file tags</span>
+              )}
+            </div>
+          ) : (
+            <TagInput
+              tags={file.tags}
+              allTags={allFileTags}
+              onChange={async (newTags) => {
+                const savedTags = await setFileTags(file.id, newTags);
+                setFile((previousFile) =>
+                  previousFile ? { ...previousFile, tags: savedTags } : previousFile,
+                );
+                setAllFileTags(await fetchFileTags());
+              }}
+              placeholder="Add tag…"
+            />
+          )}
         </div>
       </div>
 
       <div className="flex-row mb-1">
-        <button className="btn btn-primary" onClick={runOcr} disabled={ocrRunning || isFileActive(file)}>
-          {ocrRunning ? (
-            <>
-              <span className="spinner" /> Queueing…
-            </>
-          ) : file.status === "complete" ? (
-            "Re-run processing"
-          ) : (
-            "Start processing"
-          )}
-        </button>
-        {selected.size > 0 && measurements.length > 0 && (
+        {!shareExportMode && (
+          <button className="btn btn-primary" onClick={runOcr} disabled={ocrRunning || isFileActive(file)}>
+            {ocrRunning ? (
+              <>
+                <span className="spinner" /> Queueing…
+              </>
+            ) : file.status === "complete" ? (
+              "Re-run processing"
+            ) : (
+              "Start processing"
+            )}
+          </button>
+        )}
+        {canExplain && selected.size > 0 && measurements.length > 0 && (
           <button className="btn btn-outline" onClick={explainSelected} disabled={explaining}>
             {explaining ? (
               <>
@@ -371,7 +391,14 @@ export default function FileDetail() {
         )}
       </div>
 
-      {file.ocr_summary_english && (
+      {shareExportMode && (
+        <p style={{ color: "var(--text-muted)", fontSize: "0.85rem", marginBottom: "1rem" }}>
+          Share exports are read-only, use display-quality page previews, and intentionally omit generated
+          summaries and interpretations.
+        </p>
+      )}
+
+      {!shareExportMode && file.ocr_summary_english && (
         <section className="card ocr-summary-card">
           <div className="ocr-summary-eyebrow">English summary</div>
           <p>{file.ocr_summary_english}</p>
@@ -421,7 +448,9 @@ export default function FileDetail() {
                     <span className="file-preview-page-label">Page {pageNum}</span>
                   )}
                   <img
-                    src={`/api/files/${fileId}/pages/${pageNum}`}
+                    src={shareExportMode
+                      ? (getShareExportPageImageUrl(file.id, pageNum) ?? "")
+                      : `/api/files/${fileId}/pages/${pageNum}`}
                     alt={`Page ${pageNum}`}
                     loading="lazy"
                   />
@@ -455,14 +484,14 @@ export default function FileDetail() {
               <table>
                 <thead>
                   <tr>
-                    <th></th>
+                    {canExplain && <th></th>}
                     <th>Marker</th>
                     <th>Value</th>
                     <th>Unit</th>
                     <th>Reference</th>
                     <th>Date</th>
                     {hasPages && showPageColumn && <th>Page</th>}
-                    <th></th>
+                    {canExplain && <th></th>}
                   </tr>
                 </thead>
                 <tbody>
@@ -490,15 +519,17 @@ export default function FileDetail() {
 
                     return (
                       <tr key={measurement.id}>
-                        <td>
-                          <label className="checkbox-row">
-                            <input
-                              type="checkbox"
-                              checked={selected.has(measurement.id)}
-                              onChange={() => toggleSelect(measurement.id)}
-                            />
-                          </label>
-                        </td>
+                        {canExplain && (
+                          <td>
+                            <label className="checkbox-row">
+                              <input
+                                type="checkbox"
+                                checked={selected.has(measurement.id)}
+                                onChange={() => toggleSelect(measurement.id)}
+                              />
+                            </label>
+                          </td>
+                        )}
                         <td style={{ fontWeight: 500 }}>{measurement.marker_name}</td>
                         <td
                           className={getMeasurementValueClass({
@@ -552,11 +583,13 @@ export default function FileDetail() {
                             )}
                           </td>
                         )}
-                        <td>
-                          <button className="btn btn-outline btn-sm" onClick={() => void explainSingle(measurement)}>
-                            Explain
-                          </button>
-                        </td>
+                        {canExplain && (
+                          <td>
+                            <button className="btn btn-outline btn-sm" onClick={() => void explainSingle(measurement)}>
+                              Explain
+                            </button>
+                          </td>
+                        )}
                       </tr>
                     );
                   })}
@@ -565,7 +598,7 @@ export default function FileDetail() {
             </div>
           )}
 
-          {explanation && (
+          {!shareExportMode && explanation && (
             <section className="card" style={{ marginTop: "1rem" }}>
               <div style={{ color: "var(--text-muted)", fontSize: "0.8rem", marginBottom: "0.5rem" }}>
                 AI explanation

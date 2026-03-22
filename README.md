@@ -44,6 +44,7 @@ justfile          – build / dev / test / lint commands
 - **Charts** – visualize any marker's trend over time (with reference range lines)
 - **Tables** – view all values from a single lab report
 - **AI Explanations** – click "Explain" on any marker or select multiple and get a cross-marker analysis
+- **Shareable HTML export** – download a single self-contained `.html` snapshot with page previews, measurements, biomarker views, OCR text, and search for offline sharing
 - **Local storage** – all uploaded files stay on your filesystem under `backend/data/uploads/`
 
 ## Prerequisites
@@ -111,6 +112,7 @@ Newer logs also emit file-aware task spans for summary, search, text assembly, m
 5. Click **Explain** on any row, or select multiple rows and click **Explain selected**
 6. Go to **Charts** to see how a specific marker changes over time
 7. Select data points in the chart table to get AI cross-analysis
+8. Open **Settings** → **Download shareable HTML** to create a read-only snapshot for sharing; the export keeps files, search, and data views, but omits generated summaries and reprocessing
 
 ## Configuration
 

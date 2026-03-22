@@ -2,6 +2,7 @@ import { useDeferredValue, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { fetchFileTags, searchFiles } from "../api";
 import TagFilter from "../components/TagFilter";
+import { isShareExportMode } from "../export/runtime";
 import type { SearchResult } from "../types";
 import { formatDate, formatDateTime } from "../utils/measurements";
 
@@ -27,6 +28,7 @@ function getSnippetLabel(source: string | null) {
 }
 
 export default function Search() {
+  const shareExportMode = isShareExportMode();
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [allTags, setAllTags] = useState<string[]>([]);
@@ -74,7 +76,9 @@ export default function Search() {
       <div className="search-hero card">
         <h2>Search</h2>
         <p className="search-subtitle">
-          Search across file tags, English summaries, OCR text, and extracted measurements.
+          {shareExportMode
+            ? "Search across file tags, OCR text, and extracted measurements in this shared snapshot."
+            : "Search across file tags, English summaries, OCR text, and extracted measurements."}
         </p>
 
         <div className="search-form-shell">

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
@@ -124,6 +128,102 @@ async def test_delete_file_removes_original_name_sidecar(client, session_factory
 
     async with session_factory() as session:
         assert await session.get(LabFile, uploaded_file["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_share_export_html_embeds_assets_and_omits_summary_content(
+    client,
+    session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    dist_dir = tmp_path / "frontend-dist"
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    (dist_dir / "share-export-shell.html").write_text(
+        (
+            "<!doctype html><html><body>"
+            '<script id="illdashboard-export-bundle" type="application/octet-stream">'
+            "__ILLDASHBOARD_EXPORT_BASE64__"
+            "</script>"
+            "</body></html>"
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings, "FRONTEND_DIST_DIR", str(dist_dir))
+
+    file_path = Path(settings.UPLOAD_DIR) / "share-report.png"
+    file_path.write_bytes(
+        base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+yF9kAAAAASUVORK5CYII="
+        )
+    )
+
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="share-report.png",
+            filepath=str(file_path),
+            mime_type="image/png",
+            page_count=1,
+            status="complete",
+            ocr_text_raw="Ferritin 12 ug/L",
+            ocr_text_english="Ferritin 12 ug/L",
+            ocr_summary_english="Generated summary should stay out of the export.",
+            search_indexed_at=utc_now(),
+        )
+        measurement_type = MeasurementType(
+            name="Ferritin",
+            normalized_key="ferritin",
+            group_name="Inflammation & Infection",
+            canonical_unit="ug/L",
+        )
+        session.add_all([lab_file, measurement_type])
+        await session.flush()
+        session.add(LabFileTag(lab_file_id=lab_file.id, tag="doctor"))
+        session.add(
+            Measurement(
+                lab_file_id=lab_file.id,
+                measurement_type_id=measurement_type.id,
+                raw_marker_name="Ferritin",
+                normalized_marker_key="ferritin",
+                canonical_value=12.0,
+                canonical_unit="ug/L",
+                canonical_reference_low=20.0,
+                canonical_reference_high=200.0,
+                measured_at=utc_now(),
+                normalization_status="resolved",
+            )
+        )
+        await session.commit()
+
+    with patch(
+        "illdashboard.api.export.measurements_api.measurement_sparkline",
+        new=AsyncMock(return_value=Response(content=b"sparkline-bytes", media_type="image/png")),
+    ):
+        response = await client.get("/api/export/share-html")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "attachment;" in response.headers["content-disposition"]
+
+    match = re.search(
+        r'<script id="illdashboard-export-bundle" type="application/octet-stream">([^<]+)</script>',
+        response.text,
+    )
+    assert match is not None
+
+    bundle = json.loads(base64.b64decode(match.group(1)).decode("utf-8"))
+    assert bundle["kind"] == "share-export-v1"
+    assert bundle["files"][0]["filename"] == "share-report.png"
+    assert "ocr_summary_english" not in bundle["files"][0]
+    assert bundle["files"][0]["filepath"] == ""
+    assert "ocr_raw" not in bundle["files"][0]
+    assert "original_file_data_url" not in bundle["file_assets"][str(bundle["files"][0]["id"])]
+    assert bundle["file_assets"][str(bundle["files"][0]["id"])]["page_image_urls"][0].startswith("data:image/")
+    assert "explanation" not in bundle["marker_details"]["Ferritin"]
+    assert bundle["marker_details"]["Ferritin"]["explanation_cached"] is False
+    assert bundle["marker_sparkline_urls"]["Ferritin"].startswith("data:image/png;base64,")
+    assert bundle["search_documents"][0]["translated_text"] == "Ferritin 12 ug/L"
+    assert "summary" not in bundle["search_documents"][0]
 
 
 @pytest.mark.asyncio

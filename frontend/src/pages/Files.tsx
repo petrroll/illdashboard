@@ -12,6 +12,7 @@ import {
 } from "../api";
 import TagInput from "../components/TagInput";
 import TagFilter from "../components/TagFilter";
+import { isShareExportMode } from "../export/runtime";
 import type { LabFile } from "../types";
 import { formatDate } from "../utils/measurements";
 
@@ -91,6 +92,8 @@ function renderStatusBadge(file: LabFile) {
 }
 
 export default function Files() {
+  const shareExportMode = isShareExportMode();
+  const canManageFiles = !shareExportMode;
   const [files, setFiles] = useState<LabFile[]>([]);
   const [uploading, setUploading] = useState(false);
   const [pendingProcessAction, setPendingProcessAction] = useState<PendingProcessAction>(null);
@@ -128,7 +131,7 @@ export default function Files() {
   const isSelectionLocked = hasActiveJobs || isPrimaryActionPending;
 
   useEffect(() => {
-    if (!hasActiveJobs) {
+    if (shareExportMode || !hasActiveJobs) {
       return;
     }
 
@@ -157,7 +160,7 @@ export default function Files() {
         window.clearTimeout(timeoutId);
       }
     };
-  }, [hasActiveJobs, loadFiles]);
+  }, [hasActiveJobs, loadFiles, shareExportMode]);
 
   const handleUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = event.target.files;
@@ -252,7 +255,7 @@ export default function Files() {
 
   const unprocessedCount = files.filter((file) => file.status === "uploaded" || file.status === "error").length;
   const isFileChecked = (file: LabFile) => selected.has(file.id) || isFileActive(file);
-  const allFilesSelected = files.length > 0 && files.every(isFileChecked);
+  const allFilesSelected = canManageFiles && files.length > 0 && files.every(isFileChecked);
 
   const sortedFiles = useMemo(() => {
     const query = searchQuery.toLowerCase();
@@ -279,32 +282,34 @@ export default function Files() {
     field === "lab_date" ? "Lab Date" : "Uploaded";
 
   return (
-    <>
-      <h2>Lab Files</h2>
+      <>
+        <h2>Lab Files</h2>
 
-      <div className="upload-area" onClick={() => inputRef.current?.click()}>
-        {uploading ? (
-          <span className="flex-row" style={{ justifyContent: "center" }}>
-            <span className="spinner" /> Uploading…
-          </span>
-        ) : (
-          <>
-            <p>📂 Click to select PDF or image files</p>
-            <p style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>
-              Supports .pdf, .png, .jpg, .webp
-            </p>
-          </>
-        )}
-        <input
-          ref={inputRef}
-          type="file"
-          accept=".pdf,.png,.jpg,.jpeg,.webp"
-          multiple
-          onChange={handleUpload}
-        />
-      </div>
+      {canManageFiles && (
+        <div className="upload-area" onClick={() => inputRef.current?.click()}>
+          {uploading ? (
+            <span className="flex-row" style={{ justifyContent: "center" }}>
+              <span className="spinner" /> Uploading…
+            </span>
+          ) : (
+            <>
+              <p>📂 Click to select PDF or image files</p>
+              <p style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>
+                Supports .pdf, .png, .jpg, .webp
+              </p>
+            </>
+          )}
+          <input
+            ref={inputRef}
+            type="file"
+            accept=".pdf,.png,.jpg,.jpeg,.webp"
+            multiple
+            onChange={handleUpload}
+          />
+        </div>
+      )}
 
-      {files.length > 0 && (
+      {canManageFiles && files.length > 0 && (
         <div style={{ margin: "1rem 0" }}>
           <div className="flex-row" style={{ gap: "0.5rem" }}>
             <button
@@ -359,28 +364,32 @@ export default function Files() {
       )}
 
       {sortedFiles.length === 0 ? (
-        <p style={{ color: "var(--text-muted)" }}>No files uploaded yet.</p>
+        <p style={{ color: "var(--text-muted)" }}>
+          {shareExportMode ? "This export does not contain any files." : "No files uploaded yet."}
+        </p>
       ) : (
         <div className="card" style={{ overflow: "auto" }}>
           <table>
             <thead>
               <tr>
-                <th>
-                  <label className={`checkbox-row${isSelectionLocked ? " checkbox-row-disabled" : ""}`}>
-                    <input
-                      type="checkbox"
-                      checked={allFilesSelected}
-                      onChange={toggleSelectAll}
-                      disabled={isSelectionLocked}
-                    />
-                  </label>
-                </th>
+                {canManageFiles && (
+                  <th>
+                    <label className={`checkbox-row${isSelectionLocked ? " checkbox-row-disabled" : ""}`}>
+                      <input
+                        type="checkbox"
+                        checked={allFilesSelected}
+                        onChange={toggleSelectAll}
+                        disabled={isSelectionLocked}
+                      />
+                    </label>
+                  </th>
+                )}
                 <th>Filename</th>
                 <th>Lab Date</th>
                 <th>Uploaded</th>
                 <th>Status</th>
                 <th>Tags</th>
-                <th></th>
+                {canManageFiles && <th></th>}
               </tr>
             </thead>
             <tbody>
@@ -393,22 +402,24 @@ export default function Files() {
                   <Fragment key={file.id}>
                     {showYearDivider && (
                       <tr>
-                        <td colSpan={7} style={{ color: "var(--text-muted)", fontWeight: 600 }}>
+                        <td colSpan={canManageFiles ? 7 : 5} style={{ color: "var(--text-muted)", fontWeight: 600 }}>
                           {year}
                         </td>
                       </tr>
                     )}
                     <tr>
-                      <td>
-                        <label className={`checkbox-row${isSelectionLocked ? " checkbox-row-disabled" : ""}`}>
-                          <input
-                            type="checkbox"
-                            checked={isFileChecked(file)}
-                            onChange={() => toggleSelect(file.id)}
-                            disabled={isSelectionLocked}
-                          />
-                        </label>
-                      </td>
+                      {canManageFiles && (
+                        <td>
+                          <label className={`checkbox-row${isSelectionLocked ? " checkbox-row-disabled" : ""}`}>
+                            <input
+                              type="checkbox"
+                              checked={isFileChecked(file)}
+                              onChange={() => toggleSelect(file.id)}
+                              disabled={isSelectionLocked}
+                            />
+                          </label>
+                        </td>
+                      )}
                       <td>
                         <Link to={`/files/${file.id}`} style={{ fontWeight: 600 }}>
                           {file.filename}
@@ -427,7 +438,7 @@ export default function Files() {
                         </div>
                       </td>
                       <td style={{ minWidth: 160 }}>
-                        {editingTagsFileId === file.id ? (
+                        {canManageFiles && editingTagsFileId === file.id ? (
                           <TagInput
                             tags={file.tags}
                             allTags={allFileTags}
@@ -445,9 +456,9 @@ export default function Files() {
                         ) : (
                           <div
                             className="tag-list"
-                            onClick={() => setEditingTagsFileId(file.id)}
-                            style={{ cursor: "pointer", minHeight: "1.5rem" }}
-                            title="Click to edit tags"
+                            onClick={canManageFiles ? () => setEditingTagsFileId(file.id) : undefined}
+                            style={{ cursor: canManageFiles ? "pointer" : "default", minHeight: "1.5rem" }}
+                            title={canManageFiles ? "Click to edit tags" : undefined}
                           >
                             {file.tags.length > 0 ? (
                               file.tags.map((tag) => (
@@ -461,11 +472,13 @@ export default function Files() {
                           </div>
                         )}
                       </td>
-                      <td style={{ whiteSpace: "nowrap" }}>
-                        <button className="btn btn-outline btn-sm" onClick={() => handleDelete(file.id)}>
-                          Delete
-                        </button>
-                      </td>
+                      {canManageFiles && (
+                        <td style={{ whiteSpace: "nowrap" }}>
+                          <button className="btn btn-outline btn-sm" onClick={() => handleDelete(file.id)}>
+                            Delete
+                          </button>
+                        </td>
+                      )}
                     </tr>
                   </Fragment>
                 );
