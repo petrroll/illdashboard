@@ -1,7 +1,14 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from illdashboard.medications_dates import (
+    EPISODE_DATE_FORMAT_HINT,
+    normalize_episode_date,
+    parse_episode_end,
+    parse_episode_start,
+)
 
 
 class FileProgressOut(BaseModel):
@@ -191,6 +198,104 @@ class QueueFilesResponse(BaseModel):
 
 class ExplainResponse(BaseModel):
     explanation: str
+
+
+def _normalize_required_text(value: Any, field_name: str) -> str:
+    if value is None:
+        raise ValueError(f"{field_name} is required.")
+    normalized = str(value).strip()
+    if not normalized:
+        raise ValueError(f"{field_name} is required.")
+    return normalized
+
+
+def _normalize_optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+class MedicationEpisodeWrite(BaseModel):
+    start_on: str = Field(description=EPISODE_DATE_FORMAT_HINT)
+    end_on: str | None = Field(default=None, description=EPISODE_DATE_FORMAT_HINT)
+    still_taking: bool = False
+    dose: str
+    frequency: str = "daily"
+    notes: str | None = None
+
+    @field_validator("start_on", mode="before")
+    @classmethod
+    def _normalize_start_on(cls, value: Any) -> str:
+        normalized = normalize_episode_date(value, field_name="start_on")
+        if normalized is None:
+            raise ValueError("start_on is required.")
+        return normalized
+
+    @field_validator("end_on", mode="before")
+    @classmethod
+    def _normalize_end_on(cls, value: Any) -> str | None:
+        return normalize_episode_date(value, field_name="end_on", allow_blank=True)
+
+    @field_validator("dose", mode="before")
+    @classmethod
+    def _normalize_dose(cls, value: Any) -> str:
+        return _normalize_required_text(value, "dose")
+
+    @field_validator("frequency", mode="before")
+    @classmethod
+    def _normalize_frequency(cls, value: Any) -> str:
+        return _normalize_required_text(value if value is not None else "daily", "frequency")
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def _normalize_notes(cls, value: Any) -> str | None:
+        return _normalize_optional_text(value)
+
+    @model_validator(mode="after")
+    def _validate_date_range(self):
+        if self.still_taking:
+            self.end_on = None
+            return self
+
+        if self.end_on is None:
+            raise ValueError("Set an end date/month or mark the episode as still taking.")
+
+        if parse_episode_end(self.end_on) < parse_episode_start(self.start_on):
+            raise ValueError("end_on cannot be earlier than start_on.")
+        return self
+
+
+class MedicationWrite(BaseModel):
+    name: str
+    episodes: list[MedicationEpisodeWrite] = Field(min_length=1)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _normalize_name(cls, value: Any) -> str:
+        return _normalize_required_text(value, "name")
+
+
+class MedicationEpisodeOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    start_on: str
+    end_on: str | None = None
+    still_taking: bool
+    dose: str
+    frequency: str
+    notes: str | None = None
+
+
+class MedicationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    episodes: list[MedicationEpisodeOut] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
 
 
 class TagsUpdate(BaseModel):

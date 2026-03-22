@@ -11,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from illdashboard import config
 from illdashboard.database import create_database_engine, get_db
+from illdashboard.medications_database import dispose_medications_engine, get_medications_db
+from illdashboard.medications_models import MedicationsBase
 from illdashboard.models import Base
 from illdashboard.services.markers import ensure_marker_groups
 from illdashboard.services.search import ensure_search_schema
@@ -44,9 +46,32 @@ async def session_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
-async def client(session_factory):
+async def medications_session_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    db_path = tmp_path / "medications.db"
+    db_url = f"sqlite+aiosqlite:///{db_path}"
+    monkeypatch.setattr(config.settings, "MEDICATIONS_DATABASE_URL", db_url)
+
+    engine = create_database_engine(db_url)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(MedicationsBase.metadata.create_all)
+
+    try:
+        yield factory
+    finally:
+        await engine.dispose()
+        await dispose_medications_engine()
+
+
+@pytest.fixture
+async def client(session_factory, medications_session_factory):
     async def _get_db():
         async with session_factory() as session:
+            yield session
+
+    async def _get_medications_db():
+        async with medications_session_factory() as session:
             yield session
 
     with (
@@ -67,6 +92,7 @@ async def client(session_factory):
         from illdashboard.main import app
 
         app.dependency_overrides[get_db] = _get_db
+        app.dependency_overrides[get_medications_db] = _get_medications_db
         transport = ASGITransport(app=app)
         try:
             async with AsyncClient(transport=transport, base_url="http://test") as ac:

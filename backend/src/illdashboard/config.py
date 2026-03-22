@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     DATABASE_URL: str = "sqlite+aiosqlite:///./data/health.db"
+    MEDICATIONS_DATABASE_URL: str = "sqlite+aiosqlite:///./data/medications.db"
     UPLOAD_DIR: str = str(Path(__file__).resolve().parent.parent / "data" / "uploads")
     FRONTEND_DIST_DIR: str = str(Path(__file__).resolve().parents[3] / "frontend" / "dist")
     # Keep the first pass as a global provider switch so the durable pipeline can

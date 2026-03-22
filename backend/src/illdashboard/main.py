@@ -16,6 +16,7 @@ from illdashboard.api import router
 from illdashboard.config import settings
 from illdashboard.copilot.client import prewarm_client, shutdown_client
 from illdashboard.database import async_session, engine
+from illdashboard.medications_database import dispose_medications_engine, init_medications_database
 from illdashboard.models import Base
 from illdashboard.services.pipeline import start_pipeline_runtime, stop_pipeline_runtime
 
@@ -68,6 +69,7 @@ async def lifespan(app: FastAPI):
     upload_dir = Path(settings.UPLOAD_DIR)
     upload_dir.mkdir(parents=True, exist_ok=True)
 
+    await init_medications_database()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
@@ -85,6 +87,7 @@ async def lifespan(app: FastAPI):
                 pass
         await stop_pipeline_runtime()
         await shutdown_client()
+        await dispose_medications_engine()
 
 
 app = FastAPI(

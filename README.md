@@ -42,6 +42,7 @@ justfile          – build / dev / test / lint commands
 - **Serialized normalization** – DB lookups are used first, and any LLM-backed normalization result is stored back into the DB for reuse
 - **Progressive visibility** – measurements become visible as soon as they are individually resolved
 - **Charts** – visualize any marker's trend over time (with reference range lines)
+- **Meds timeline** – track medications with multiple dose episodes on a shared editable timeline
 - **Tables** – view all values from a single lab report
 - **AI Explanations** – click "Explain" on any marker or select multiple and get a cross-marker analysis
 - **Shareable HTML export** – download a single self-contained `.html` snapshot with page previews, measurements, biomarker views, OCR text, and search for offline sharing
@@ -132,6 +133,7 @@ Environment variables (or a local `.env` file in `backend/`):
 | `MISTRAL_OCR_MODEL` | `mistral-ocr-latest` | Mistral OCR/Document AI model used for OCR and annotations |
 | `MISTRAL_CHAT_MODEL` | `mistral-large-latest` | Mistral chat model used for translation and normalization |
 | `DATABASE_URL` | `sqlite+aiosqlite:///./data/health.db` | SQLite database path |
+| `MEDICATIONS_DATABASE_URL` | `sqlite+aiosqlite:///./data/medications.db` | Separate SQLite database path for medication history |
 | `UPLOAD_DIR` | `backend/data/uploads` | Directory for uploaded files |
 
 If you switch `EXTRACTION_PROVIDER=mistral`, measurement extraction uses Mistral Document AI annotations and text OCR uses Mistral OCR plus an English translation step through the configured Mistral chat model.

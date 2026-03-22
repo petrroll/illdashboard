@@ -87,6 +87,7 @@ run-log-viewer:
 # Remove build artifacts and caches
 clean:
     rm -rf backend/.venv backend/dist backend/data/health.db
+    rm -rf backend/data/medications.db
     rm -rf frontend/node_modules frontend/dist
     find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 

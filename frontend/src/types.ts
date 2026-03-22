@@ -57,6 +57,38 @@ export interface Measurement {
   page_number: number | null;
 }
 
+export interface MedicationEpisode {
+  id: number;
+  start_on: string;
+  end_on: string | null;
+  still_taking: boolean;
+  dose: string;
+  frequency: string;
+  notes: string | null;
+}
+
+export interface Medication {
+  id: number;
+  name: string;
+  episodes: MedicationEpisode[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MedicationEpisodeWrite {
+  start_on: string;
+  end_on: string | null;
+  still_taking: boolean;
+  dose: string;
+  frequency: string;
+  notes: string | null;
+}
+
+export interface MedicationWrite {
+  name: string;
+  episodes: MedicationEpisodeWrite[];
+}
+
 export interface MarkerOverviewItem {
   marker_name: string;
   aliases: string[];

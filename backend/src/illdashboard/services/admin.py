@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from illdashboard.database import engine
+from illdashboard.medications_database import reset_medications_database
 from illdashboard.models import Base, BiomarkerInsight, RescalingRule
 from illdashboard.services import pipeline as pipeline_service
 from illdashboard.services.markers import ensure_marker_groups
@@ -38,6 +39,7 @@ async def reset_database() -> int:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.drop_all)
             await conn.run_sync(Base.metadata.create_all)
+        await reset_medications_database()
         async with AsyncSession(engine, expire_on_commit=False) as session:
             await ensure_marker_groups(session)
             await ensure_search_schema(session)

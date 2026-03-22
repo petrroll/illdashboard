@@ -6,11 +6,13 @@ import Settings from "./pages/Settings";
 import Files from "./pages/Files";
 import FileDetail from "./pages/FileDetail";
 import MarkerChart from "./pages/MarkerChart";
+import Medications from "./pages/Medications";
 import Search from "./pages/Search";
 import "./App.css";
 
 const navigationItems = [
   { to: "/charts", label: "Biomarkers" },
+  { to: "/meds", label: "Meds", hideInShareExport: true },
   { to: "/search", label: "Search" },
   { to: "/files", label: "Lab Files" },
   { to: "/settings", label: "Settings" },
@@ -33,6 +35,7 @@ function App() {
   const shareExportMode = isShareExportMode();
   const shareExport = getShareExportBundle();
   const Router = shareExportMode ? HashRouter : BrowserRouter;
+  const visibleNavigationItems = navigationItems.filter((item) => !shareExportMode || !item.hideInShareExport);
 
   return (
     <Router>
@@ -42,7 +45,7 @@ function App() {
             {!shareExportMode && <img className="logo-mark" src="/favicon.svg" alt="" aria-hidden="true" />}
             <span>Health Dashboard</span>
           </h1>
-          {navigationItems.map((item) => (
+          {visibleNavigationItems.map((item) => (
             <NavLink key={item.to} to={item.to}>
               {item.label}
             </NavLink>
@@ -62,6 +65,7 @@ function App() {
             <Route path="/files" element={<Files />} />
             <Route path="/files/:id" element={<FileDetail />} />
             <Route path="/charts" element={<MarkerChart />} />
+            <Route path="/meds" element={<Medications />} />
             <Route path="/search" element={<Search />} />
             <Route path="/settings" element={<Settings />} />
           </Routes>
