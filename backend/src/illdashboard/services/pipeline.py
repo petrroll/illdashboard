@@ -1564,11 +1564,20 @@ async def _canonize_qualitative_jobs(session: AsyncSession, jobs: list[Job]) -> 
             sample = samples_by_key.get(qualitative_key)
             if sample is None or sample.original_qualitative_value is None:
                 continue
+            threshold_result = qualitative_values.infer_threshold_qualitative_result(
+                sample.original_qualitative_value,
+                reference_low=sample.original_reference_low,
+                reference_high=sample.original_reference_high,
+            )
+            if threshold_result is not None:
+                continue
             requests.append(
                 copilot_normalization.QualitativeNormalizationRequest(
                     id=qualitative_key,
                     marker_name=sample.marker_name,
                     original_value=sample.original_qualitative_value,
+                    reference_low=sample.original_reference_low,
+                    reference_high=sample.original_reference_high,
                 )
             )
         if requests:
@@ -1835,9 +1844,15 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
                     _conversion_task_key(measurement_type.normalized_key, original_unit_key, canonical_unit_key)
                 )
         if measurement.original_qualitative_value:
-            qualitative_key = qualitative_values.normalize_qualitative_key(measurement.original_qualitative_value)
-            if qualitative_key:
-                qualitative_task_keys.add(_qualitative_task_key(qualitative_key))
+            threshold_result = qualitative_values.infer_threshold_qualitative_result(
+                measurement.original_qualitative_value,
+                reference_low=measurement.original_reference_low,
+                reference_high=measurement.original_reference_high,
+            )
+            if threshold_result is None:
+                qualitative_key = qualitative_values.normalize_qualitative_key(measurement.original_qualitative_value)
+                if qualitative_key:
+                    qualitative_task_keys.add(_qualitative_task_key(qualitative_key))
 
     conversion_rule_map = await rescaling.load_rescaling_rules(session, conversion_requests)
     conversion_job_statuses = await _load_job_statuses(session, TASK_CANONIZE_CONVERSION, list(conversion_task_keys))
@@ -1953,36 +1968,48 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
                                 rule.scale_factor,
                             )
         elif measurement.original_qualitative_value:
-            qualitative_key = qualitative_values.normalize_qualitative_key(measurement.original_qualitative_value)
-            if qualitative_key is None:
-                measurement.normalization_status = MEASUREMENT_STATE_ERROR
-                measurement.normalization_error = (
-                    f"Unsupported qualitative normalization for {measurement.original_qualitative_value}"
-                )
-                continue
-            rule = qualitative_rule_map.get(qualitative_key)
-            if rule is None:
-                task_key = _qualitative_task_key(qualitative_key)
-                if qualitative_job_statuses.get(task_key) == job_service.JOB_STATUS_FAILED:
+            # Comparator cutoffs such as ">1.5" are only meaningful alongside
+            # the measurement's own reference bounds, so resolve those directly
+            # here instead of persisting a global raw-value rule that could be
+            # wrong for a different assay.
+            threshold_result = qualitative_values.infer_threshold_qualitative_result(
+                measurement.original_qualitative_value,
+                reference_low=measurement.original_reference_low,
+                reference_high=measurement.original_reference_high,
+            )
+            if threshold_result is not None:
+                measurement.qualitative_value, measurement.qualitative_bool = threshold_result
+            else:
+                qualitative_key = qualitative_values.normalize_qualitative_key(measurement.original_qualitative_value)
+                if qualitative_key is None:
                     measurement.normalization_status = MEASUREMENT_STATE_ERROR
                     measurement.normalization_error = (
-                        f"Qualitative canonization failed for {measurement.original_qualitative_value}"
+                        f"Unsupported qualitative normalization for {measurement.original_qualitative_value}"
                     )
                     continue
-                requested_new_work = (
-                    await _request_job(
-                        session,
-                        task_type=TASK_CANONIZE_QUALITATIVE,
-                        task_key=task_key,
-                        payload={"original_value": measurement.original_qualitative_value},
-                        priority=PRIORITY_CANONIZE,
+                rule = qualitative_rule_map.get(qualitative_key)
+                if rule is None:
+                    task_key = _qualitative_task_key(qualitative_key)
+                    if qualitative_job_statuses.get(task_key) == job_service.JOB_STATUS_FAILED:
+                        measurement.normalization_status = MEASUREMENT_STATE_ERROR
+                        measurement.normalization_error = (
+                            f"Qualitative canonization failed for {measurement.original_qualitative_value}"
+                        )
+                        continue
+                    requested_new_work = (
+                        await _request_job(
+                            session,
+                            task_type=TASK_CANONIZE_QUALITATIVE,
+                            task_key=task_key,
+                            payload={"original_value": measurement.original_qualitative_value},
+                            priority=PRIORITY_CANONIZE,
+                        )
+                        or requested_new_work
                     )
-                    or requested_new_work
-                )
-                resolved = False
-            else:
-                measurement.qualitative_value = rule.canonical_value
-                measurement.qualitative_bool = rule.boolean_value
+                    resolved = False
+                else:
+                    measurement.qualitative_value = rule.canonical_value
+                    measurement.qualitative_bool = rule.boolean_value
         else:
             measurement.canonical_value = measurement.original_value
             measurement.canonical_reference_low = measurement.original_reference_low

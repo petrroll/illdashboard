@@ -988,6 +988,7 @@ async def test_normalize_qualitative_values_includes_existing_canonical_values_i
             id="negative",
             marker_name="Chlamydia psittaci IgG",
             original_value="NEGATIVE",
+            reference_high=1.5,
         )
     ]
     response = json.dumps({"negative": {"canonical_value": "negative", "boolean_value": False}})
@@ -1000,6 +1001,33 @@ async def test_normalize_qualitative_values_includes_existing_canonical_values_i
     assert ask_mock.await_args is not None
     _system_prompt, user_prompt = ask_mock.await_args.args
     assert "EXISTING canonical qualitative values:\n- negative\n" in user_prompt
+    assert "reference_low=None; reference_high=1.5" in user_prompt
+
+
+@pytest.mark.asyncio
+async def test_normalize_qualitative_values_falls_back_to_cleaned_original_when_model_returns_no_mapping():
+    requests = [
+        copilot_normalization.QualitativeNormalizationRequest(
+            id="threshold",
+            marker_name="eGF from creatinine",
+            original_value=" >1.5 ",
+        )
+    ]
+    response = json.dumps({"threshold": {"canonical_value": None, "boolean_value": None}})
+
+    with patch("illdashboard.copilot.normalization._ask", new=AsyncMock(return_value=response)):
+        result = await copilot_normalization.normalize_qualitative_values(requests, [])
+
+    assert result == {"threshold": (">1.5", None)}
+
+
+def test_qualitative_normalization_prompt_includes_threshold_cutoff_guidance():
+    prompt = copilot_normalization.QUALITATIVE_NORMALIZATION_SYSTEM_PROMPT
+
+    assert "<1.5" in prompt
+    assert ">1.5" in prompt
+    assert 'means negative' in prompt
+    assert 'means positive' in prompt
 
 
 @pytest.mark.asyncio

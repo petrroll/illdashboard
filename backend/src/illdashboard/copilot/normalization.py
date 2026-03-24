@@ -19,6 +19,7 @@ from illdashboard.copilot.client import (
 from illdashboard.copilot.client import (
     _ask as copilot_ask,
 )
+from illdashboard.services import qualitative_values
 from illdashboard.services.markers import normalize_marker_alias_key
 from illdashboard.services.rescaling import normalize_unit_key
 
@@ -127,6 +128,8 @@ class QualitativeNormalizationRequest:
     id: str
     marker_name: str
     original_value: str
+    reference_low: float | None = None
+    reference_high: float | None = None
 
 
 def _chunk_items(items: list, chunk_size: int) -> list[list]:
@@ -257,10 +260,17 @@ def _build_qualitative_request_user_text(
 
     user_text += "\nQualitative normalization requests:\n"
     for request in batch_requests:
+        reference_text = "reference_range=(none)"
+        if request.reference_low is not None or request.reference_high is not None:
+            reference_text = (
+                f"reference_low={request.reference_low}; "
+                f"reference_high={request.reference_high}"
+            )
         user_text += (
             f"\n- id={request.id}; "
             f"marker={request.marker_name or '(unknown)'}; "
-            f"original_value={request.original_value or '(none)'}\n"
+            f"original_value={request.original_value or '(none)'}; "
+            f"{reference_text}\n"
         )
     return user_text
 
@@ -317,6 +327,10 @@ def _parse_scale_factor_response(payload: dict, batch_requests: list[UnitConvers
     return result
 
 
+def _fallback_qualitative_canonical_value(request: QualitativeNormalizationRequest) -> str | None:
+    return qualitative_values.clean_qualitative_value(request.original_value)
+
+
 def _parse_qualitative_response(
     payload: dict,
     batch_requests: list[QualitativeNormalizationRequest],
@@ -325,13 +339,13 @@ def _parse_qualitative_response(
     for request in batch_requests:
         request_payload = payload.get(request.id) if isinstance(payload, dict) else None
         if not isinstance(request_payload, dict):
-            normalized[request.id] = (None, None)
+            normalized[request.id] = (_fallback_qualitative_canonical_value(request), None)
             continue
 
         canonical_value = request_payload.get("canonical_value")
         boolean_value = request_payload.get("boolean_value")
         if not isinstance(canonical_value, str) or not canonical_value.strip():
-            normalized[request.id] = (None, None)
+            normalized[request.id] = (_fallback_qualitative_canonical_value(request), None)
             continue
 
         normalized[request.id] = (
@@ -480,7 +494,8 @@ QUALITATIVE_NORMALIZATION_SYSTEM_PROMPT = """\
 You are a medical lab qualitative value normalization assistant. The user will give you:
 1. A list of EXISTING canonical qualitative values already used in the database.
 2. One or more qualitative normalization requests. Each request includes a request id,
-    a marker name for context, and a raw qualitative result value.
+    a marker name for context, a raw qualitative result value, and optional
+    reference bounds from the same measurement.
 
 For each request:
 - Reuse an existing canonical value when it clearly means the same thing.
@@ -488,6 +503,15 @@ For each request:
 - Translate non-English qualitative result words to concise English when you can do so confidently.
 - Prefer short lower-case medical result labels such as "positive", "negative", "reactive",
     "non-reactive", "detected", "not detected", or "indeterminate" when appropriate.
+- Comparator cutoff strings such as "<1.5" or ">1.5" often encode a qualitative
+    presence/absence outcome rather than a numeric scalar. Use the provided
+    reference bounds when they match the assay cutoff.
+- When a comparator result lands on the within-range side of the cutoff, map it
+    to "negative" with boolean false.
+- When a comparator result lands on the outside-range side of the cutoff, map it
+    to "positive" with boolean true.
+- For example, with an upper cutoff of 1.5, "<1.5" means negative and ">1.5"
+    means positive.
 - If the raw value is a literal boolean-like value such as "true" or "false", use the marker context
     and standard lab-report meaning to map it to the closest concise qualitative result.
 - Also return the boolean semantic when the result clearly means presence/abnormality versus absence/normality.

@@ -601,6 +601,19 @@ def test_normalize_qualitative_key_preserves_symbolic_values():
     assert qualitative_values.normalize_qualitative_key("non-reactive") == "non reactive"
 
 
+def test_infer_threshold_qualitative_result_uses_matching_reference_cutoffs():
+    assert qualitative_values.infer_threshold_qualitative_result(
+        "<1.5",
+        reference_low=None,
+        reference_high=1.5,
+    ) == ("negative", False)
+    assert qualitative_values.infer_threshold_qualitative_result(
+        ">1.5",
+        reference_low=None,
+        reference_high=1.5,
+    ) == ("positive", True)
+
+
 @pytest.mark.asyncio
 async def test_qualitative_rule_upsert_deduplicates_equivalent_values(session_factory):
     async with session_factory() as session:
@@ -671,6 +684,95 @@ async def test_qualitative_canonization_reuses_symbolic_rule_keys(session_factor
     normalize_mock.assert_awaited_once()
     assert rules[job_key].canonical_value == "negative"
     assert rules[job_key].boolean_value is False
+    assert any(
+        queued_job.task_type == pipeline.TASK_PROCESS_MEASUREMENTS and queued_job.file_id == lab_file.id
+        for queued_job in queued_jobs
+    )
+
+
+@pytest.mark.asyncio
+async def test_apply_known_measurement_rules_resolves_threshold_qualitative_values_from_reference_bounds(session_factory):
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="qual-threshold.png",
+            filepath="/tmp/qual-threshold.png",
+            mime_type="image/png",
+        )
+        group = MarkerGroup(name="Kidney Function Threshold Test", display_order=10)
+        measurement_type = MeasurementType(
+            name="eGF from creatinine",
+            normalized_key="egf-from-creatinine",
+            group_name=group.name,
+            group=group,
+        )
+        alias = MeasurementAlias(
+            alias_name="eGF from creatinine",
+            normalized_key=normalize_marker_alias_key("eGF from creatinine"),
+            measurement_type=measurement_type,
+        )
+        measurement = Measurement(
+            lab_file=lab_file,
+            raw_marker_name="eGF from creatinine",
+            normalized_marker_key=normalize_marker_alias_key("eGF from creatinine"),
+            original_qualitative_value=">1.5",
+            original_reference_high=1.5,
+        )
+        session.add_all([lab_file, group, measurement_type, alias, measurement])
+        await session.commit()
+
+        requested_new_work = await pipeline._apply_known_measurement_rules(session, [measurement])
+        await session.commit()
+        await session.refresh(measurement)
+        jobs = list((await session.execute(select(Job).order_by(Job.id.asc()))).scalars())
+
+    assert requested_new_work is False
+    assert measurement.normalization_status == pipeline.MEASUREMENT_STATE_RESOLVED
+    assert measurement.qualitative_value == "positive"
+    assert measurement.qualitative_bool is True
+    assert jobs == []
+
+
+@pytest.mark.asyncio
+async def test_qualitative_canonization_skips_llm_for_threshold_values_with_matching_bounds(session_factory):
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="qual-threshold-queued.png",
+            filepath="/tmp/qual-threshold-queued.png",
+            mime_type="image/png",
+        )
+        measurement = Measurement(
+            lab_file=lab_file,
+            raw_marker_name="eGF from creatinine",
+            normalized_marker_key=normalize_marker_alias_key("eGF from creatinine"),
+            original_qualitative_value=">1.5",
+            original_reference_high=1.5,
+        )
+        session.add_all([lab_file, measurement])
+        await session.flush()
+
+        job = Job(
+            task_type=pipeline.TASK_CANONIZE_QUALITATIVE,
+            task_key=">1.5",
+            status=job_service.JOB_STATUS_LEASED,
+            lease_owner="test-runtime",
+            lease_until=utc_now(),
+            payload_json=job_service.json_dumps({"original_value": measurement.original_qualitative_value}),
+        )
+        session.add(job)
+        await session.commit()
+
+        with patch(
+            "illdashboard.services.pipeline.copilot_normalization.normalize_qualitative_values",
+            new=AsyncMock(return_value={}),
+        ) as normalize_mock:
+            await pipeline._canonize_qualitative_jobs(session, [job])
+            await session.commit()
+
+        rules = await qualitative_values.load_qualitative_rules(session, [job.task_key])
+        queued_jobs = list((await session.execute(select(Job).order_by(Job.id.asc()))).scalars())
+
+    normalize_mock.assert_not_awaited()
+    assert rules == {}
     assert any(
         queued_job.task_type == pipeline.TASK_PROCESS_MEASUREMENTS and queued_job.file_id == lab_file.id
         for queued_job in queued_jobs

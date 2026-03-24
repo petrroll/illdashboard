@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 
@@ -10,9 +11,10 @@ from sqlalchemy.orm import selectinload
 from illdashboard.models import QualitativeRule
 
 _SYMBOLIC_QUALITATIVE_VALUE_RE = re.compile(r"[+\-/]+")
+_THRESHOLD_QUALITATIVE_VALUE_RE = re.compile(r"^(<=|>=|<|>)\s*([+-]?(?:\d+(?:[.,]\d+)?|[.,]\d+))$")
 
 
-def normalize_qualitative_key(value: str | None) -> str | None:
+def clean_qualitative_value(value: str | None) -> str | None:
     if value is None:
         return None
 
@@ -20,8 +22,18 @@ def normalize_qualitative_key(value: str | None) -> str | None:
     if not normalized:
         return None
 
-    normalized = unicodedata.normalize("NFKD", normalized).encode("ascii", "ignore").decode("ascii")
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = normalized.strip(".:;,()[]{}")
     normalized = normalized.casefold().strip()
+    return normalized or None
+
+
+def normalize_qualitative_key(value: str | None) -> str | None:
+    normalized = clean_qualitative_value(value)
+    if normalized is None:
+        return None
+
+    normalized = unicodedata.normalize("NFKD", normalized).encode("ascii", "ignore").decode("ascii")
     # Standalone symbolic results like "-", "++", or "+/-" carry the entire
     # meaning, so replacing "-" with whitespace would collapse their job keys.
     symbolic_value = normalized.strip(".:;,()[]{}").strip()
@@ -31,6 +43,42 @@ def normalize_qualitative_key(value: str | None) -> str | None:
     normalized = re.sub(r"\s+", " ", normalized)
     normalized = normalized.strip(".:;,()[]{}").strip()
     return normalized or None
+
+
+def infer_threshold_qualitative_result(
+    value: str | None,
+    *,
+    reference_low: float | None,
+    reference_high: float | None,
+) -> tuple[str, bool] | None:
+    normalized = clean_qualitative_value(value)
+    if normalized is None:
+        return None
+
+    normalized = normalized.replace("≤", "<=").replace("≥", ">=")
+    match = _THRESHOLD_QUALITATIVE_VALUE_RE.fullmatch(normalized)
+    if match is None:
+        return None
+
+    operator, raw_threshold = match.groups()
+    try:
+        threshold = float(raw_threshold.replace(",", "."))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(threshold):
+        return None
+
+    if reference_high is not None and math.isclose(threshold, reference_high, rel_tol=1e-6, abs_tol=1e-9):
+        if operator in {"<", "<="}:
+            return "negative", False
+        return "positive", True
+
+    if reference_low is not None and math.isclose(threshold, reference_low, rel_tol=1e-6, abs_tol=1e-9):
+        if operator in {">", ">="}:
+            return "negative", False
+        return "positive", True
+
+    return None
 
 
 async def load_qualitative_rules(
