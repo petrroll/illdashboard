@@ -133,7 +133,7 @@ Environment variables (or a local `.env` file in `backend/`):
 | `MISTRAL_OCR_MODEL` | `mistral-ocr-latest` | Mistral OCR/Document AI model used for OCR and annotations |
 | `MISTRAL_CHAT_MODEL` | `mistral-large-latest` | Mistral chat model used for translation and normalization |
 | `DATABASE_URL` | `sqlite+aiosqlite:///./data/health.db` | SQLite database path |
-| `MEDICATIONS_DATABASE_URL` | `sqlite+aiosqlite:///./data/medications.db` | Separate SQLite database path for medication history |
+| `MEDICATIONS_DATABASE_URL` | `sqlite+aiosqlite:///./data/medications.db` | Separate SQLite database path for the meds + events timeline history |
 | `UPLOAD_DIR` | `backend/data/uploads` | Directory for uploaded files |
 
 If you switch `EXTRACTION_PROVIDER=mistral`, measurement extraction uses Mistral Document AI annotations and text OCR uses Mistral OCR plus an English translation step through the configured Mistral chat model.

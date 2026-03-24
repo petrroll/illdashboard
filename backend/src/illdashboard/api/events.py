@@ -32,6 +32,7 @@ def apply_event_payload(event: TimelineEvent, payload: TimelineEventWrite) -> No
             position=index,
             start_on=occurrence.start_on,
             end_on=occurrence.end_on,
+            is_ongoing=occurrence.is_ongoing,
             notes=occurrence.notes,
         )
         for index, occurrence in enumerate(payload.occurrences)

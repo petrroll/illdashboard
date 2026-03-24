@@ -135,10 +135,10 @@
 .meds-event-table-header,
 .meds-event-row {
   display: grid;
-  grid-template-columns: 1.1fr 1.1fr 1.8fr auto;
+  grid-template-columns: 1.05fr 1.05fr auto 1.6fr auto;
   gap: 0.65rem;
   align-items: center;
-  min-width: 38rem;
+  min-width: 44rem;
 }
 
 .meds-event-table-header {
@@ -155,6 +155,19 @@
   border-radius: 10px;
   background: rgba(255, 255, 255, 0.02);
   padding: 0.55rem;
+}
+
+.meds-inline-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.meds-inline-toggle input {
+  accent-color: var(--purple);
 }
 
 .meds-editor-actions,
@@ -344,6 +357,10 @@
 
 .meds-timeline-bar.meds-timeline-bar-event {
   background: linear-gradient(135deg, rgba(181, 117, 255, 0.95), rgba(116, 86, 255, 0.95));
+}
+
+.meds-timeline-bar.meds-timeline-bar-event.meds-timeline-bar-current {
+  background: linear-gradient(135deg, rgba(181, 117, 255, 1), rgba(227, 146, 255, 0.95));
 }
 
 .meds-timeline-caption {

@@ -88,6 +88,7 @@ class TimelineEventOccurrence(MedicationsBase):
     position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     start_on: Mapped[str] = mapped_column(String, nullable=False)
     end_on: Mapped[str | None] = mapped_column(String, nullable=True)
+    is_ongoing: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(

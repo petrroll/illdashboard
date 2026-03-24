@@ -4,7 +4,7 @@ import pytest
 
 
 @pytest.mark.asyncio
-async def test_events_crud_supports_point_and_ranged_occurrences(client):
+async def test_events_crud_supports_point_ranged_and_ongoing_occurrences(client):
     create_response = await client.post(
         "/api/events",
         json={
@@ -19,19 +19,27 @@ async def test_events_crud_supports_point_and_ranged_occurrences(client):
                     "start_on": "2025-01-10",
                     "notes": "Positive rapid test.",
                 },
+                {
+                    "start_on": "2025-02",
+                    "is_ongoing": True,
+                    "notes": "Recovery dragged on.",
+                },
             ],
         },
     )
     assert create_response.status_code == 201
     created = create_response.json()
     assert created["name"] == "COVID infection"
-    assert len(created["occurrences"]) == 2
+    assert len(created["occurrences"]) == 3
     assert created["occurrences"][1]["end_on"] is None
+    assert created["occurrences"][1]["is_ongoing"] is False
+    assert created["occurrences"][2]["end_on"] is None
+    assert created["occurrences"][2]["is_ongoing"] is True
 
     event_id = created["id"]
     get_response = await client.get(f"/api/events/{event_id}")
     assert get_response.status_code == 200
-    assert len(get_response.json()["occurrences"]) == 2
+    assert len(get_response.json()["occurrences"]) == 3
 
     update_response = await client.put(
         f"/api/events/{event_id}",
@@ -40,7 +48,8 @@ async def test_events_crud_supports_point_and_ranged_occurrences(client):
             "occurrences": [
                 {
                     "start_on": "2025-01-10",
-                    "notes": "Short point event.",
+                    "is_ongoing": True,
+                    "notes": "Still dealing with symptoms.",
                 }
             ],
         },
@@ -49,6 +58,7 @@ async def test_events_crud_supports_point_and_ranged_occurrences(client):
     updated = update_response.json()
     assert updated["name"] == "COVID / illness"
     assert len(updated["occurrences"]) == 1
+    assert updated["occurrences"][0]["is_ongoing"] is True
 
     list_response = await client.get("/api/events")
     assert list_response.status_code == 200
@@ -73,6 +83,24 @@ async def test_events_reject_invalid_occurrence_ranges(client):
                 {
                     "start_on": "2024-08",
                     "end_on": "2024-07",
+                }
+            ],
+        },
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_events_reject_ongoing_occurrences_with_explicit_end_dates(client):
+    response = await client.post(
+        "/api/events",
+        json={
+            "name": "Contradictory event",
+            "occurrences": [
+                {
+                    "start_on": "2024-08",
+                    "end_on": "2024-09",
+                    "is_ongoing": True,
                 }
             ],
         },

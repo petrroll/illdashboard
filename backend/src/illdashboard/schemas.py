@@ -301,6 +301,7 @@ class MedicationOut(BaseModel):
 class TimelineEventOccurrenceWrite(BaseModel):
     start_on: str = Field(description=EPISODE_DATE_FORMAT_HINT)
     end_on: str | None = Field(default=None, description=EPISODE_DATE_FORMAT_HINT)
+    is_ongoing: bool = False
     notes: str | None = None
 
     @field_validator("start_on", mode="before")
@@ -323,6 +324,11 @@ class TimelineEventOccurrenceWrite(BaseModel):
 
     @model_validator(mode="after")
     def _validate_date_range(self):
+        if self.is_ongoing:
+            if self.end_on is not None:
+                raise ValueError("Ongoing events cannot also have an end date/month.")
+            return self
+
         if self.end_on is not None and parse_episode_end(self.end_on) < parse_episode_start(self.start_on):
             raise ValueError("end_on cannot be earlier than start_on.")
         return self
@@ -344,6 +350,7 @@ class TimelineEventOccurrenceOut(BaseModel):
     id: int
     start_on: str
     end_on: str | None = None
+    is_ongoing: bool
     notes: str | None = None
 
 

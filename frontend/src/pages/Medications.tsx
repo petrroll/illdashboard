@@ -47,6 +47,7 @@ interface TimelineEventOccurrenceDraft {
   client_id: string;
   start_on: string;
   end_on: string;
+  is_ongoing: boolean;
   notes: string;
 }
 
@@ -126,6 +127,7 @@ function createEmptyTimelineEventOccurrenceDraft(): TimelineEventOccurrenceDraft
     client_id: nextDraftRowId(),
     start_on: "",
     end_on: "",
+    is_ongoing: false,
     notes: "",
   };
 }
@@ -144,6 +146,7 @@ function createTimelineEventDraft(event: TimelineEvent): TimelineEventDraft {
       client_id: nextDraftRowId(),
       start_on: occurrence.start_on,
       end_on: occurrence.end_on ?? "",
+      is_ongoing: occurrence.is_ongoing,
       notes: occurrence.notes ?? "",
     })),
   };
@@ -170,11 +173,15 @@ function buildMedicationPayload(draft: MedicationDraft): MedicationWrite {
 function buildTimelineEventPayload(draft: TimelineEventDraft): TimelineEventWrite {
   return {
     name: draft.name.trim(),
-    occurrences: draft.occurrences.map((occurrence) => ({
-      start_on: occurrence.start_on.trim(),
-      end_on: occurrence.end_on.trim() || null,
-      notes: occurrence.notes.trim() || null,
-    })),
+    occurrences: draft.occurrences.map((occurrence) => {
+      const trimmedEndOn = occurrence.end_on.trim();
+      return {
+        start_on: occurrence.start_on.trim(),
+        end_on: occurrence.is_ongoing ? null : trimmedEndOn || null,
+        is_ongoing: occurrence.is_ongoing,
+        notes: occurrence.notes.trim() || null,
+      };
+    }),
   };
 }
 
@@ -182,7 +189,12 @@ function formatMedicationRangeLabel(episode: Pick<MedicationEpisode, "start_on" 
   return `${episode.start_on} to ${episode.still_taking ? "Current" : episode.end_on ?? "Unknown"}`;
 }
 
-function formatEventRangeLabel(occurrence: Pick<TimelineEventOccurrence, "start_on" | "end_on">) {
+function formatEventRangeLabel(
+  occurrence: Pick<TimelineEventOccurrence, "start_on" | "end_on" | "is_ongoing">,
+) {
+  if (occurrence.is_ongoing) {
+    return `${occurrence.start_on} to Current`;
+  }
   return occurrence.end_on ? `${occurrence.start_on} to ${occurrence.end_on}` : occurrence.start_on;
 }
 
@@ -400,6 +412,9 @@ export default function Medications() {
   }, [loadTimelineData]);
 
   const timelineRows = useMemo<SharedTimelineRow[]>(() => {
+    const nowTimestamp = Date.now();
+    const currentMonthKey = new Date(nowTimestamp).toISOString().slice(0, 7);
+
     const medicationRows = medications
       .map((medication) => {
         const bars = medication.episodes
@@ -407,7 +422,7 @@ export default function Medications() {
             const startTimestamp = parseEpisodeTimestamp(episode.start_on, "start");
             const explicitEnd = parseEpisodeTimestamp(episode.end_on, "end");
             const endTimestamp = episode.still_taking
-              ? Date.now()
+              ? nowTimestamp
               : explicitEnd ?? parseEpisodeTimestamp(episode.start_on, "end");
 
             if (startTimestamp == null || endTimestamp == null) {
@@ -424,7 +439,7 @@ export default function Medications() {
               displayEndTimestamp: Math.max(endTimestamp, startTimestamp),
               startMonthKey: getMonthKey(episode.start_on),
               endMonthKey: getMonthKey(
-                episode.still_taking ? new Date().toISOString().slice(0, 7) : episode.end_on ?? episode.start_on,
+                episode.still_taking ? currentMonthKey : episode.end_on ?? episode.start_on,
               ),
               isOngoing: episode.still_taking,
             } satisfies TimelineBar;
@@ -447,7 +462,7 @@ export default function Medications() {
           .map((occurrence) => {
             const startTimestamp = parseEpisodeTimestamp(occurrence.start_on, "start");
             const explicitEnd = parseEpisodeTimestamp(occurrence.end_on, "end");
-            const endTimestamp = explicitEnd ?? startTimestamp;
+            const endTimestamp = occurrence.is_ongoing ? nowTimestamp : explicitEnd ?? startTimestamp;
 
             if (startTimestamp == null || endTimestamp == null) {
               return null;
@@ -462,8 +477,10 @@ export default function Medications() {
               endTimestamp: Math.max(endTimestamp, startTimestamp),
               displayEndTimestamp: Math.max(endTimestamp, startTimestamp),
               startMonthKey: getMonthKey(occurrence.start_on),
-              endMonthKey: getMonthKey(occurrence.end_on ?? occurrence.start_on),
-              isOngoing: false,
+              endMonthKey: getMonthKey(
+                occurrence.is_ongoing ? currentMonthKey : occurrence.end_on ?? occurrence.start_on,
+              ),
+              isOngoing: occurrence.is_ongoing,
             } satisfies TimelineBar;
           })
           .filter(isDefined)
@@ -580,7 +597,7 @@ export default function Medications() {
 
   const handleEventOccurrenceChange = (
     occurrenceIndex: number,
-    field: keyof Omit<TimelineEventOccurrenceDraft, "client_id">,
+    field: "start_on" | "end_on" | "notes",
     value: string,
   ) => {
     setEventDraft((currentDraft) => ({
@@ -592,6 +609,22 @@ export default function Medications() {
         return {
           ...occurrence,
           [field]: value,
+        };
+      }),
+    }));
+  };
+
+  const handleEventOccurrenceOngoingChange = (occurrenceIndex: number, isOngoing: boolean) => {
+    setEventDraft((currentDraft) => ({
+      ...currentDraft,
+      occurrences: currentDraft.occurrences.map((occurrence, index) => {
+        if (index !== occurrenceIndex) {
+          return occurrence;
+        }
+        return {
+          ...occurrence,
+          is_ongoing: isOngoing,
+          end_on: isOngoing ? "" : occurrence.end_on,
         };
       }),
     }));
@@ -939,7 +972,8 @@ export default function Medications() {
           <div>
             <h3>{editingEventId == null ? "Add event" : "Edit event"}</h3>
             <div className="meds-card-meta">
-              Events cover things like infections, bad periods, moving, breakups, or starting work.
+              Events can be one-offs, fixed spans, or ongoing periods like infections, bad stretches,
+              moving, breakups, or starting work.
             </div>
           </div>
         </div>
@@ -970,6 +1004,7 @@ export default function Medications() {
               <div className="meds-event-table-header">
                 <span>Start</span>
                 <span>End</span>
+                <span>Now</span>
                 <span>Notes</span>
                 <span />
               </div>
@@ -995,10 +1030,22 @@ export default function Medications() {
                     onChange={(inputEvent) => {
                       handleEventOccurrenceChange(index, "end_on", inputEvent.target.value);
                     }}
-                    placeholder="Blank means point"
+                    placeholder={occurrence.is_ongoing ? "Ongoing" : "Blank means point"}
                     pattern={DATE_INPUT_PATTERN}
                     title={DATE_INPUT_HINT}
+                    disabled={occurrence.is_ongoing}
                   />
+                  <label className="meds-inline-toggle">
+                    <input
+                      type="checkbox"
+                      aria-label={`Event occurrence ${index + 1} is ongoing`}
+                      checked={occurrence.is_ongoing}
+                      onChange={(inputEvent) => {
+                        handleEventOccurrenceOngoingChange(index, inputEvent.target.checked);
+                      }}
+                    />
+                    <span>Now</span>
+                  </label>
                   <input
                     aria-label={`Event occurrence ${index + 1} notes`}
                     className="meds-input meds-input-compact"
@@ -1020,7 +1067,8 @@ export default function Medications() {
             </div>
 
             <p className="meds-field-hint">
-              {DATE_INPUT_HINT} Leave the end blank for a point-in-time event.
+              {DATE_INPUT_HINT} Leave the end blank for a point-in-time event, or check Now to keep
+              it ongoing.
             </p>
           </div>
 
@@ -1134,7 +1182,8 @@ export default function Medications() {
 
             <p className="meds-timeline-caption">
               Month-precision and day-precision dates can mix, same-month handoffs stay packed onto
-              one lane, and point events are rendered by leaving the end blank.
+              one lane, point events are rendered by leaving the end blank, and ongoing events run
+              through the current day.
             </p>
           </div>
         )}
@@ -1204,7 +1253,8 @@ export default function Medications() {
           <div>
             <h3>Saved events</h3>
             <div className="meds-card-meta">
-              Edit an event to change the label, update a dated span, or add another occurrence.
+              Edit an event to change the label, update a point, span, or ongoing period, or add
+              another occurrence.
             </div>
           </div>
         </div>

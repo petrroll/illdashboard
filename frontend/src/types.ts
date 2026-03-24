@@ -93,6 +93,7 @@ export interface TimelineEventOccurrence {
   id: number;
   start_on: string;
   end_on: string | null;
+  is_ongoing: boolean;
   notes: string | null;
 }
 
@@ -107,6 +108,7 @@ export interface TimelineEvent {
 export interface TimelineEventOccurrenceWrite {
   start_on: string;
   end_on: string | null;
+  is_ongoing: boolean;
   notes: string | null;
 }
 
