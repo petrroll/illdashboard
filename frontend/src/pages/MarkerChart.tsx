@@ -57,6 +57,7 @@ import {
 } from "../export/runtime";
 
 const LIST_PANE_STORAGE_KEY = "illdashboard.markerListWidth";
+const TIME_WEIGHTED_AXIS_STORAGE_KEY = "illdashboard.markerDetail.timeWeightedAxis";
 const MIN_LIST_PANE_WIDTH = 300;
 const DEFAULT_LIST_PANE_WIDTH = 680;
 const MAX_LIST_PANE_WIDTH = 680;
@@ -108,6 +109,14 @@ function getStoredListPaneWidth() {
   const rawValue = window.localStorage.getItem(LIST_PANE_STORAGE_KEY);
   const parsed = rawValue ? Number(rawValue) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : DEFAULT_LIST_PANE_WIDTH;
+}
+
+function getStoredTimeWeightedAxis() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  return window.localStorage.getItem(TIME_WEIGHTED_AXIS_STORAGE_KEY) === "true";
 }
 
 function formatQualitativeStatusLabel(item: MarkerOverviewItem) {
@@ -207,7 +216,7 @@ export default function MarkerChart() {
   const markerRowRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const [allMarkerTags, setAllMarkerTags] = useState<string[]>([]);
   const [filterTags, setFilterTags] = useState<string[]>([]);
-  const [timeWeightedAxis, setTimeWeightedAxis] = useState(false);
+  const [timeWeightedAxis, setTimeWeightedAxis] = useState(getStoredTimeWeightedAxis);
 
   const clampListPaneWidth = (nextWidth: number) => {
     const browserWidth = markerBrowserRef.current?.clientWidth ?? window.innerWidth;
@@ -268,6 +277,10 @@ export default function MarkerChart() {
   useEffect(() => {
     window.localStorage.setItem(LIST_PANE_STORAGE_KEY, String(listPaneWidth));
   }, [listPaneWidth]);
+
+  useEffect(() => {
+    window.localStorage.setItem(TIME_WEIGHTED_AXIS_STORAGE_KEY, String(timeWeightedAxis));
+  }, [timeWeightedAxis]);
 
   useEffect(() => {
     if (!selectedMarker) return;
