@@ -29,6 +29,10 @@ let draftRowCounter = 0;
 
 type TimelineRowKind = "medication" | "event";
 
+// Keep the last active editor in module state so route changes preserve it
+// during the current app session without persisting anything to storage.
+let lastUsedTimelineEditorKind: TimelineRowKind = "medication";
+
 interface MedicationEpisodeDraft {
   client_id: string;
   start_on: string;
@@ -368,11 +372,12 @@ export default function Medications() {
   const [editingEventId, setEditingEventId] = useState<number | null>(null);
   const [medicationDraft, setMedicationDraft] = useState<MedicationDraft>(createEmptyMedicationDraft);
   const [eventDraft, setEventDraft] = useState<TimelineEventDraft>(createEmptyTimelineEventDraft);
+  const [activeEditorKind, setActiveEditorKind] = useState<TimelineRowKind>(() => lastUsedTimelineEditorKind);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
-  const medicationEditorSectionRef = useRef<HTMLElement | null>(null);
+  const medicationEditorSectionRef = useRef<HTMLDivElement | null>(null);
   const medicationNameInputRef = useRef<HTMLInputElement | null>(null);
-  const eventEditorSectionRef = useRef<HTMLElement | null>(null);
+  const eventEditorSectionRef = useRef<HTMLDivElement | null>(null);
   const eventNameInputRef = useRef<HTMLInputElement | null>(null);
 
   const loadTimelineData = useCallback(async () => {
@@ -545,6 +550,11 @@ export default function Medications() {
     setEventDraft(createEmptyTimelineEventDraft());
   }, []);
 
+  const setActiveTimelineEditor = (kind: TimelineRowKind) => {
+    lastUsedTimelineEditorKind = kind;
+    setActiveEditorKind(kind);
+  };
+
   const focusMedicationEditor = () => {
     window.requestAnimationFrame(() => {
       medicationEditorSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -557,6 +567,16 @@ export default function Medications() {
       eventEditorSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
       eventNameInputRef.current?.focus();
     });
+  };
+
+  const showMedicationEditor = () => {
+    setActiveTimelineEditor("medication");
+    focusMedicationEditor();
+  };
+
+  const showEventEditor = () => {
+    setActiveTimelineEditor("event");
+    focusEventEditor();
   };
 
   const handleMedicationEpisodeChange = (
@@ -652,7 +672,7 @@ export default function Medications() {
     setMedicationDraft(createMedicationDraft(medication));
     setErrorMessage(null);
     setStatusMessage(null);
-    focusMedicationEditor();
+    showMedicationEditor();
   };
 
   const handleEditEvent = (event: TimelineEvent) => {
@@ -660,7 +680,7 @@ export default function Medications() {
     setEventDraft(createTimelineEventDraft(event));
     setErrorMessage(null);
     setStatusMessage(null);
-    focusEventEditor();
+    showEventEditor();
   };
 
   const handleEditMedicationById = (medicationId: number) => {
@@ -799,6 +819,18 @@ export default function Medications() {
     };
   };
 
+  const isMedicationEditorActive = activeEditorKind === "medication";
+  const activeEditorTitle = isMedicationEditorActive
+    ? editingMedicationId == null
+      ? "Add medication"
+      : "Edit medication"
+    : editingEventId == null
+      ? "Add event"
+      : "Edit event";
+  const activeEditorMeta = isMedicationEditorActive
+    ? "Use one medication row with multiple episodes when the same med changes over time."
+    : "Events can be one-offs, fixed spans, or ongoing periods like infections, bad stretches, moving, breakups, or starting work.";
+
   if (shareExportMode) {
     return (
       <div className="meds-page">
@@ -834,263 +866,290 @@ export default function Medications() {
         </div>
       )}
 
-      <section ref={medicationEditorSectionRef} className="card">
-        <div className="meds-card-header">
-          <div>
-            <h3>{editingMedicationId == null ? "Add medication" : "Edit medication"}</h3>
-            <div className="meds-card-meta">
-              Use one medication row with multiple episodes when the same med changes over time.
-            </div>
+      <section className="card meds-editor-shell">
+        <div className="meds-editor-topline">
+          <div className="meds-editor-heading">
+            <p className="meds-editor-kicker">Timeline editor</p>
+            <h3>{activeEditorTitle}</h3>
+            <div className="meds-card-meta">{activeEditorMeta}</div>
+          </div>
+
+          <div className="meds-editor-switch" role="group" aria-label="Choose which kind of timeline entry to edit">
+            <button
+              type="button"
+              className={[
+                "meds-editor-switch-button",
+                "meds-editor-switch-button-medication",
+                isMedicationEditorActive ? "meds-editor-switch-button-active" : "",
+              ].join(" ").trim()}
+              aria-pressed={isMedicationEditorActive}
+              onClick={showMedicationEditor}
+            >
+              <span className="meds-editor-switch-label">Medication</span>
+              <span className="meds-editor-switch-detail">
+                Episodes, dose changes, and active treatments
+              </span>
+            </button>
+
+            <button
+              type="button"
+              className={[
+                "meds-editor-switch-button",
+                "meds-editor-switch-button-event",
+                !isMedicationEditorActive ? "meds-editor-switch-button-active" : "",
+              ].join(" ").trim()}
+              aria-pressed={!isMedicationEditorActive}
+              onClick={showEventEditor}
+            >
+              <span className="meds-editor-switch-label">Event</span>
+              <span className="meds-editor-switch-detail">
+                One-offs, spans, and ongoing periods
+              </span>
+            </button>
           </div>
         </div>
 
-        <form className="meds-editor-form" onSubmit={handleMedicationSubmit}>
-          <div className="meds-field-grid">
-            <div className="meds-full-width">
-              <label htmlFor="medication-name">Medication name</label>
-              <input
-                id="medication-name"
-                ref={medicationNameInputRef}
-                className="meds-input"
-                value={medicationDraft.name}
-                onChange={(inputEvent) => {
-                  setMedicationDraft((currentDraft) => ({
-                    ...currentDraft,
-                    name: inputEvent.target.value,
-                  }));
-                }}
-                placeholder="Metformin"
-                required
-              />
-            </div>
-          </div>
-
-          <div className="meds-episodes-list">
-            <div className="meds-episode-table">
-              <div className="meds-episode-table-header">
-                <span>Start</span>
-                <span>End</span>
-                <span>Dose</span>
-                <span>Freq</span>
-                <span>Notes</span>
-                <span />
+        {isMedicationEditorActive ? (
+          <div ref={medicationEditorSectionRef} className="meds-editor-panel">
+            <form className="meds-editor-form" onSubmit={handleMedicationSubmit}>
+              <div className="meds-field-grid">
+                <div className="meds-full-width">
+                  <label htmlFor="medication-name">Medication name</label>
+                  <input
+                    id="medication-name"
+                    ref={medicationNameInputRef}
+                    className="meds-input"
+                    value={medicationDraft.name}
+                    onChange={(inputEvent) => {
+                      setMedicationDraft((currentDraft) => ({
+                        ...currentDraft,
+                        name: inputEvent.target.value,
+                      }));
+                    }}
+                    placeholder="Metformin"
+                    required
+                  />
+                </div>
               </div>
 
-              {medicationDraft.episodes.map((episode, index) => (
-                <div key={episode.client_id} className="meds-episode-row">
-                  <input
-                    aria-label={`Medication episode ${index + 1} start date or month`}
-                    className="meds-input meds-input-compact"
-                    value={episode.start_on}
-                    onChange={(inputEvent) => {
-                      handleMedicationEpisodeChange(index, "start_on", inputEvent.target.value);
-                    }}
-                    placeholder="2024-03"
-                    pattern={DATE_INPUT_PATTERN}
-                    title={DATE_INPUT_HINT}
-                    required
-                  />
-                  <input
-                    aria-label={`Medication episode ${index + 1} end date or month`}
-                    className="meds-input meds-input-compact"
-                    value={episode.end_on}
-                    onChange={(inputEvent) => {
-                      handleMedicationEpisodeChange(index, "end_on", inputEvent.target.value);
-                    }}
-                    placeholder="Blank means current"
-                    pattern={DATE_INPUT_PATTERN}
-                    title={DATE_INPUT_HINT}
-                  />
-                  <input
-                    aria-label={`Medication episode ${index + 1} dose`}
-                    className="meds-input meds-input-compact"
-                    value={episode.dose}
-                    onChange={(inputEvent) => {
-                      handleMedicationEpisodeChange(index, "dose", inputEvent.target.value);
-                    }}
-                    placeholder="500 mg"
-                    required
-                  />
-                  <input
-                    aria-label={`Medication episode ${index + 1} frequency`}
-                    className="meds-input meds-input-compact"
-                    value={episode.frequency}
-                    onChange={(inputEvent) => {
-                      handleMedicationEpisodeChange(index, "frequency", inputEvent.target.value);
-                    }}
-                    placeholder="daily"
-                    required
-                  />
-                  <input
-                    aria-label={`Medication episode ${index + 1} notes`}
-                    className="meds-input meds-input-compact"
-                    value={episode.notes}
-                    onChange={(inputEvent) => {
-                      handleMedicationEpisodeChange(index, "notes", inputEvent.target.value);
-                    }}
-                    placeholder="Optional notes"
-                  />
+              <div className="meds-episodes-list">
+                <div className="meds-episode-table">
+                  <div className="meds-episode-table-header">
+                    <span>Start</span>
+                    <span>End</span>
+                    <span>Dose</span>
+                    <span>Freq</span>
+                    <span>Notes</span>
+                    <span />
+                  </div>
+
+                  {medicationDraft.episodes.map((episode, index) => (
+                    <div key={episode.client_id} className="meds-episode-row">
+                      <input
+                        aria-label={`Medication episode ${index + 1} start date or month`}
+                        className="meds-input meds-input-compact"
+                        value={episode.start_on}
+                        onChange={(inputEvent) => {
+                          handleMedicationEpisodeChange(index, "start_on", inputEvent.target.value);
+                        }}
+                        placeholder="2024-03"
+                        pattern={DATE_INPUT_PATTERN}
+                        title={DATE_INPUT_HINT}
+                        required
+                      />
+                      <input
+                        aria-label={`Medication episode ${index + 1} end date or month`}
+                        className="meds-input meds-input-compact"
+                        value={episode.end_on}
+                        onChange={(inputEvent) => {
+                          handleMedicationEpisodeChange(index, "end_on", inputEvent.target.value);
+                        }}
+                        placeholder="Blank means current"
+                        pattern={DATE_INPUT_PATTERN}
+                        title={DATE_INPUT_HINT}
+                      />
+                      <input
+                        aria-label={`Medication episode ${index + 1} dose`}
+                        className="meds-input meds-input-compact"
+                        value={episode.dose}
+                        onChange={(inputEvent) => {
+                          handleMedicationEpisodeChange(index, "dose", inputEvent.target.value);
+                        }}
+                        placeholder="500 mg"
+                        required
+                      />
+                      <input
+                        aria-label={`Medication episode ${index + 1} frequency`}
+                        className="meds-input meds-input-compact"
+                        value={episode.frequency}
+                        onChange={(inputEvent) => {
+                          handleMedicationEpisodeChange(index, "frequency", inputEvent.target.value);
+                        }}
+                        placeholder="daily"
+                        required
+                      />
+                      <input
+                        aria-label={`Medication episode ${index + 1} notes`}
+                        className="meds-input meds-input-compact"
+                        value={episode.notes}
+                        onChange={(inputEvent) => {
+                          handleMedicationEpisodeChange(index, "notes", inputEvent.target.value);
+                        }}
+                        placeholder="Optional notes"
+                      />
+                      <button
+                        type="button"
+                        className="btn btn-outline btn-sm"
+                        onClick={() => handleRemoveMedicationEpisode(index)}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
+                <p className="meds-field-hint">
+                  {DATE_INPUT_HINT} Leave the end blank while the medication is still active.
+                </p>
+              </div>
+
+              <div className="meds-editor-actions">
+                <button type="button" className="btn btn-outline" onClick={handleAddMedicationEpisode}>
+                  Add medication episode
+                </button>
+                <button type="submit" className="btn btn-primary" disabled={savingMedication}>
+                  {savingMedication ? "Saving..." : editingMedicationId == null ? "Add medication" : "Save medication"}
+                </button>
+                {editingMedicationId != null && (
                   <button
                     type="button"
-                    className="btn btn-outline btn-sm"
-                    onClick={() => handleRemoveMedicationEpisode(index)}
+                    className="btn btn-outline meds-secondary-action"
+                    onClick={resetMedicationEditor}
+                    disabled={savingMedication}
                   >
-                    Remove
+                    Cancel editing
                   </button>
-                </div>
-              ))}
-            </div>
-
-            <p className="meds-field-hint">
-              {DATE_INPUT_HINT} Leave the end blank while the medication is still active.
-            </p>
-          </div>
-
-          <div className="meds-editor-actions">
-            <button type="button" className="btn btn-outline" onClick={handleAddMedicationEpisode}>
-              Add medication episode
-            </button>
-            <button type="submit" className="btn btn-primary" disabled={savingMedication}>
-              {savingMedication ? "Saving..." : editingMedicationId == null ? "Add medication" : "Save medication"}
-            </button>
-            {editingMedicationId != null && (
-              <button
-                type="button"
-                className="btn btn-outline meds-secondary-action"
-                onClick={resetMedicationEditor}
-                disabled={savingMedication}
-              >
-                Cancel editing
-              </button>
-            )}
-          </div>
-        </form>
-      </section>
-
-      <section ref={eventEditorSectionRef} className="card">
-        <div className="meds-card-header">
-          <div>
-            <h3>{editingEventId == null ? "Add event" : "Edit event"}</h3>
-            <div className="meds-card-meta">
-              Events can be one-offs, fixed spans, or ongoing periods like infections, bad stretches,
-              moving, breakups, or starting work.
-            </div>
-          </div>
-        </div>
-
-        <form className="meds-editor-form" onSubmit={handleEventSubmit}>
-          <div className="meds-field-grid">
-            <div className="meds-full-width">
-              <label htmlFor="event-name">Event name</label>
-              <input
-                id="event-name"
-                ref={eventNameInputRef}
-                className="meds-input"
-                value={eventDraft.name}
-                onChange={(inputEvent) => {
-                  setEventDraft((currentDraft) => ({
-                    ...currentDraft,
-                    name: inputEvent.target.value,
-                  }));
-                }}
-                placeholder="COVID infection"
-                required
-              />
-            </div>
-          </div>
-
-          <div className="meds-episodes-list">
-            <div className="meds-event-table">
-              <div className="meds-event-table-header">
-                <span>Start</span>
-                <span>End</span>
-                <span>Now</span>
-                <span>Notes</span>
-                <span />
+                )}
               </div>
-
-              {eventDraft.occurrences.map((occurrence, index) => (
-                <div key={occurrence.client_id} className="meds-event-row">
+            </form>
+          </div>
+        ) : (
+          <div ref={eventEditorSectionRef} className="meds-editor-panel">
+            <form className="meds-editor-form" onSubmit={handleEventSubmit}>
+              <div className="meds-field-grid">
+                <div className="meds-full-width">
+                  <label htmlFor="event-name">Event name</label>
                   <input
-                    aria-label={`Event occurrence ${index + 1} start date or month`}
-                    className="meds-input meds-input-compact"
-                    value={occurrence.start_on}
+                    id="event-name"
+                    ref={eventNameInputRef}
+                    className="meds-input"
+                    value={eventDraft.name}
                     onChange={(inputEvent) => {
-                      handleEventOccurrenceChange(index, "start_on", inputEvent.target.value);
+                      setEventDraft((currentDraft) => ({
+                        ...currentDraft,
+                        name: inputEvent.target.value,
+                      }));
                     }}
-                    placeholder="2024-03"
-                    pattern={DATE_INPUT_PATTERN}
-                    title={DATE_INPUT_HINT}
+                    placeholder="COVID infection"
                     required
                   />
-                  <input
-                    aria-label={`Event occurrence ${index + 1} end date or month`}
-                    className="meds-input meds-input-compact"
-                    value={occurrence.end_on}
-                    onChange={(inputEvent) => {
-                      handleEventOccurrenceChange(index, "end_on", inputEvent.target.value);
-                    }}
-                    placeholder={occurrence.is_ongoing ? "Ongoing" : "Blank means point"}
-                    pattern={DATE_INPUT_PATTERN}
-                    title={DATE_INPUT_HINT}
-                    disabled={occurrence.is_ongoing}
-                  />
-                  <label className="meds-inline-toggle">
-                    <input
-                      type="checkbox"
-                      aria-label={`Event occurrence ${index + 1} is ongoing`}
-                      checked={occurrence.is_ongoing}
-                      onChange={(inputEvent) => {
-                        handleEventOccurrenceOngoingChange(index, inputEvent.target.checked);
-                      }}
-                    />
+                </div>
+              </div>
+
+              <div className="meds-episodes-list">
+                <div className="meds-event-table">
+                  <div className="meds-event-table-header">
+                    <span>Start</span>
+                    <span>End</span>
                     <span>Now</span>
-                  </label>
-                  <input
-                    aria-label={`Event occurrence ${index + 1} notes`}
-                    className="meds-input meds-input-compact"
-                    value={occurrence.notes}
-                    onChange={(inputEvent) => {
-                      handleEventOccurrenceChange(index, "notes", inputEvent.target.value);
-                    }}
-                    placeholder="Optional notes"
-                  />
+                    <span>Notes</span>
+                    <span />
+                  </div>
+
+                  {eventDraft.occurrences.map((occurrence, index) => (
+                    <div key={occurrence.client_id} className="meds-event-row">
+                      <input
+                        aria-label={`Event occurrence ${index + 1} start date or month`}
+                        className="meds-input meds-input-compact"
+                        value={occurrence.start_on}
+                        onChange={(inputEvent) => {
+                          handleEventOccurrenceChange(index, "start_on", inputEvent.target.value);
+                        }}
+                        placeholder="2024-03"
+                        pattern={DATE_INPUT_PATTERN}
+                        title={DATE_INPUT_HINT}
+                        required
+                      />
+                      <input
+                        aria-label={`Event occurrence ${index + 1} end date or month`}
+                        className="meds-input meds-input-compact"
+                        value={occurrence.end_on}
+                        onChange={(inputEvent) => {
+                          handleEventOccurrenceChange(index, "end_on", inputEvent.target.value);
+                        }}
+                        placeholder={occurrence.is_ongoing ? "Ongoing" : "Blank means point"}
+                        pattern={DATE_INPUT_PATTERN}
+                        title={DATE_INPUT_HINT}
+                        disabled={occurrence.is_ongoing}
+                      />
+                      <label className="meds-inline-toggle">
+                        <input
+                          type="checkbox"
+                          aria-label={`Event occurrence ${index + 1} is ongoing`}
+                          checked={occurrence.is_ongoing}
+                          onChange={(inputEvent) => {
+                            handleEventOccurrenceOngoingChange(index, inputEvent.target.checked);
+                          }}
+                        />
+                        <span>Now</span>
+                      </label>
+                      <input
+                        aria-label={`Event occurrence ${index + 1} notes`}
+                        className="meds-input meds-input-compact"
+                        value={occurrence.notes}
+                        onChange={(inputEvent) => {
+                          handleEventOccurrenceChange(index, "notes", inputEvent.target.value);
+                        }}
+                        placeholder="Optional notes"
+                      />
+                      <button
+                        type="button"
+                        className="btn btn-outline btn-sm"
+                        onClick={() => handleRemoveEventOccurrence(index)}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
+                <p className="meds-field-hint">
+                  {DATE_INPUT_HINT} Leave the end blank for a point-in-time event, or check Now to keep
+                  it ongoing.
+                </p>
+              </div>
+
+              <div className="meds-editor-actions">
+                <button type="button" className="btn btn-outline" onClick={handleAddEventOccurrence}>
+                  Add event occurrence
+                </button>
+                <button type="submit" className="btn btn-primary" disabled={savingEvent}>
+                  {savingEvent ? "Saving..." : editingEventId == null ? "Add event" : "Save event"}
+                </button>
+                {editingEventId != null && (
                   <button
                     type="button"
-                    className="btn btn-outline btn-sm"
-                    onClick={() => handleRemoveEventOccurrence(index)}
+                    className="btn btn-outline meds-secondary-action"
+                    onClick={resetEventEditor}
+                    disabled={savingEvent}
                   >
-                    Remove
+                    Cancel editing
                   </button>
-                </div>
-              ))}
-            </div>
-
-            <p className="meds-field-hint">
-              {DATE_INPUT_HINT} Leave the end blank for a point-in-time event, or check Now to keep
-              it ongoing.
-            </p>
+                )}
+              </div>
+            </form>
           </div>
-
-          <div className="meds-editor-actions">
-            <button type="button" className="btn btn-outline" onClick={handleAddEventOccurrence}>
-              Add event occurrence
-            </button>
-            <button type="submit" className="btn btn-primary" disabled={savingEvent}>
-              {savingEvent ? "Saving..." : editingEventId == null ? "Add event" : "Save event"}
-            </button>
-            {editingEventId != null && (
-              <button
-                type="button"
-                className="btn btn-outline meds-secondary-action"
-                onClick={resetEventEditor}
-                disabled={savingEvent}
-              >
-                Cancel editing
-              </button>
-            )}
-          </div>
-        </form>
+        )}
       </section>
 
       <section className="card">
