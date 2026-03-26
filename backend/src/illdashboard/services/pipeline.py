@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import math
-import mimetypes
 import re
 import time
 import uuid
@@ -43,8 +42,8 @@ from illdashboard.models import (
     TextBatch,
     utc_now,
 )
+from illdashboard.services import file_types, qualitative_values, rescaling, upload_metadata
 from illdashboard.services import jobs as job_service
-from illdashboard.services import qualitative_values, rescaling, upload_metadata
 from illdashboard.services import search as search_service
 from illdashboard.services.markers import (
     SOURCE_TAG_PREFIX,
@@ -125,15 +124,6 @@ _runtime: PipelineRuntime | None = None
 _runtime_reset_lock = asyncio.Lock()
 _T = TypeVar("_T")
 
-_PRELOADABLE_MIME_TYPES: dict[str, str] = {
-    ".pdf": "application/pdf",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-}
-
-
 @dataclass(frozen=True)
 class FileProgressSnapshot:
     measurement_pages_done: int
@@ -164,12 +154,9 @@ async def preload_uploaded_files(session: AsyncSession) -> int:
         if file_path.resolve() in known_paths:
             continue
 
-        mime_type = _PRELOADABLE_MIME_TYPES.get(file_path.suffix.lower())
+        mime_type = file_types.guess_preloadable_mime_type(file_path)
         if mime_type is None:
-            guessed, _ = mimetypes.guess_type(file_path.name)
-            if guessed not in _PRELOADABLE_MIME_TYPES.values():
-                continue
-            mime_type = guessed
+            continue
 
         page_count = 1
         if mime_type == "application/pdf":

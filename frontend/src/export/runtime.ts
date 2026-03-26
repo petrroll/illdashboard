@@ -9,6 +9,7 @@ import type {
 
 export interface ShareExportFileAssets {
   page_image_urls: string[];
+  text_preview?: string | null;
 }
 
 export interface ShareExportSearchDocument {
@@ -152,6 +153,10 @@ export function getShareExportFilePageInfo(fileId: number) {
 
 export function getShareExportPageImageUrl(fileId: number, pageNum: number) {
   return requireBundle().file_assets[String(fileId)]?.page_image_urls[pageNum - 1] ?? null;
+}
+
+export function getShareExportFileTextPreview(fileId: number) {
+  return requireBundle().file_assets[String(fileId)]?.text_preview ?? null;
 }
 
 export function getShareExportFileTags() {

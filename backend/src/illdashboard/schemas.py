@@ -385,6 +385,7 @@ class SearchResultOut(BaseModel):
 
 class ShareExportFileAssets(BaseModel):
     page_image_urls: list[str] = Field(default_factory=list)
+    text_preview: str | None = None
 
 
 class ShareExportSearchDocument(BaseModel):

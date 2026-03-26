@@ -497,6 +497,210 @@ async def test_extract_text_batch_uses_retrying_pdf_range_path():
 
 
 @pytest.mark.asyncio
+async def test_extract_measurement_batch_reads_text_document_directly_with_copilot_backend(tmp_path):
+    file_path = tmp_path / "report.md"
+    file_path.write_text("# Lab report\n\nCRP 15 mg/L", encoding="utf-8")
+
+    with (
+        patch(
+            "illdashboard.copilot.extraction.copilot_ask_json",
+            new=AsyncMock(
+                return_value={
+                    "lab_date": "2026-03-15T00:00:00+00:00",
+                    "source": "Synlab",
+                    "measurements": [
+                        {
+                            "marker_name": "CRP",
+                            "value": 15.0,
+                            "unit": "mg/L",
+                            "reference_low": 0.0,
+                            "reference_high": 5.0,
+                            "measured_at": "2026-03-15T00:00:00+00:00",
+                            "page_number": 7,
+                        }
+                    ],
+                }
+            ),
+        ) as ask_mock,
+        patch(
+            "illdashboard.copilot.extraction.mistral_client._ask_json",
+            new=AsyncMock(),
+        ) as mistral_json_mock,
+        patch(
+            "illdashboard.copilot.extraction._extract_structured_medical_data_from_file_mistral",
+            new=AsyncMock(),
+        ) as mistral_mock,
+    ):
+        result = await copilot_ocr.extract_measurement_batch(
+            str(file_path),
+            start_page=0,
+            stop_page=1,
+            dpi=144,
+            filename="report.md",
+        )
+
+    assert result == {
+        "lab_date": "2026-03-15T00:00:00+00:00",
+        "source": "Synlab",
+        "measurements": [
+            {
+                "marker_name": "CRP",
+                "value": 15.0,
+                "unit": "mg/L",
+                "reference_low": 0.0,
+                "reference_high": 5.0,
+                "measured_at": "2026-03-15T00:00:00+00:00",
+                "page_number": 1,
+            }
+        ],
+    }
+    ask_mock.assert_awaited_once()
+    mistral_json_mock.assert_not_called()
+    mistral_mock.assert_not_called()
+    assert ask_mock.await_args.kwargs["request_name"] == "structured_medical_extraction"
+
+
+@pytest.mark.asyncio
+async def test_extract_text_batch_reads_text_document_directly_with_copilot_backend(tmp_path):
+    file_path = tmp_path / "report.txt"
+    file_path.write_text("CRP 15 mg/L", encoding="utf-8")
+
+    with (
+        patch(
+            "illdashboard.copilot.extraction.copilot_ask_json",
+            new=AsyncMock(return_value={"translated_text_english": "CRP 15 mg/L"}),
+        ) as ask_mock,
+        patch(
+            "illdashboard.copilot.extraction.mistral_client._ask_json",
+            new=AsyncMock(),
+        ) as mistral_json_mock,
+        patch(
+            "illdashboard.copilot.extraction._extract_document_text_from_file_mistral",
+            new=AsyncMock(),
+        ) as mistral_mock,
+    ):
+        result = await copilot_ocr.extract_text_batch(
+            str(file_path),
+            start_page=0,
+            stop_page=1,
+            dpi=144,
+            filename="report.txt",
+        )
+
+    assert result == {
+        "raw_text": "CRP 15 mg/L",
+        "translated_text_english": "CRP 15 mg/L",
+    }
+    ask_mock.assert_awaited_once()
+    mistral_json_mock.assert_not_called()
+    mistral_mock.assert_not_called()
+    assert ask_mock.await_args.kwargs["request_name"] == "document_text_extraction"
+
+
+@pytest.mark.asyncio
+async def test_extract_measurement_batch_reads_text_document_directly_with_mistral_backend(tmp_path):
+    file_path = tmp_path / "report.md"
+    file_path.write_text("# Lab report\n\nCRP 15 mg/L", encoding="utf-8")
+
+    with (
+        patch.object(copilot_ocr.settings, "EXTRACTION_PROVIDER", "mistral"),
+        patch(
+            "illdashboard.copilot.extraction.mistral_client._ask_json",
+            new=AsyncMock(
+                return_value={
+                    "lab_date": "2026-03-15T00:00:00+00:00",
+                    "source": "Synlab",
+                    "measurements": [
+                        {
+                            "marker_name": "CRP",
+                            "value": 15.0,
+                            "unit": "mg/L",
+                            "reference_low": 0.0,
+                            "reference_high": 5.0,
+                            "measured_at": "2026-03-15T00:00:00+00:00",
+                            "page_number": 3,
+                        }
+                    ],
+                }
+            ),
+        ) as ask_mock,
+        patch(
+            "illdashboard.copilot.extraction.copilot_ask_json",
+            new=AsyncMock(),
+        ) as copilot_json_mock,
+        patch(
+            "illdashboard.copilot.extraction._extract_structured_medical_data_from_file_mistral",
+            new=AsyncMock(),
+        ) as mistral_mock,
+    ):
+        result = await copilot_ocr.extract_measurement_batch(
+            str(file_path),
+            start_page=0,
+            stop_page=1,
+            dpi=144,
+            filename="report.md",
+        )
+
+    assert result == {
+        "lab_date": "2026-03-15T00:00:00+00:00",
+        "source": "Synlab",
+        "measurements": [
+            {
+                "marker_name": "CRP",
+                "value": 15.0,
+                "unit": "mg/L",
+                "reference_low": 0.0,
+                "reference_high": 5.0,
+                "measured_at": "2026-03-15T00:00:00+00:00",
+                "page_number": 1,
+            }
+        ],
+    }
+    ask_mock.assert_awaited_once()
+    copilot_json_mock.assert_not_called()
+    mistral_mock.assert_not_called()
+    assert ask_mock.await_args.kwargs["request_name"] == "structured_medical_extraction"
+
+
+@pytest.mark.asyncio
+async def test_extract_text_batch_reads_text_document_directly_with_mistral_backend(tmp_path):
+    file_path = tmp_path / "report.txt"
+    file_path.write_text("CRP 15 mg/L", encoding="utf-8")
+
+    with (
+        patch.object(copilot_ocr.settings, "EXTRACTION_PROVIDER", "mistral"),
+        patch(
+            "illdashboard.copilot.extraction.mistral_client._ask_json",
+            new=AsyncMock(return_value={"translated_text_english": "CRP 15 mg/L"}),
+        ) as ask_mock,
+        patch(
+            "illdashboard.copilot.extraction.copilot_ask_json",
+            new=AsyncMock(),
+        ) as copilot_json_mock,
+        patch(
+            "illdashboard.copilot.extraction._extract_document_text_from_file_mistral",
+            new=AsyncMock(),
+        ) as mistral_mock,
+    ):
+        result = await copilot_ocr.extract_text_batch(
+            str(file_path),
+            start_page=0,
+            stop_page=1,
+            dpi=144,
+            filename="report.txt",
+        )
+
+    assert result == {
+        "raw_text": "CRP 15 mg/L",
+        "translated_text_english": "CRP 15 mg/L",
+    }
+    ask_mock.assert_awaited_once()
+    copilot_json_mock.assert_not_called()
+    mistral_mock.assert_not_called()
+    assert ask_mock.await_args.kwargs["request_name"] == "document_text_extraction"
+
+
+@pytest.mark.asyncio
 async def test_extract_measurement_batch_uses_direct_mistral_file_path_when_configured():
     with (
         patch.object(copilot_ocr.settings, "EXTRACTION_PROVIDER", "mistral"),

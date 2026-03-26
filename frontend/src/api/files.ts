@@ -78,6 +78,16 @@ export async function fetchFilePageInfo(fileId: string | number) {
   return response.data;
 }
 
+export async function fetchFileTextPreview(fileId: string | number) {
+  if (isShareExportMode()) {
+    throwUnavailableInShareExport("Loading file previews");
+  }
+  const response = await apiClient.get<string>(`/files/${fileId}/pages/1`, {
+    responseType: "text",
+  });
+  return response.data;
+}
+
 export async function runFileOcr(fileId: string | number) {
   if (isShareExportMode()) {
     throwUnavailableInShareExport("Reprocessing files");

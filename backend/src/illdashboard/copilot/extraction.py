@@ -24,6 +24,7 @@ from illdashboard.copilot.client import (
 from illdashboard.copilot.client import (
     _ask_json as copilot_ask_json,
 )
+from illdashboard.services import file_types
 
 logger = logging.getLogger(__name__)
 
@@ -375,6 +376,148 @@ Rules:
 Return ONLY valid JSON: {"summary_english": "...", "lab_date": "...", "source": "..."}.
 Do not include any commentary outside the JSON.\
 """
+
+
+MEDICAL_TEXT_SYSTEM_PROMPT = """\
+You are a medical lab report extraction assistant.
+
+The user will provide:
+1. Raw text copied from a plain-text or Markdown document.
+2. The original filename.
+
+Your job is to:
+1. Identify every measured lab marker.
+2. Extract "lab_date" as an ISO date string or null when the report date is not clear.
+3. Extract "source" as a short raw lab/provider name string or null when unclear.
+4. Return each measurement with keys:
+   "marker_name", "value", "unit", "reference_low", "reference_high",
+   "measured_at", and "page_number".
+
+Rules:
+- Use a JSON number in "value" for numeric results and a short JSON string for qualitative results.
+- "reference_low" and "reference_high" must be JSON numbers or null.
+- If the document is not a lab report, return an empty "measurements" array.
+- Because the source is a text document, always set "page_number" to 1.
+- Use only the provided raw text and filename.
+
+Return ONLY valid JSON: {"lab_date": "...", "source": "...", "measurements": [...]}.
+Do not include any commentary outside the JSON.\
+"""
+
+
+TEXT_DOCUMENT_TRANSLATION_SYSTEM_PROMPT = """\
+You translate plain-text or Markdown documents into English.
+
+The user will provide raw text and the original filename.
+
+Rules:
+- Preserve headings, bullets, tables, document order, and line breaks when practical.
+- Keep marker names, numbers, ranges, and units exact.
+- If the source text is already English, return it unchanged except for obvious cleanup.
+
+Return ONLY valid JSON: {"translated_text_english": "..."}.
+Do not include any commentary outside the JSON.\
+"""
+
+
+def _read_text_document(file_path: str) -> str:
+    # Plain text and Markdown uploads already contain machine-readable content,
+    # so keep their native bytes instead of forcing them through image OCR.
+    return Path(file_path).read_text(encoding="utf-8-sig")
+
+
+def _normalize_text_document(raw_text: str) -> str | None:
+    normalized = raw_text.replace("\r\n", "\n").strip()
+    return normalized or None
+
+
+def _text_document_request_context(filename: str | None) -> str:
+    return _mistral_request_context(filename)
+
+
+async def _text_document_json_request(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    request_name: str,
+    request_context: str = "",
+) -> dict:
+    # Text/Markdown uploads bypass OCR, but they should still respect the active
+    # extraction provider instead of silently depending on the other backend.
+    if settings.EXTRACTION_PROVIDER == "mistral":
+        return await mistral_client._ask_json(
+            system_prompt,
+            user_prompt,
+            request_name=request_name,
+            request_context=request_context,
+            timeout=OCR_ASK_TIMEOUT,
+        )
+    return await copilot_ask_json(
+        system_prompt,
+        user_prompt,
+        request_name=request_name,
+        request_context=request_context,
+        timeout=OCR_ASK_TIMEOUT,
+    )
+
+
+async def _translate_text_document_to_english(
+    raw_text: str,
+    *,
+    filename: str | None = None,
+    request_context: str = "",
+) -> str | None:
+    payload = {"filename": filename, "raw_text": raw_text}
+    parsed = await _text_document_json_request(
+        TEXT_DOCUMENT_TRANSLATION_SYSTEM_PROMPT,
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        request_name="document_text_extraction",
+        request_context=request_context,
+    )
+    translated = parsed.get("translated_text_english")
+    return translated.strip() if isinstance(translated, str) and translated.strip() else None
+
+
+async def _extract_text_from_text_document(
+    file_path: str,
+    *,
+    filename: str | None = None,
+    request_context: str = "",
+) -> dict:
+    raw_text = _normalize_text_document(_read_text_document(file_path))
+    if raw_text is None:
+        return {"raw_text": None, "translated_text_english": None}
+    translated = await _translate_text_document_to_english(
+        raw_text,
+        filename=filename,
+        request_context=request_context,
+    )
+    return {
+        "raw_text": raw_text,
+        "translated_text_english": translated,
+    }
+
+
+async def _extract_structured_medical_data_from_text_document(
+    file_path: str,
+    *,
+    filename: str | None = None,
+    request_context: str = "",
+) -> dict:
+    raw_text = _normalize_text_document(_read_text_document(file_path))
+    if raw_text is None:
+        return {"lab_date": None, "source": None, "measurements": []}
+
+    payload = {"filename": filename, "raw_text": raw_text}
+    parsed = await _text_document_json_request(
+        MEDICAL_TEXT_SYSTEM_PROMPT,
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        request_name="structured_medical_extraction",
+        request_context=request_context,
+    )
+    result = _normalized_medical_annotation(parsed)
+    result["measurements"] = [{**measurement, "page_number": 1} for measurement in result["measurements"]]
+    return result
 
 
 def _render_pdf_page_to_temp_png(page: fitz.Page, *, dpi: int) -> str:
@@ -1149,8 +1292,29 @@ async def ocr_extract(
     medical_task: asyncio.Task[dict] | None = None
     text_task: asyncio.Task[dict] | None = None
     render_cache: _PdfRenderCache | _ImageRenderCache | None = None
+    if file_types.is_text_document_path(file_path):
+        request_context = _text_document_request_context(filename)
 
-    if settings.EXTRACTION_PROVIDER == "mistral":
+        async def _extract_medical_result() -> dict:
+            result = await _extract_structured_medical_data_from_text_document(
+                file_path,
+                filename=filename,
+                request_context=request_context,
+            )
+            if on_medical_batch is not None:
+                await on_medical_batch(0, result)
+            return result
+
+        medical_task = asyncio.create_task(_extract_medical_result(), name="ocr:medical")
+        text_task = asyncio.create_task(
+            _extract_text_from_text_document(
+                file_path,
+                filename=filename,
+                request_context=request_context,
+            ),
+            name="ocr:text",
+        )
+    elif settings.EXTRACTION_PROVIDER == "mistral":
 
         async def _extract_medical_result() -> dict:
             start_page = 0 if Path(file_path).suffix.lower() == ".pdf" else None
@@ -1301,7 +1465,13 @@ async def extract_text(
     )
 
     try:
-        if settings.EXTRACTION_PROVIDER == "mistral":
+        if file_types.is_text_document_path(file_path):
+            result = await _extract_text_from_text_document(
+                file_path,
+                filename=filename,
+                request_context=_text_document_request_context(filename),
+            )
+        elif settings.EXTRACTION_PROVIDER == "mistral":
             result = await _extract_document_text_from_file_mistral(
                 file_path,
                 filename=filename,
@@ -1337,6 +1507,12 @@ async def extract_measurement_batch(
     dpi: int,
     filename: str | None = None,
 ) -> dict:
+    if file_types.is_text_document_path(file_path):
+        return await _extract_structured_medical_data_from_text_document(
+            file_path,
+            filename=filename,
+            request_context=_text_document_request_context(filename),
+        )
     if settings.EXTRACTION_PROVIDER == "mistral":
         pdf_range = Path(file_path).suffix.lower() == ".pdf"
         return await _extract_structured_medical_data_from_file_mistral(
@@ -1379,6 +1555,12 @@ async def extract_text_batch(
     dpi: int,
     filename: str | None = None,
 ) -> dict:
+    if file_types.is_text_document_path(file_path):
+        return await _extract_text_from_text_document(
+            file_path,
+            filename=filename,
+            request_context=_text_document_request_context(filename),
+        )
     if settings.EXTRACTION_PROVIDER == "mistral":
         pdf_range = Path(file_path).suffix.lower() == ".pdf"
         return await _extract_document_text_from_file_mistral(

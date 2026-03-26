@@ -25,6 +25,7 @@ from illdashboard.schemas import (
     ShareExportFileAssets,
     ShareExportSearchDocument,
 )
+from illdashboard.services import file_types
 from illdashboard.services import search as search_service
 
 router = APIRouter(prefix="")
@@ -108,6 +109,9 @@ def _render_preview_page(document: fitz.Document, page_num: int) -> str:
 async def _build_file_assets(file_id: int, db: AsyncSession) -> ShareExportFileAssets:
     lab_file = await files_api.get_lab_file_or_404(file_id, db)
     file_path = files_api.get_file_path_or_404(lab_file)
+
+    if file_types.is_text_document_mime_type(lab_file.mime_type):
+        return ShareExportFileAssets(text_preview=file_path.read_text(encoding="utf-8-sig"))
 
     with fitz.open(str(file_path)) as document:
         page_image_urls = [

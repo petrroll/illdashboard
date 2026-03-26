@@ -7,6 +7,7 @@ import {
   fetchFile,
   fetchFileMeasurements,
   fetchFilePageInfo,
+  fetchFileTextPreview,
   fetchFileTags,
   runFileOcr,
   setFileTags,
@@ -35,6 +36,7 @@ import {
   isUnitConversionMissing,
 } from "../utils/measurements";
 import {
+  getShareExportFileTextPreview,
   getShareExportPageImageUrl,
   isShareExportMode,
 } from "../export/runtime";
@@ -79,6 +81,14 @@ function getProcessingLabel(file: LabFile) {
   return "Processing";
 }
 
+function isTextPreviewMime(mimeType: string | null | undefined) {
+  return mimeType === "text/plain" || mimeType === "text/markdown";
+}
+
+function isMarkdownPreviewMime(mimeType: string | null | undefined) {
+  return mimeType === "text/markdown";
+}
+
 function getProgressSummary(file: LabFile) {
   return [
     `Measurements ${file.progress.measurement_pages_done}/${file.progress.measurement_pages_total} pages`,
@@ -121,6 +131,9 @@ export default function FileDetail() {
   const [allFileTags, setAllFileTags] = useState<string[]>([]);
   const [highlightedPage, setHighlightedPage] = useState<number | null>(null);
   const [search, setSearch] = useState("");
+  const [textPreview, setTextPreview] = useState<string | null>(null);
+  const [textPreviewError, setTextPreviewError] = useState<string | null>(null);
+  const [textPreviewLoading, setTextPreviewLoading] = useState(false);
   const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const highlightTimeoutRef = useRef<number | null>(null);
 
@@ -189,6 +202,42 @@ export default function FileDetail() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (shareExportMode || !fileId || !pageInfo || !isTextPreviewMime(pageInfo.mime_type)) {
+      setTextPreview(null);
+      setTextPreviewError(null);
+      setTextPreviewLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setTextPreview(null);
+    setTextPreviewError(null);
+    setTextPreviewLoading(true);
+
+    void fetchFileTextPreview(fileId)
+      .then((preview) => {
+        if (!cancelled) {
+          setTextPreview(preview);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setTextPreview(null);
+          setTextPreviewError("Preview unavailable.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setTextPreviewLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [fileId, pageInfo?.mime_type, shareExportMode]);
 
   const requestExplanation = async (request: () => Promise<{ explanation: string }>) => {
     setExplaining(true);
@@ -280,6 +329,11 @@ export default function FileDetail() {
 
   const canExplain = !shareExportMode;
   const hasPages = pageInfo && pageInfo.page_count > 0;
+  const isTextPreview = isTextPreviewMime(pageInfo?.mime_type);
+  const shareExportTextPreview = shareExportMode
+    ? getShareExportFileTextPreview(file.id) ?? file.ocr_text_raw ?? file.ocr_text_english ?? null
+    : null;
+  const resolvedTextPreview = shareExportMode ? shareExportTextPreview : textPreview;
   const showPageColumn = (pageInfo?.page_count ?? 0) > 1;
   const searchLower = search.toLowerCase();
   const filteredMeasurements = searchLower
@@ -437,26 +491,54 @@ export default function FileDetail() {
               Document Preview
               {pageInfo.page_count > 1 && ` · ${pageInfo.page_count} pages`}
             </h3>
-            <div className="file-preview-pages">
-              {Array.from({ length: pageInfo.page_count }, (_, index) => index + 1).map((pageNum) => (
-                <div
-                  key={pageNum}
-                  ref={(element) => setPageRef(pageNum, element)}
-                  className={`file-preview-page${highlightedPage === pageNum ? " file-preview-page--highlighted" : ""}`}
-                >
-                  {pageInfo.page_count > 1 && (
-                    <span className="file-preview-page-label">Page {pageNum}</span>
-                  )}
-                  <img
-                    src={shareExportMode
-                      ? (getShareExportPageImageUrl(file.id, pageNum) ?? "")
-                      : `/api/files/${fileId}/pages/${pageNum}`}
-                    alt={`Page ${pageNum}`}
-                    loading="lazy"
-                  />
+            {isTextPreview ? (
+              textPreviewLoading ? (
+                <p style={{ color: "var(--text-muted)" }}>Loading preview…</p>
+              ) : textPreviewError ? (
+                <p style={{ color: "var(--text-muted)" }}>{textPreviewError}</p>
+              ) : resolvedTextPreview === null ? (
+                <p style={{ color: "var(--text-muted)" }}>Preview unavailable.</p>
+              ) : resolvedTextPreview.length === 0 ? (
+                <p style={{ color: "var(--text-muted)" }}>This document is empty.</p>
+              ) : isMarkdownPreviewMime(pageInfo?.mime_type) ? (
+                <div style={{ overflow: "auto", lineHeight: 1.6 }}>
+                  <ReactMarkdown>{resolvedTextPreview}</ReactMarkdown>
                 </div>
-              ))}
-            </div>
+              ) : (
+                <pre
+                  style={{
+                    margin: 0,
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                    lineHeight: 1.5,
+                    overflow: "auto",
+                  }}
+                >
+                  {resolvedTextPreview}
+                </pre>
+              )
+            ) : (
+              <div className="file-preview-pages">
+                {Array.from({ length: pageInfo.page_count }, (_, index) => index + 1).map((pageNum) => (
+                  <div
+                    key={pageNum}
+                    ref={(element) => setPageRef(pageNum, element)}
+                    className={`file-preview-page${highlightedPage === pageNum ? " file-preview-page--highlighted" : ""}`}
+                  >
+                    {pageInfo.page_count > 1 && (
+                      <span className="file-preview-page-label">Page {pageNum}</span>
+                    )}
+                    <img
+                      src={shareExportMode
+                        ? (getShareExportPageImageUrl(file.id, pageNum) ?? "")
+                        : `/api/files/${fileId}/pages/${pageNum}`}
+                      alt={`Page ${pageNum}`}
+                      loading="lazy"
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 

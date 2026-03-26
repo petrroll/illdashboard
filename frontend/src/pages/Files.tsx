@@ -293,16 +293,16 @@ export default function Files() {
             </span>
           ) : (
             <>
-              <p>📂 Click to select PDF or image files</p>
+              <p>📂 Click to select PDF, image, text, or Markdown files</p>
               <p style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>
-                Supports .pdf, .png, .jpg, .webp
+                Supports .pdf, .png, .jpg, .webp, .txt, .md
               </p>
             </>
           )}
           <input
             ref={inputRef}
             type="file"
-            accept=".pdf,.png,.jpg,.jpeg,.webp"
+            accept=".pdf,.png,.jpg,.jpeg,.webp,.txt,.md"
             multiple
             onChange={handleUpload}
           />

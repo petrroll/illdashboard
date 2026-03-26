@@ -19,12 +19,10 @@ from illdashboard.config import settings
 from illdashboard.database import get_db
 from illdashboard.models import LabFile, LabFileTag
 from illdashboard.schemas import BatchOcrRequest, FileProgressOut, LabFileOut, QueueFilesResponse
-from illdashboard.services import pipeline, upload_metadata
+from illdashboard.services import file_types, pipeline, upload_metadata
 from illdashboard.services import search as search_service
 
 router = APIRouter(prefix="")
-
-ALLOWED_MIME = {"application/pdf", "image/png", "image/jpeg", "image/webp"}
 
 
 async def get_lab_file_or_404(file_id: int, db: AsyncSession) -> LabFile:
@@ -106,8 +104,10 @@ async def upload_file(
     lab_date: datetime | None = Query(None, description="Date of the lab report"),
     db: AsyncSession = Depends(get_db),
 ):
-    if file.content_type not in ALLOWED_MIME:
-        raise HTTPException(400, f"Unsupported file type: {file.content_type}")
+    mime_type = file_types.canonical_upload_mime_type(file.filename, file.content_type)
+    if mime_type is None:
+        unsupported_type = file.content_type or Path(file.filename or "file").suffix or "unknown"
+        raise HTTPException(400, f"Unsupported file type: {unsupported_type}")
 
     upload_dir = Path(settings.UPLOAD_DIR)
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -124,7 +124,6 @@ async def upload_file(
         destination.unlink(missing_ok=True)
         raise
 
-    mime_type = file.content_type or "application/octet-stream"
     lab = LabFile(
         filename=file.filename or safe_name,
         filepath=str(destination),
@@ -186,6 +185,8 @@ async def get_file_page_image(file_id: int, page_num: int, db: AsyncSession = De
 
     if page_num != 1:
         raise HTTPException(404, "Page not found")
+    if file_types.is_text_document_mime_type(lab.mime_type):
+        return Response(content=file_path.read_text(encoding="utf-8-sig"), media_type=lab.mime_type)
     return Response(content=file_path.read_bytes(), media_type=lab.mime_type)
 
 

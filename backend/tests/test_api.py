@@ -103,6 +103,24 @@ async def test_upload_and_queue_processing_creates_ensure_file_job(client, sessi
 
 
 @pytest.mark.asyncio
+async def test_upload_markdown_file_exposes_text_preview(client):
+    markdown = "# Lab report\n\nCRP 15 mg/L\n"
+    upload_response = await client.post(
+        "/api/files/upload",
+        files={"file": ("report.md", markdown.encode("utf-8"), "text/plain")},
+    )
+    assert upload_response.status_code == 200
+    uploaded_file = upload_response.json()
+    assert uploaded_file["mime_type"] == "text/markdown"
+    assert uploaded_file["page_count"] == 1
+
+    page_response = await client.get(f"/api/files/{uploaded_file['id']}/pages/1")
+    assert page_response.status_code == 200
+    assert page_response.headers["content-type"].startswith("text/markdown")
+    assert page_response.text == markdown
+
+
+@pytest.mark.asyncio
 async def test_delete_file_removes_original_name_sidecar(client, session_factory):
     upload_response = await client.post(
         "/api/files/upload",
@@ -224,6 +242,60 @@ async def test_share_export_html_embeds_assets_and_omits_summary_content(
     assert bundle["marker_sparkline_urls"]["Ferritin"].startswith("data:image/png;base64,")
     assert bundle["search_documents"][0]["translated_text"] == "Ferritin 12 ug/L"
     assert "summary" not in bundle["search_documents"][0]
+
+
+@pytest.mark.asyncio
+async def test_share_export_html_embeds_text_preview_for_text_documents(
+    client,
+    session_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    dist_dir = tmp_path / "frontend-dist"
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    (dist_dir / "share-export-shell.html").write_text(
+        (
+            "<!doctype html><html><body>"
+            '<script id="illdashboard-export-bundle" type="application/octet-stream">'
+            "__ILLDASHBOARD_EXPORT_BASE64__"
+            "</script>"
+            "</body></html>"
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings, "FRONTEND_DIST_DIR", str(dist_dir))
+
+    markdown = "# Lab report\n\nCRP 15 mg/L\n"
+    file_path = Path(settings.UPLOAD_DIR) / "share-report.md"
+    file_path.write_text(markdown, encoding="utf-8")
+
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="share-report.md",
+            filepath=str(file_path),
+            mime_type="text/markdown",
+            page_count=1,
+            status="complete",
+            ocr_text_raw=markdown,
+            ocr_text_english="CRP 15 mg/L",
+            search_indexed_at=utc_now(),
+        )
+        session.add(lab_file)
+        await session.commit()
+
+    response = await client.get("/api/export/share-html")
+    assert response.status_code == 200
+
+    match = re.search(
+        r'<script id="illdashboard-export-bundle" type="application/octet-stream">([^<]+)</script>',
+        response.text,
+    )
+    assert match is not None
+
+    bundle = json.loads(base64.b64decode(match.group(1)).decode("utf-8"))
+    assets = bundle["file_assets"][str(bundle["files"][0]["id"])]
+    assert assets["page_image_urls"] == []
+    assert assets["text_preview"] == markdown
 
 
 @pytest.mark.asyncio
@@ -401,6 +473,102 @@ async def test_pipeline_runtime_processes_file_end_to_end(session_factory):
     assert all(status == job_service.JOB_STATUS_RESOLVED for status in job_statuses)
     assert [result["file_id"] for result in search_results] == [file_id]
     assert progress.search_ready is True
+
+
+@pytest.mark.asyncio
+async def test_pipeline_runtime_processes_text_file_end_to_end(session_factory):
+    upload_dir = Path(settings.UPLOAD_DIR)
+    file_path = upload_dir / "runtime-report.md"
+    file_path.write_text("# Lab report\n\nCRP 15 mg/L\n", encoding="utf-8")
+
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="runtime-report.md",
+            filepath=str(file_path),
+            mime_type="text/markdown",
+            page_count=1,
+        )
+        session.add(lab_file)
+        await session.commit()
+        await session.refresh(lab_file)
+        file_id = lab_file.id
+
+    async def fake_copilot_ask_json(_system_prompt, _user_prompt, *, request_name: str, **_kwargs):
+        if request_name == "structured_medical_extraction":
+            return {
+                "lab_date": "2026-03-15T00:00:00+00:00",
+                "source": "Synlab",
+                "measurements": [
+                    {
+                        "marker_name": "CRP",
+                        "value": 15.0,
+                        "unit": "mg/L",
+                        "reference_low": 0.0,
+                        "reference_high": 5.0,
+                        "measured_at": "2026-03-15T00:00:00+00:00",
+                        "page_number": 1,
+                    }
+                ],
+            }
+        if request_name == "document_text_extraction":
+            return {"translated_text_english": "# Lab report\n\nCRP 15 mg/L"}
+        if request_name == "medical_summary":
+            return {
+                "summary_english": "Inflammation marker is elevated.",
+                "lab_date": "2026-03-15T00:00:00+00:00",
+                "source": "Synlab",
+            }
+        raise AssertionError(f"Unexpected request_name: {request_name}")
+
+    runtime = pipeline.PipelineRuntime(session_factory)
+    await runtime.start()
+    try:
+        with (
+            patch(
+                "illdashboard.copilot.extraction.copilot_ask_json",
+                new=AsyncMock(side_effect=fake_copilot_ask_json),
+            ),
+            patch(
+                "illdashboard.services.pipeline.copilot_normalization.normalize_marker_names",
+                new=AsyncMock(return_value={"CRP": "CRP"}),
+            ),
+            patch(
+                "illdashboard.services.pipeline.copilot_normalization.normalize_source_name",
+                new=AsyncMock(return_value="Synlab"),
+            ),
+            patch(
+                "illdashboard.services.pipeline.copilot_normalization.classify_marker_groups",
+                new=AsyncMock(return_value={"CRP": "Inflammation & Infection"}),
+            ),
+            patch(
+                "illdashboard.services.pipeline.copilot_normalization.choose_canonical_units",
+                new=AsyncMock(return_value={"CRP": "mg/L"}),
+            ),
+            patch(
+                "illdashboard.services.pipeline.copilot_normalization.infer_rescaling_factors",
+                new=AsyncMock(return_value={}),
+            ),
+            patch(
+                "illdashboard.services.pipeline.copilot_normalization.normalize_qualitative_values",
+                new=AsyncMock(return_value={}),
+            ),
+        ):
+            async with session_factory() as session:
+                queued_file_ids = await pipeline.queue_files(session, [file_id])
+            assert queued_file_ids == [file_id]
+
+            complete_file = await _wait_for_file_complete(session_factory, file_id)
+            await _wait_for_jobs_resolved(session_factory)
+    finally:
+        await runtime.stop()
+
+    assert complete_file.status == "complete"
+    assert complete_file.ocr_text_raw == "# Lab report\n\nCRP 15 mg/L"
+    assert complete_file.ocr_text_english == "# Lab report\n\nCRP 15 mg/L"
+    assert complete_file.ocr_summary_english == "Inflammation marker is elevated."
+    assert complete_file.source_name == "synlab"
+    assert len(complete_file.measurements) == 1
+    assert complete_file.measurements[0].page_number == 1
 
 
 @pytest.mark.asyncio
@@ -919,12 +1087,13 @@ async def test_preload_uploaded_files_seeds_missing_disk_files(session_factory):
     original_name_sidecar_path(hashed_path).write_text("new-scan.png", encoding="utf-8")
     fallback_path = upload_dir / "missing-sidecar.png"
     fallback_path.write_bytes(b"fallback-png")
-    (upload_dir / "notes.txt").write_text("ignore me")
+    notes_path = upload_dir / "notes.txt"
+    notes_path.write_text("ignore me", encoding="utf-8")
 
     async with session_factory() as session:
         added = await pipeline.preload_uploaded_files(session)
 
-    assert added == 2
+    assert added == 3
 
     async with session_factory() as session:
         result = await session.execute(select(LabFile).order_by(LabFile.filepath.asc()))
@@ -934,8 +1103,8 @@ async def test_preload_uploaded_files_seeds_missing_disk_files(session_factory):
     assert "already-tracked.png" in paths
     assert hashed_path.name in paths
     assert fallback_path.name in paths
+    assert notes_path.name in paths
     assert original_name_sidecar_path(hashed_path).name not in paths
-    assert "notes.txt" not in paths
 
     new_file = next(file for file in files if Path(file.filepath).name == hashed_path.name)
     assert new_file.mime_type == "image/png"
@@ -944,6 +1113,10 @@ async def test_preload_uploaded_files_seeds_missing_disk_files(session_factory):
     fallback_file = next(file for file in files if Path(file.filepath).name == fallback_path.name)
     assert fallback_file.filename == fallback_path.name
     assert fallback_file.status == "uploaded"
+    notes_file = next(file for file in files if Path(file.filepath).name == notes_path.name)
+    assert notes_file.mime_type == "text/plain"
+    assert notes_file.filename == notes_path.name
+    assert notes_file.status == "uploaded"
 
 
 @pytest.mark.asyncio
