@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from illdashboard.api import router
 from illdashboard.config import settings
 from illdashboard.copilot.client import prewarm_client, shutdown_client
-from illdashboard.database import async_session, engine
+from illdashboard.database import dispose_database_engine, get_async_session_factory, get_database_engine
 from illdashboard.medications_database import dispose_medications_engine, init_medications_database
 from illdashboard.models import Base
 from illdashboard.services.pipeline import start_pipeline_runtime, stop_pipeline_runtime
@@ -68,12 +68,14 @@ async def lifespan(app: FastAPI):
     prewarm_task: asyncio.Task[bool] | None = None
     upload_dir = Path(settings.UPLOAD_DIR)
     upload_dir.mkdir(parents=True, exist_ok=True)
+    engine = get_database_engine()
+    session_factory = get_async_session_factory()
 
     await init_medications_database()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    await start_pipeline_runtime(async_session)
+    await start_pipeline_runtime(session_factory)
     prewarm_task = asyncio.create_task(prewarm_client())
     logger.info("Pipeline runtime started")
     try:
@@ -87,6 +89,7 @@ async def lifespan(app: FastAPI):
                 pass
         await stop_pipeline_runtime()
         await shutdown_client()
+        await dispose_database_engine()
         await dispose_medications_engine()
 
 

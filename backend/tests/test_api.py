@@ -1140,7 +1140,6 @@ async def test_reset_database_reloads_upload_dir_as_uploaded_files(client, sessi
         await session.commit()
 
     with (
-        patch.object(admin_service, "engine", session_factory.kw["bind"]),
         patch.object(admin_service, "purge_sparkline_cache", return_value=0),
     ):
         response = await client.delete("/api/admin/database")

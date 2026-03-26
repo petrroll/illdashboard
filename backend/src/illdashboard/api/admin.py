@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
 from illdashboard.database import get_db
 from illdashboard.metrics import get_premium_requests_used
@@ -11,6 +11,20 @@ from illdashboard.schemas import RescalingRuleOut
 from illdashboard.services import admin as admin_service
 
 router = APIRouter(prefix="")
+
+
+def _session_engine(db: AsyncSession) -> AsyncEngine:
+    # Destructive admin actions must follow the same engine as the request
+    # session so tests and dependency overrides cannot accidentally target a
+    # different process-global database.
+    bind = db.bind
+    if bind is None:
+        raise RuntimeError("Database session is not bound to an engine.")
+    if isinstance(bind, AsyncEngine):
+        return bind
+    if isinstance(bind, AsyncConnection):
+        return bind.engine
+    raise RuntimeError("Database session bind is not an async engine.")
 
 
 @router.get("/admin/stats", tags=["admin"])
@@ -37,6 +51,6 @@ async def purge_all_caches(db: AsyncSession = Depends(get_db)):
 
 
 @router.delete("/admin/database", tags=["admin"])
-async def drop_database():
-    sparkline_count = await admin_service.reset_database()
+async def drop_database(db: AsyncSession = Depends(get_db)):
+    sparkline_count = await admin_service.reset_database(_session_engine(db))
     return {"status": "database_reset", "deleted_sparklines": sparkline_count}

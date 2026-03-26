@@ -10,7 +10,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from illdashboard import config
-from illdashboard.database import create_database_engine, get_db
+from illdashboard.database import create_database_engine, dispose_database_engine, get_db
 from illdashboard.medications_database import dispose_medications_engine, get_medications_db
 from illdashboard.medications_models import MedicationsBase
 from illdashboard.models import Base
@@ -43,6 +43,7 @@ async def session_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         yield factory
     finally:
         await engine.dispose()
+        await dispose_database_engine()
 
 
 @pytest.fixture
@@ -61,6 +62,7 @@ async def medications_session_factory(tmp_path: Path, monkeypatch: pytest.Monkey
         yield factory
     finally:
         await engine.dispose()
+        await dispose_database_engine()
         await dispose_medications_engine()
 
 
