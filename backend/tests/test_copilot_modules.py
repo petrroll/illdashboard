@@ -183,7 +183,7 @@ async def test_ocr_extract_splits_oversized_batches_and_preserves_page_numbers()
     ):
         result = await copilot_ocr.ocr_extract("/tmp/report.pdf")
 
-    assert result["lab_date"] == "2025-09-05"
+    assert result["lab_date"] is None
     assert result["source"] == "synlab"
     assert [measurement["page_number"] for measurement in result["measurements"]] == [1, 2, 3, 4]
     observed_calls = sorted(
@@ -700,6 +700,71 @@ async def test_extract_text_batch_reads_text_document_directly_with_mistral_back
     assert ask_mock.await_args.kwargs["request_name"] == "document_text_extraction"
 
 
+def test_medical_summary_prompts_prefer_document_level_dates():
+    summary_prompt = copilot_ocr.MEDICAL_SUMMARY_SYSTEM_PROMPT
+    text_prompt = copilot_ocr.MEDICAL_TEXT_SYSTEM_PROMPT
+
+    assert "document as a whole" in summary_prompt
+    assert "individual measurements" in summary_prompt
+    assert "validation/validated" in summary_prompt
+    assert "Return null only when no plausible document-level date is visible." in summary_prompt
+    assert "document as a whole" in text_prompt
+
+
+@pytest.mark.asyncio
+async def test_generate_summary_uses_a_single_prompt_pass_for_lab_date():
+    raw_text = (
+        "Validated: 2026-03-15\n"
+        "CRP 15 mg/L measured 2026-03-14\n"
+        "Ferritin 21 ug/L measured 2026-03-01\n"
+    )
+
+    with patch(
+        "illdashboard.copilot.extraction.copilot_ask_json",
+        new=AsyncMock(
+            return_value={
+                "summary_english": "Inflammation marker is elevated.",
+                "lab_date": "2026-03-15",
+                "source": "Synlab",
+            }
+        ),
+    ) as ask_mock:
+        result = await copilot_ocr.generate_summary(raw_text, filename="report.txt")
+
+    assert result == {
+        "summary_english": "Inflammation marker is elevated.",
+        "lab_date": "2026-03-15",
+        "source": "Synlab",
+    }
+    ask_mock.assert_awaited_once()
+    assert ask_mock.await_args.kwargs["request_name"] == "medical_summary"
+    assert "document as a whole" in ask_mock.await_args.args[0]
+    assert "individual measurements" in ask_mock.await_args.args[0]
+    assert "Validated: 2026-03-15" in ask_mock.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_generate_summary_does_not_retry_when_lab_date_is_missing():
+    with patch(
+        "illdashboard.copilot.extraction.copilot_ask_json",
+        new=AsyncMock(
+            return_value={
+                "summary_english": "Inflammation marker is elevated.",
+                "lab_date": None,
+                "source": "Synlab",
+            }
+        ),
+    ) as ask_mock:
+        result = await copilot_ocr.generate_summary("Validated: 2026-03-15", filename="report.txt")
+
+    assert result == {
+        "summary_english": "Inflammation marker is elevated.",
+        "lab_date": None,
+        "source": "Synlab",
+    }
+    ask_mock.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_extract_measurement_batch_uses_direct_mistral_file_path_when_configured():
     with (
@@ -1003,9 +1068,66 @@ async def test_ocr_extract_streams_medical_batches_before_combining_result():
         )
 
     assert observed_batches == [(1, [3]), (0, [1])]
-    assert result["lab_date"] == "2025-09-05"
+    assert result["lab_date"] is None
     assert result["source"] == "synlab"
     assert [measurement["page_number"] for measurement in result["measurements"]] == [1, 3]
+
+
+@pytest.mark.asyncio
+async def test_ocr_extract_uses_summary_lab_date_from_combined_text():
+    async def fake_extract_batches(
+        file_path: str,
+        kind: copilot_ocr._ExtractionKind,
+        *,
+        filename: str | None = None,
+        render_cache=None,
+    ):
+        assert file_path == "/tmp/report.pdf"
+        assert kind is copilot_ocr._MEDICAL_EXTRACTION
+        yield copilot_ocr._ExtractionBatch(
+            batch_index=0,
+            start_page=0,
+            stop_page=2,
+            result={
+                "lab_date": "2025-09-01",
+                "source": "synlab",
+                "measurements": [
+                    {
+                        "marker_name": "CRP",
+                        "value": 15,
+                        "unit": "mg/L",
+                        "reference_low": 0,
+                        "reference_high": 5,
+                        "measured_at": None,
+                        "page_number": 1,
+                    }
+                ],
+            },
+        )
+
+    text_result = {
+        "raw_text": "Page 1 text\n\nPage 2 text",
+        "translated_text_english": "Page 1 text\n\nPage 2 text",
+    }
+    summary_mock = AsyncMock(
+        return_value={
+            "summary_english": "Inflammation marker is elevated.",
+            "lab_date": "2025-09-05",
+            "source": "summary-synlab",
+        }
+    )
+
+    with (
+        patch.object(copilot_ocr, "_extract_file_batches", side_effect=fake_extract_batches),
+        patch.object(copilot_ocr, "extract_text", new=AsyncMock(return_value=text_result)),
+        patch.object(copilot_ocr, "generate_summary", new=summary_mock),
+    ):
+        result = await copilot_ocr.ocr_extract("/tmp/report.pdf")
+
+    assert result["lab_date"] == "2025-09-05"
+    assert result["source"] == "summary-synlab"
+    assert result["summary_english"] == "Inflammation marker is elevated."
+    summary_mock.assert_awaited_once_with("Page 1 text\n\nPage 2 text", filename=None)
 
 
 @pytest.mark.asyncio

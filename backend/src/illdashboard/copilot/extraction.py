@@ -363,13 +363,20 @@ The user will provide:
 
 Your job is to:
 1. Write a short factual English summary in 2-4 sentences.
-2. Extract "lab_date" as an ISO date string or null when the report date is not clear.
+2. Extract "lab_date" as the single best ISO date string for the document as a whole.
 3. Extract "source" as a short raw lab/provider name string or null when unclear.
 
 Rules:
 - Use only the provided raw text and filename.
 - Do not rely on any structured measurements or translated text.
 - Keep the summary factual and concise.
+- For "lab_date", prefer the main document/report-level date rather than dates attached only to
+  individual measurements or comparison rows.
+- When several dates are plausible, prefer dates labeled like validation/validated, result/report,
+  specimen collection, or issue dates when they apply to the whole report.
+- If more than one document-level date is plausible, choose the most likely one for this specific
+  document instead of returning null too early.
+- Return null only when no plausible document-level date is visible.
 - If the document is not clearly a lab report, briefly describe what kind of document it seems to be.
 - Do not add generic cautions or boilerplate.
 
@@ -399,6 +406,11 @@ Rules:
 - If the document is not a lab report, return an empty "measurements" array.
 - Because the source is a text document, always set "page_number" to 1.
 - Use only the provided raw text and filename.
+- For "lab_date", choose the single best date for the document as a whole, not a date attached only
+  to one measurement row.
+- When several dates are plausible, prefer document-level validation/result/report/specimen dates
+  over dates that belong only to individual analytes, history rows, or unrelated admin details.
+- Return null only when no plausible document-level date is visible.
 
 Return ONLY valid JSON: {"lab_date": "...", "source": "...", "measurements": [...]}.
 Do not include any commentary outside the JSON.\
@@ -809,8 +821,11 @@ def _merge_document_text_results(results: list[dict]) -> dict:
 
 def _combine_ocr_outputs(medical_result: dict, text_result: dict | None, summary_result: dict | None) -> dict:
     combined = {
-        "lab_date": medical_result.get("lab_date") or (summary_result or {}).get("lab_date"),
-        "source": medical_result.get("source") or (summary_result or {}).get("source"),
+        # File-level lab dates must come from the summary call over the merged
+        # all-pages OCR text. Batch-level measurement extraction can see only a
+        # slice of the document and is therefore not the source of truth.
+        "lab_date": (summary_result or {}).get("lab_date"),
+        "source": (summary_result or {}).get("source") or medical_result.get("source"),
         "measurements": medical_result.get("measurements", []),
     }
     if text_result and text_result.get("raw_text"):
