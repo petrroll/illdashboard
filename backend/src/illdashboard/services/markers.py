@@ -7,7 +7,7 @@ import re
 import unicodedata
 from collections import defaultdict
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -468,12 +468,16 @@ async def load_measurements_for_marker(db: AsyncSession, marker_name: str) -> li
 
     result = await db.execute(
         select(Measurement)
+        .join(Measurement.lab_file)
         .options(
             selectinload(Measurement.measurement_type).selectinload(MeasurementType.aliases),
             selectinload(Measurement.lab_file).selectinload(LabFile.tags),
         )
         .where(Measurement.measurement_type_id == measurement_type.id)
-        .order_by(Measurement.measured_at.asc(), Measurement.id.asc())
+        .order_by(
+            func.coalesce(Measurement.measured_at, LabFile.lab_date, LabFile.uploaded_at).asc(),
+            Measurement.id.asc(),
+        )
     )
     return list(result.scalars().all())
 

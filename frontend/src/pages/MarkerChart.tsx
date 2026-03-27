@@ -82,6 +82,12 @@ function parseMeasuredAtTimestamp(measuredAt: string | null) {
   return Number.isFinite(timestamp) ? timestamp : null;
 }
 
+
+function effectiveMeasuredAt(measurement: Measurement): string | null {
+  return measurement.effective_measured_at ?? measurement.measured_at ?? null;
+}
+
+
 function formatTimestampLabel(timestamp: number | null) {
   if (timestamp == null || !Number.isFinite(timestamp)) {
     return "—";
@@ -386,9 +392,8 @@ export default function MarkerChart() {
     [measurements],
   );
   const chartSeries = useMemo(() => {
-    const measuredTimestamps = chartMeasurements.map((measurement) =>
-      parseMeasuredAtTimestamp(measurement.measured_at),
-    );
+    const effectiveMeasuredDates = chartMeasurements.map((measurement) => effectiveMeasuredAt(measurement));
+    const measuredTimestamps = effectiveMeasuredDates.map((measuredAt) => parseMeasuredAtTimestamp(measuredAt));
     const firstMeasuredTimestamp = measuredTimestamps.find(
       (timestamp): timestamp is number => timestamp != null,
     ) ?? null;
@@ -398,17 +403,18 @@ export default function MarkerChart() {
 
     return {
       chartData: chartMeasurements.map<MarkerChartPoint>((measurement, index) => {
+        const effectiveMeasuredDate = effectiveMeasuredDates[index];
         const measuredTimestamp = measuredTimestamps[index];
         const axisTimestamp = measuredTimestamp ?? fallbackTimestamp ?? index;
 
         return {
-          dateLabel: formatDate(measurement.measured_at),
+          dateLabel: formatDate(effectiveMeasuredDate),
           axisDateLabel: formatTimestampLabel(measuredTimestamp ?? fallbackTimestamp),
           timestamp: axisTimestamp,
           value: getCanonicalTrendValue(measurement),
           reference_low: measurement.unit_conversion_missing ? null : measurement.canonical_reference_low,
           reference_high: measurement.unit_conversion_missing ? null : measurement.canonical_reference_high,
-          hasEstimatedDate: measuredTimestamp == null && fallbackTimestamp != null,
+          hasEstimatedDate: measurement.measured_at == null && measuredTimestamp != null,
         };
       }),
       fallbackTimestamp,

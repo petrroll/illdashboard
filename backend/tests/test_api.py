@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -569,6 +570,135 @@ async def test_pipeline_runtime_processes_text_file_end_to_end(session_factory):
     assert complete_file.source_name == "synlab"
     assert len(complete_file.measurements) == 1
     assert complete_file.measurements[0].page_number == 1
+
+
+@pytest.mark.asyncio
+async def test_measurement_chronology_prefers_measurement_then_file_lab_date_then_upload_date(
+    client, session_factory
+):
+    upload_only_file_upload = datetime(2026, 3, 19, 14, 35, tzinfo=UTC)
+    lab_date_file_upload = datetime(2026, 3, 22, 9, 10, tzinfo=UTC)
+    lab_date_file_lab_date = datetime(2026, 3, 20, 8, 0, tzinfo=UTC)
+    explicit_measurement_date = datetime(2026, 3, 21, 7, 45, tzinfo=UTC)
+    explicit_file_upload = datetime(2026, 3, 18, 11, 20, tzinfo=UTC)
+
+    async with session_factory() as session:
+        upload_only_file = LabFile(
+            filename="upload-only.txt",
+            filepath="/tmp/upload-only.txt",
+            mime_type="text/plain",
+            page_count=1,
+            uploaded_at=upload_only_file_upload,
+            lab_date=None,
+        )
+        lab_date_file = LabFile(
+            filename="lab-date.txt",
+            filepath="/tmp/lab-date.txt",
+            mime_type="text/plain",
+            page_count=1,
+            uploaded_at=lab_date_file_upload,
+            lab_date=lab_date_file_lab_date,
+        )
+        explicit_file = LabFile(
+            filename="explicit-date.txt",
+            filepath="/tmp/explicit-date.txt",
+            mime_type="text/plain",
+            page_count=1,
+            uploaded_at=explicit_file_upload,
+            lab_date=None,
+        )
+        marker_type = MeasurementType(
+            name="WBC",
+            normalized_key="wbc",
+            canonical_unit="10^9/L",
+            group_name="Blood Count",
+        )
+        session.add_all([upload_only_file, lab_date_file, explicit_file, marker_type])
+        await session.flush()
+        session.add_all(
+            [
+                Measurement(
+                    lab_file_id=upload_only_file.id,
+                    measurement_type_id=marker_type.id,
+                    raw_marker_name="WBC",
+                    normalized_marker_key="wbc",
+                    original_value=4.0,
+                    original_unit="10^9/L",
+                    canonical_value=4.0,
+                    canonical_unit="10^9/L",
+                    measured_at=None,
+                    normalization_status="resolved",
+                ),
+                Measurement(
+                    lab_file_id=lab_date_file.id,
+                    measurement_type_id=marker_type.id,
+                    raw_marker_name="WBC",
+                    normalized_marker_key="wbc",
+                    original_value=9.0,
+                    original_unit="10^9/L",
+                    canonical_value=9.0,
+                    canonical_unit="10^9/L",
+                    measured_at=None,
+                    normalization_status="resolved",
+                ),
+                Measurement(
+                    lab_file_id=explicit_file.id,
+                    measurement_type_id=marker_type.id,
+                    raw_marker_name="WBC",
+                    normalized_marker_key="wbc",
+                    original_value=12.0,
+                    original_unit="10^9/L",
+                    canonical_value=12.0,
+                    canonical_unit="10^9/L",
+                    measured_at=explicit_measurement_date,
+                    normalization_status="resolved",
+                ),
+            ]
+        )
+        await session.commit()
+
+    files_response = await client.get("/api/files")
+    assert files_response.status_code == 200
+    files = {
+        item["filename"]: item
+        for item in files_response.json()
+        if item["filename"] in {"upload-only.txt", "lab-date.txt", "explicit-date.txt"}
+    }
+    assert files["upload-only.txt"]["lab_date"] is None
+    assert files["lab-date.txt"]["lab_date"].startswith("2026-03-20T08:00:00")
+    assert files["explicit-date.txt"]["lab_date"] is None
+
+    list_response = await client.get("/api/measurements", params={"marker_name": "WBC"})
+    assert list_response.status_code == 200
+    listed = list_response.json()
+    assert [measurement["canonical_value"] for measurement in listed] == [4.0, 9.0, 12.0]
+    assert [measurement["measured_at"] for measurement in listed[:2]] == [None, None]
+    assert listed[2]["measured_at"].startswith("2026-03-21T07:45:00")
+    assert listed[0]["effective_measured_at"].startswith("2026-03-19T14:35:00")
+    assert listed[1]["effective_measured_at"].startswith("2026-03-20T08:00:00")
+    assert listed[2]["effective_measured_at"].startswith("2026-03-21T07:45:00")
+
+    overview_response = await client.get("/api/measurements/overview")
+    assert overview_response.status_code == 200
+    overview_markers = [marker for group in overview_response.json() for marker in group["markers"]]
+    wbc_overview = next(marker for marker in overview_markers if marker["marker_name"] == "WBC")
+    assert wbc_overview["latest_measurement"]["canonical_value"] == 12.0
+    assert wbc_overview["latest_measurement"]["measured_at"].startswith("2026-03-21T07:45:00")
+    assert wbc_overview["latest_measurement"]["effective_measured_at"].startswith("2026-03-21T07:45:00")
+    assert wbc_overview["previous_measurement"]["canonical_value"] == 9.0
+    assert wbc_overview["previous_measurement"]["measured_at"] is None
+    assert wbc_overview["previous_measurement"]["effective_measured_at"].startswith("2026-03-20T08:00:00")
+
+    detail_response = await client.get("/api/measurements/detail", params={"marker_name": "WBC"})
+    assert detail_response.status_code == 200
+    detail = detail_response.json()
+    assert [measurement["canonical_value"] for measurement in detail["measurements"]] == [4.0, 9.0, 12.0]
+    assert detail["latest_measurement"]["canonical_value"] == 12.0
+    assert detail["latest_measurement"]["measured_at"].startswith("2026-03-21T07:45:00")
+    assert detail["latest_measurement"]["effective_measured_at"].startswith("2026-03-21T07:45:00")
+    assert detail["previous_measurement"]["canonical_value"] == 9.0
+    assert detail["previous_measurement"]["measured_at"] is None
+    assert detail["previous_measurement"]["effective_measured_at"].startswith("2026-03-20T08:00:00")
 
 
 @pytest.mark.asyncio

@@ -61,6 +61,14 @@ class LabFileOut(BaseModel):
         return data
 
 
+def _resolve_effective_measured_at(
+    measured_at: datetime | None,
+    lab_date: datetime | None,
+    uploaded_at: datetime | None,
+) -> datetime | None:
+    return measured_at or lab_date or uploaded_at
+
+
 class MeasurementOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -68,6 +76,7 @@ class MeasurementOut(BaseModel):
     lab_file_id: int
     lab_file_filename: str | None = None
     lab_file_source_tag: str | None = None
+    effective_measured_at: datetime | None = None
     marker_name: str
     canonical_unit: str | None = None
     canonical_value: float | None = None
@@ -88,7 +97,22 @@ class MeasurementOut(BaseModel):
     @classmethod
     def _flatten_measurement_type(cls, data: Any):
         if isinstance(data, dict):
+            lab_file = data.get("lab_file")
+            nested_lab_date = (
+                lab_file.get("lab_date") if isinstance(lab_file, dict) else getattr(lab_file, "lab_date", None)
+            )
+            nested_uploaded_at = (
+                lab_file.get("uploaded_at") if isinstance(lab_file, dict) else getattr(lab_file, "uploaded_at", None)
+            )
             data.setdefault("unit_conversion_missing", False)
+            data.setdefault(
+                "effective_measured_at",
+                _resolve_effective_measured_at(
+                    data.get("measured_at"),
+                    data.get("lab_date") or data.get("lab_file_lab_date") or nested_lab_date,
+                    data.get("uploaded_at") or data.get("lab_file_uploaded_at") or nested_uploaded_at,
+                ),
+            )
             return data
         if hasattr(data, "lab_file"):
             measurement_type = getattr(data, "measurement_type", None)
@@ -103,6 +127,11 @@ class MeasurementOut(BaseModel):
                 "lab_file_id": data.lab_file_id,
                 "lab_file_filename": getattr(lab_file, "filename", None),
                 "lab_file_source_tag": source_tag,
+                "effective_measured_at": _resolve_effective_measured_at(
+                    data.measured_at,
+                    getattr(lab_file, "lab_date", None),
+                    getattr(lab_file, "uploaded_at", None),
+                ),
                 "marker_name": getattr(data, "marker_name", None) or getattr(measurement_type, "name", None),
                 "canonical_unit": data.canonical_unit or getattr(measurement_type, "canonical_unit", None),
                 "canonical_value": data.canonical_value,

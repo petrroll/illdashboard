@@ -262,10 +262,13 @@ export default function Files() {
     const filtered = query
       ? files.filter((file) => file.filename.toLowerCase().includes(query))
       : files;
+    const sortValue = (file: LabFile) => (
+      sortField === "lab_date" ? file.lab_date ?? file.uploaded_at : file.uploaded_at
+    );
 
     return [...filtered].sort((left, right) => {
-      const leftValue = left[sortField];
-      const rightValue = right[sortField];
+      const leftValue = sortValue(left);
+      const rightValue = sortValue(right);
       if (!leftValue && !rightValue) return 0;
       if (!leftValue) return 1;
       if (!rightValue) return -1;
@@ -274,7 +277,7 @@ export default function Files() {
   }, [files, sortField, searchQuery]);
 
   const getYear = (file: LabFile) => {
-    const value = file[sortField];
+    const value = sortField === "lab_date" ? file.lab_date ?? file.uploaded_at : file.uploaded_at;
     return value ? new Date(value).getFullYear() : null;
   };
 

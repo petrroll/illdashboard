@@ -40,6 +40,7 @@ export interface Measurement {
   lab_file_id: number;
   lab_file_filename?: string | null;
   lab_file_source_tag?: string | null;
+  effective_measured_at?: string | null;
   marker_name: string;
   canonical_unit?: string | null;
   canonical_value: number | null;

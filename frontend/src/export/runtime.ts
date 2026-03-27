@@ -134,8 +134,8 @@ export function getShareExportMeasurements() {
     .flat()
     .slice()
     .sort((left, right) => {
-      const leftTimestamp = left.measured_at ?? "";
-      const rightTimestamp = right.measured_at ?? "";
+      const leftTimestamp = left.effective_measured_at ?? left.measured_at ?? "";
+      const rightTimestamp = right.effective_measured_at ?? right.measured_at ?? "";
       if (leftTimestamp !== rightTimestamp) {
         return leftTimestamp.localeCompare(rightTimestamp);
       }
