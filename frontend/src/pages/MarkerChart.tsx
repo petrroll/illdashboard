@@ -33,9 +33,7 @@ import {
   buildNiceNumericAxis,
   formatDate,
   formatMeasurementValue,
-  formatQualitativeStatusLabel,
   getMeasurementStatusClassName,
-  getQualitativeStatusClassName,
   formatPreferredMeasurementScalarValue,
   formatPreferredMeasurementUnit,
   formatPreferredMeasurementValue,
@@ -481,42 +479,25 @@ export default function MarkerChart() {
       && detail.measurements.some((measurement) => measurement.qualitative_value != null),
   );
 
-  const rangeMeter = (item: MarkerOverviewItem) => {
+  const trendMeter = (item: MarkerOverviewItem) => {
     const sparklineSrc = shareExportMode
       ? getShareExportMarkerSparklineUrl(item.marker_name)
       : `/api/measurements/sparkline?marker_name=${encodeURIComponent(item.marker_name)}&v=6`;
+    const hasTrend = item.has_numeric_history || item.has_qualitative_trend;
 
-    if (!item.has_numeric_history) {
-      return (
-        <div className="range-meter">
-          <span className={`status-pill ${getQualitativeStatusClassName(item)}`}>
-            {formatQualitativeStatusLabel(item)}
-          </span>
-          {item.has_qualitative_trend && sparklineSrc && (
-            <img
-              className="sparkline-img"
-              src={sparklineSrc}
-              alt={`Sparkline for ${item.marker_name}`}
-              loading="lazy"
-              decoding="async"
-            />
-          )}
-        </div>
-      );
+    if (!sparklineSrc || !hasTrend) {
+      return null;
     }
 
     return (
       <div className="range-meter">
-        <span className={`status-pill status-${item.status}`}>{getMarkerStatusLabel(item.status)}</span>
-        {sparklineSrc && (
-          <img
-            className="sparkline-img"
-            src={sparklineSrc}
-            alt={`Sparkline for ${item.marker_name}`}
-            loading="lazy"
-            decoding="async"
-          />
-        )}
+        <img
+          className="sparkline-img"
+          src={sparklineSrc}
+          alt={`Sparkline for ${item.marker_name}`}
+          loading="lazy"
+          decoding="async"
+        />
       </div>
     );
   };
@@ -661,7 +642,7 @@ export default function MarkerChart() {
                   <div className="marker-row marker-row-legend" aria-hidden="true">
                     <div className="marker-row-name"><strong>Marker</strong></div>
                     <div className="marker-row-value"><strong>Last result</strong></div>
-                    <div className="marker-row-range"><strong>Range</strong></div>
+                    <div className="marker-row-range"><strong>Trend</strong></div>
                     <div className="marker-row-previous"><strong>Previous &amp; diff</strong></div>
                   </div>
                   {group.markers.map((item) => {
@@ -718,7 +699,7 @@ export default function MarkerChart() {
                           <span>{latestValueNote}</span>
                         </div>
 
-                        <div className="marker-row-range">{rangeMeter(item)}</div>
+                        <div className="marker-row-range">{trendMeter(item)}</div>
 
                         <div className={`marker-row-previous ${previousValueClassName}`}>
                           <strong>
