@@ -933,6 +933,24 @@ input[type="file"] {
   align-items: center;
   padding: 0.9rem 1rem;
   border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  user-select: none;
+}
+
+.marker-group-header:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.marker-group-collapsed .marker-group-header {
+  border-bottom: none;
+}
+
+.marker-group-toggle {
+  display: inline-block;
+  width: 1em;
+  font-size: 0.7em;
+  margin-right: 0.45em;
+  color: var(--text-muted);
 }
 
 .marker-group-header h3 {
