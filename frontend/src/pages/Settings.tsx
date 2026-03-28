@@ -112,6 +112,18 @@ function ExportSettings() {
         </p>
       </div>
 
+      <div className="card" style={{ marginBottom: "1.5rem" }}>
+        <h3 style={{ marginBottom: "0.75rem" }}>Document exports</h3>
+        <p style={{ color: "var(--text-muted)", marginBottom: "0.75rem", lineHeight: 1.5 }}>
+          Build Markdown and PDF reports from the data bundled into this share export. Use the export builder
+          for arbitrary biomarker sets, or open a file to export just that file's measurements.
+        </p>
+        <div className="flex-row gap-1">
+          <Link to="/exports" className="btn btn-primary">Open export builder</Link>
+          <Link to="/files" className="btn btn-outline">File exports</Link>
+        </div>
+      </div>
+
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: "1rem", marginBottom: "1.5rem" }}>
         <div className="card" style={{ textAlign: "center" }}>
           <div style={{ fontSize: "2rem", fontWeight: 700 }}>{bundle?.files.length ?? 0}</div>
@@ -235,6 +247,18 @@ function OnlineSettings() {
         >
           Download shareable HTML
         </a>
+      </div>
+
+      <div className="card" style={{ marginBottom: "1.5rem" }}>
+        <h3 style={{ marginBottom: "0.75rem" }}>Document exports</h3>
+        <p style={{ color: "var(--text-muted)", marginBottom: "0.75rem", lineHeight: 1.5 }}>
+          Build Markdown and PDF reports directly in the frontend app. Use the export builder for custom
+          biomarker sets, or open a file for file-specific exports with or without historical values.
+        </p>
+        <div className="flex-row gap-1">
+          <Link to="/exports" className="btn btn-primary">Open export builder</Link>
+          <Link to="/files" className="btn btn-outline">Go to files</Link>
+        </div>
       </div>
 
       <div className="card" style={{ marginBottom: "1.5rem" }}>

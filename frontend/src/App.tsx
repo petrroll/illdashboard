@@ -8,10 +8,12 @@ import FileDetail from "./pages/FileDetail";
 import MarkerChart from "./pages/MarkerChart";
 import Medications from "./pages/Medications";
 import Search from "./pages/Search";
+import Exports from "./pages/Exports";
 import "./App.css";
 
 const navigationItems = [
   { to: "/charts", label: "Biomarkers" },
+  { to: "/exports", label: "Exports" },
   { to: "/meds", label: "Meds", hideInShareExport: true },
   { to: "/search", label: "Search" },
   { to: "/files", label: "Lab Files" },
@@ -65,6 +67,7 @@ function App() {
             <Route path="/files" element={<Files />} />
             <Route path="/files/:id" element={<FileDetail />} />
             <Route path="/charts" element={<MarkerChart />} />
+            <Route path="/exports" element={<Exports />} />
             <Route path="/meds" element={<Medications />} />
             <Route path="/search" element={<Search />} />
             <Route path="/settings" element={<Settings />} />

@@ -1,4 +1,4 @@
-import type { Measurement } from "../types";
+import type { MarkerOverviewItem, Measurement } from "../types";
 
 const DIMENSIONLESS_UNIT = "1";
 const SIGNIFICANT_VALUE_FORMATTER = new Intl.NumberFormat(undefined, {
@@ -413,6 +413,56 @@ export function getMeasurementValueClass(measurement: {
   }
 
   return "value-normal";
+}
+
+export function getMeasurementStatusClassName(
+  measurement: Measurement | null,
+  fallbackReferenceLow: number | null,
+  fallbackReferenceHigh: number | null,
+) {
+  if (!measurement) {
+    return "value-neutral";
+  }
+
+  const conversionMissing = isUnitConversionMissing(measurement);
+  const statusValue = conversionMissing
+    ? getOriginalMeasurementValue(measurement)
+    : measurement.canonical_value;
+  const statusReferenceLow = conversionMissing
+    ? getOriginalMeasurementReferenceLow(measurement)
+    : measurement.canonical_reference_low ?? fallbackReferenceLow;
+  const statusReferenceHigh = conversionMissing
+    ? getOriginalMeasurementReferenceHigh(measurement)
+    : measurement.canonical_reference_high ?? fallbackReferenceHigh;
+
+  return getMeasurementValueClass({
+    value: statusValue,
+    reference_low: statusReferenceLow,
+    reference_high: statusReferenceHigh,
+    qualitative_bool: measurement.qualitative_bool,
+  });
+}
+
+export function formatQualitativeStatusLabel(item: MarkerOverviewItem) {
+  const latest = item.latest_measurement;
+  if (latest.qualitative_bool === true) {
+    return "Positive";
+  }
+  if (latest.qualitative_bool === false) {
+    return "Negative";
+  }
+  return latest.qualitative_value || getMarkerStatusLabel(item.status);
+}
+
+export function getQualitativeStatusClassName(item: MarkerOverviewItem) {
+  const latest = item.latest_measurement;
+  if (latest.qualitative_bool === true) {
+    return "status-positive";
+  }
+  if (latest.qualitative_bool === false) {
+    return "status-negative";
+  }
+  return `status-${item.status}`;
 }
 
 export function getMarkerStatusLabel(status: MarkerStatus) {

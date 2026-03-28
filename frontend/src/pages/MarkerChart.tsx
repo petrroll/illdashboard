@@ -33,9 +33,9 @@ import {
   buildNiceNumericAxis,
   formatDate,
   formatMeasurementValue,
-  getMeasurementValueClass,
-  getOriginalMeasurementReferenceHigh,
-  getOriginalMeasurementReferenceLow,
+  formatQualitativeStatusLabel,
+  getMeasurementStatusClassName,
+  getQualitativeStatusClassName,
   formatPreferredMeasurementScalarValue,
   formatPreferredMeasurementUnit,
   formatPreferredMeasurementValue,
@@ -139,28 +139,6 @@ function getStoredCollapsedGroups(): Set<string> {
   }
 }
 
-function formatQualitativeStatusLabel(item: MarkerOverviewItem) {
-  const latest = item.latest_measurement;
-  if (latest.qualitative_bool === true) {
-    return "Positive";
-  }
-  if (latest.qualitative_bool === false) {
-    return "Negative";
-  }
-  return latest.qualitative_value || getMarkerStatusLabel(item.status);
-}
-
-function getQualitativeStatusClassName(item: MarkerOverviewItem) {
-  const latest = item.latest_measurement;
-  if (latest.qualitative_bool === true) {
-    return "status-positive";
-  }
-  if (latest.qualitative_bool === false) {
-    return "status-negative";
-  }
-  return `status-${item.status}`;
-}
-
 function renderPreferredMeasurementValue(
   measurement: Pick<
     Measurement,
@@ -186,34 +164,6 @@ function renderPreferredMeasurementValue(
           <span className="measurement-value-unit"> {renderedUnit}</span>
         </>
       );
-}
-
-function getMeasurementStatusClassName(
-  measurement: Measurement | null,
-  fallbackReferenceLow: number | null,
-  fallbackReferenceHigh: number | null,
-) {
-  if (!measurement) {
-    return "value-neutral";
-  }
-
-  const conversionMissing = isUnitConversionMissing(measurement);
-  const statusValue = conversionMissing
-    ? getOriginalMeasurementValue(measurement)
-    : measurement.canonical_value;
-  const statusReferenceLow = conversionMissing
-    ? getOriginalMeasurementReferenceLow(measurement)
-    : measurement.canonical_reference_low ?? fallbackReferenceLow;
-  const statusReferenceHigh = conversionMissing
-    ? getOriginalMeasurementReferenceHigh(measurement)
-    : measurement.canonical_reference_high ?? fallbackReferenceHigh;
-
-  return getMeasurementValueClass({
-    value: statusValue,
-    reference_low: statusReferenceLow,
-    reference_high: statusReferenceHigh,
-    qualitative_bool: measurement.qualitative_bool,
-  });
 }
 
 export default function MarkerChart() {
@@ -806,9 +756,9 @@ export default function MarkerChart() {
           </div>
         ) : (
           <>
-            <div className="detail-header">
-              <div>
-                <p className="detail-group-label">{summarySource.group_name}</p>
+             <div className="detail-header">
+               <div>
+                 <p className="detail-group-label">{summarySource.group_name}</p>
                 <h2>{summarySource.marker_name}</h2>
                 <p className="detail-latest-meta">
                   Latest result on {formatDate(summarySource.latest_measurement.measured_at)}
@@ -842,13 +792,13 @@ export default function MarkerChart() {
                     ))}
                   </div>
                 )}
-              </div>
-              <span className={`status-pill status-${summarySource.status}`}>
-                {getMarkerStatusLabel(summarySource.status)}
-              </span>
-            </div>
+               </div>
+               <span className={`status-pill status-${summarySource.status}`}>
+                 {getMarkerStatusLabel(summarySource.status)}
+               </span>
+             </div>
 
-            <div className="detail-summary-grid">
+             <div className="detail-summary-grid">
               <div className={`detail-stat-card detail-stat-card-measurement ${latestDetailValueClassName}`}>
                 <span>Latest</span>
                 <strong>{formatPreferredMeasurementValue(summarySource.latest_measurement)}</strong>

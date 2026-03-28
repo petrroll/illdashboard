@@ -40,6 +40,7 @@ import {
   getShareExportPageImageUrl,
   isShareExportMode,
 } from "../export/runtime";
+import { downloadFileExport } from "../export/reports";
 
 const FILE_POLL_INTERVAL_MS = 3000;
 
@@ -134,6 +135,10 @@ export default function FileDetail() {
   const [textPreview, setTextPreview] = useState<string | null>(null);
   const [textPreviewError, setTextPreviewError] = useState<string | null>(null);
   const [textPreviewLoading, setTextPreviewLoading] = useState(false);
+  const [exporting, setExporting] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [exportFormat, setExportFormat] = useState<"markdown" | "pdf">("pdf");
+  const [exportHistory, setExportHistory] = useState(false);
   const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const highlightTimeoutRef = useRef<number | null>(null);
 
@@ -261,6 +266,23 @@ export default function FileDetail() {
       await load();
     } finally {
       setOcrRunning(false);
+    }
+  };
+
+  const handleFileExport = async (format: "markdown" | "pdf", includeHistory: boolean) => {
+    if (!fileId) {
+      return;
+    }
+
+    const exportKey = `${format}-${includeHistory ? "history" : "current"}`;
+    setExporting(exportKey);
+    setExportError(null);
+    try {
+      await downloadFileExport(fileId, format, includeHistory);
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : "Export failed.");
+    } finally {
+      setExporting(null);
     }
   };
 
@@ -443,6 +465,45 @@ export default function FileDetail() {
             )}
           </button>
         )}
+
+        {!shareExportMode && measurements.length > 0 && (
+          <>
+            <span className="action-row-separator" />
+            <button
+              className="btn btn-primary"
+              onClick={() => void handleFileExport(exportFormat, exportHistory)}
+              disabled={exporting !== null}
+            >
+              {exporting ? (
+                <>
+                  <span className="spinner" /> Exporting…
+                </>
+              ) : (
+                "Export"
+              )}
+            </button>
+            <select
+              value={exportFormat}
+              onChange={(e) => setExportFormat(e.target.value as "markdown" | "pdf")}
+              disabled={exporting !== null}
+            >
+              <option value="pdf">PDF</option>
+              <option value="markdown">Markdown</option>
+            </select>
+            <label className="checkbox-row" style={{ whiteSpace: "nowrap" }}>
+              <input
+                type="checkbox"
+                checked={exportHistory}
+                onChange={(e) => setExportHistory(e.target.checked)}
+                disabled={exporting !== null}
+              />
+              Include markers histories
+            </label>
+          </>
+        )}
+        {exportError && (
+          <span className="export-error-note">{exportError}</span>
+        )}
       </div>
 
       {shareExportMode && (
@@ -612,7 +673,14 @@ export default function FileDetail() {
                             </label>
                           </td>
                         )}
-                        <td style={{ fontWeight: 500 }}>{measurement.marker_name}</td>
+                        <td style={{ fontWeight: 500 }}>
+                          <Link
+                            to={`/charts?marker=${encodeURIComponent(measurement.marker_name)}`}
+                            className="marker-name-link"
+                          >
+                            {measurement.marker_name}
+                          </Link>
+                        </td>
                         <td
                           className={getMeasurementValueClass({
                             value: statusValue,
