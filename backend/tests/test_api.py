@@ -15,6 +15,7 @@ from sqlalchemy.orm import selectinload
 
 from illdashboard.config import settings
 from illdashboard.models import (
+    BiomarkerInsight,
     Job,
     LabFile,
     LabFileTag,
@@ -30,6 +31,7 @@ from illdashboard.services import admin as admin_service
 from illdashboard.services import jobs as job_service
 from illdashboard.services import pipeline, rescaling
 from illdashboard.services import search as search_service
+from illdashboard.services.insights import marker_signature
 from illdashboard.services.markers import normalize_marker_alias_key
 from illdashboard.services.upload_metadata import original_name_sidecar_path
 
@@ -172,9 +174,7 @@ async def test_share_export_html_embeds_assets_and_omits_summary_content(
 
     file_path = Path(settings.UPLOAD_DIR) / "share-report.png"
     file_path.write_bytes(
-        base64.b64decode(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+yF9kAAAAASUVORK5CYII="
-        )
+        base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+yF9kAAAAASUVORK5CYII=")
     )
 
     async with session_factory() as session:
@@ -573,9 +573,7 @@ async def test_pipeline_runtime_processes_text_file_end_to_end(session_factory):
 
 
 @pytest.mark.asyncio
-async def test_measurement_chronology_prefers_measurement_then_file_lab_date_then_upload_date(
-    client, session_factory
-):
+async def test_measurement_chronology_prefers_measurement_then_file_lab_date_then_upload_date(client, session_factory):
     upload_only_file_upload = datetime(2026, 3, 19, 14, 35, tzinfo=UTC)
     lab_date_file_upload = datetime(2026, 3, 22, 9, 10, tzinfo=UTC)
     lab_date_file_lab_date = datetime(2026, 3, 20, 8, 0, tzinfo=UTC)
@@ -699,6 +697,568 @@ async def test_measurement_chronology_prefers_measurement_then_file_lab_date_the
     assert detail["previous_measurement"]["canonical_value"] == 9.0
     assert detail["previous_measurement"]["measured_at"] is None
     assert detail["previous_measurement"]["effective_measured_at"].startswith("2026-03-20T08:00:00")
+
+
+@pytest.mark.asyncio
+async def test_patch_file_updates_filename_and_lab_date_override(client, session_factory):
+    pipeline_lab_date = datetime(2026, 3, 20, 8, 0, tzinfo=UTC)
+    override_lab_date = datetime(2026, 3, 21, 9, 15, tzinfo=UTC)
+
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="original-name.pdf",
+            filepath="/tmp/original-name.pdf",
+            mime_type="application/pdf",
+            page_count=1,
+            lab_date=pipeline_lab_date,
+        )
+        measurement_type = MeasurementType(
+            name="CRP",
+            normalized_key="crp",
+            canonical_unit="mg/L",
+            group_name="Inflammation & Infection",
+        )
+        session.add_all([lab_file, measurement_type])
+        await session.flush()
+        session.add(
+            Measurement(
+                lab_file_id=lab_file.id,
+                measurement_type_id=measurement_type.id,
+                raw_marker_name="CRP",
+                normalized_marker_key="crp",
+                original_value=10.0,
+                original_unit="mg/L",
+                canonical_value=10.0,
+                canonical_unit="mg/L",
+                measured_at=None,
+                normalization_status="resolved",
+            )
+        )
+        await session.commit()
+        file_id = lab_file.id
+
+    response = await client.patch(
+        f"/api/files/{file_id}",
+        json={
+            "filename": "edited-name.pdf",
+            "lab_date": override_lab_date.isoformat(),
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["filename"] == "edited-name.pdf"
+    assert body["lab_date"].startswith("2026-03-21T09:15:00")
+    assert body["has_user_edits"] is True
+    assert body["user_edited_fields"] == ["lab_date"]
+
+    list_response = await client.get("/api/measurements", params={"marker_name": "CRP"})
+    assert list_response.status_code == 200
+    measurements = list_response.json()
+    assert measurements[0]["lab_file_filename"] == "edited-name.pdf"
+    assert measurements[0]["effective_measured_at"].startswith("2026-03-21T09:15:00")
+
+    reset_response = await client.patch(
+        f"/api/files/{file_id}",
+        json={"reset_fields": ["lab_date"]},
+    )
+    assert reset_response.status_code == 200
+    reset_body = reset_response.json()
+    assert reset_body["lab_date"].startswith("2026-03-20T08:00:00")
+    assert reset_body["has_user_edits"] is False
+    assert reset_body["user_edited_fields"] == []
+
+
+@pytest.mark.asyncio
+async def test_patch_measurement_applies_and_resets_manual_overrides(client, session_factory):
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="measurement-edit.pdf",
+            filepath="/tmp/measurement-edit.pdf",
+            mime_type="application/pdf",
+            page_count=1,
+        )
+        measurement_type = MeasurementType(
+            name="Ferritin",
+            normalized_key="ferritin",
+            canonical_unit="ug/L",
+            group_name="Iron Status",
+        )
+        session.add_all([lab_file, measurement_type])
+        await session.flush()
+        measurement = Measurement(
+            lab_file_id=lab_file.id,
+            measurement_type_id=measurement_type.id,
+            raw_marker_name="Ferritin",
+            normalized_marker_key="ferritin",
+            original_value=12.0,
+            original_unit="ug/L",
+            canonical_value=12.0,
+            canonical_unit="ug/L",
+            canonical_reference_low=20.0,
+            canonical_reference_high=200.0,
+            normalization_status="resolved",
+        )
+        session.add(measurement)
+        await session.commit()
+        measurement_id = measurement.id
+
+    response = await client.patch(
+        f"/api/measurements/{measurement_id}",
+        json={
+            "canonical_value": 15.5,
+            "canonical_unit": "mg/L",
+            "canonical_reference_low": 2.0,
+            "canonical_reference_high": 7.0,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["canonical_value"] == 15.5
+    assert body["canonical_unit"] == "mg/L"
+    assert body["canonical_reference_low"] == 2.0
+    assert body["canonical_reference_high"] == 7.0
+    assert body["has_user_edits"] is True
+    assert sorted(body["user_edited_fields"]) == [
+        "canonical_reference_high",
+        "canonical_reference_low",
+        "canonical_unit",
+        "canonical_value",
+    ]
+
+    detail_response = await client.get("/api/measurements/detail", params={"marker_name": "Ferritin"})
+    assert detail_response.status_code == 200
+    detail = detail_response.json()
+    assert detail["latest_measurement"]["canonical_value"] == 15.5
+    assert detail["reference_low"] == 2.0
+    assert detail["reference_high"] == 7.0
+
+    reset_response = await client.patch(
+        f"/api/measurements/{measurement_id}",
+        json={
+            "reset_fields": [
+                "canonical_value",
+                "canonical_unit",
+                "canonical_reference_low",
+                "canonical_reference_high",
+            ]
+        },
+    )
+    assert reset_response.status_code == 200
+    reset_body = reset_response.json()
+    assert reset_body["canonical_value"] == 12.0
+    assert reset_body["canonical_unit"] == "ug/L"
+    assert reset_body["canonical_reference_low"] == 20.0
+    assert reset_body["canonical_reference_high"] == 200.0
+    assert reset_body["has_user_edits"] is False
+    assert reset_body["user_edited_fields"] == []
+
+
+@pytest.mark.asyncio
+async def test_patch_measurement_updates_and_resets_measurement_date_override(client, session_factory):
+    pipeline_measured_at = datetime(2026, 3, 18, 8, 30, tzinfo=UTC)
+    override_measured_at = datetime(2026, 3, 22, 12, 0, tzinfo=UTC)
+
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="measurement-date-edit.pdf",
+            filepath="/tmp/measurement-date-edit.pdf",
+            mime_type="application/pdf",
+            page_count=1,
+            lab_date=datetime(2026, 3, 20, 9, 0, tzinfo=UTC),
+        )
+        measurement_type = MeasurementType(
+            name="Ferritin",
+            normalized_key="ferritin",
+            canonical_unit="ug/L",
+            group_name="Iron Status",
+        )
+        session.add_all([lab_file, measurement_type])
+        await session.flush()
+        measurement = Measurement(
+            lab_file_id=lab_file.id,
+            measurement_type_id=measurement_type.id,
+            raw_marker_name="Ferritin",
+            normalized_marker_key="ferritin",
+            original_value=12.0,
+            original_unit="ug/L",
+            canonical_value=12.0,
+            canonical_unit="ug/L",
+            normalization_status="resolved",
+            measured_at=pipeline_measured_at,
+        )
+        session.add(measurement)
+        await session.commit()
+        file_id = lab_file.id
+        measurement_id = measurement.id
+
+    response = await client.patch(
+        f"/api/measurements/{measurement_id}",
+        json={"measured_at": override_measured_at.isoformat()},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["measured_at"].startswith("2026-03-18T08:30:00")
+    assert body["effective_measured_at"].startswith("2026-03-22T12:00:00")
+    assert body["has_user_edits"] is True
+    assert "measured_at" in body["user_edited_fields"]
+
+    detail_response = await client.get("/api/measurements/detail", params={"marker_name": "Ferritin"})
+    assert detail_response.status_code == 200
+    detail = detail_response.json()
+    assert detail["latest_measurement"]["effective_measured_at"].startswith("2026-03-22T12:00:00")
+
+    file_response = await client.get(f"/api/files/{file_id}")
+    assert file_response.status_code == 200
+    assert file_response.json()["has_measurement_edits"] is True
+
+    reset_response = await client.patch(
+        f"/api/measurements/{measurement_id}",
+        json={"reset_fields": ["measured_at"]},
+    )
+    assert reset_response.status_code == 200
+    reset_body = reset_response.json()
+    assert reset_body["effective_measured_at"].startswith("2026-03-18T08:30:00")
+    assert "measured_at" not in reset_body["user_edited_fields"]
+
+    reset_file_response = await client.get(f"/api/files/{file_id}")
+    assert reset_file_response.status_code == 200
+    assert reset_file_response.json()["has_measurement_edits"] is False
+
+
+@pytest.mark.asyncio
+async def test_patch_measurement_parses_qualitative_expression(client, session_factory):
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="qualitative-edit.pdf",
+            filepath="/tmp/qualitative-edit.pdf",
+            mime_type="application/pdf",
+            page_count=1,
+        )
+        measurement_type = MeasurementType(
+            name="Hepatitis B Surface Antigen",
+            normalized_key="hepatitis-b-surface-antigen",
+            canonical_unit=None,
+            group_name="Immunity & Serology",
+        )
+        session.add_all([lab_file, measurement_type])
+        await session.flush()
+        measurement = Measurement(
+            lab_file_id=lab_file.id,
+            measurement_type_id=measurement_type.id,
+            raw_marker_name="HBsAg",
+            normalized_marker_key="hbsag",
+            original_qualitative_value="Positive",
+            qualitative_value="Positive",
+            qualitative_bool=True,
+            normalization_status="resolved",
+        )
+        session.add(measurement)
+        await session.commit()
+        measurement_id = measurement.id
+
+    response = await client.patch(
+        f"/api/measurements/{measurement_id}",
+        json={"qualitative_expression": 'false("Not detected")'},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["qualitative_value"] == "Not detected"
+    assert body["qualitative_bool"] is False
+    assert body["has_user_edits"] is True
+
+    reset_response = await client.patch(
+        f"/api/measurements/{measurement_id}",
+        json={"reset_fields": ["qualitative"]},
+    )
+    assert reset_response.status_code == 200
+    reset_body = reset_response.json()
+    assert reset_body["qualitative_value"] == "Positive"
+    assert reset_body["qualitative_bool"] is True
+    assert reset_body["has_user_edits"] is False
+
+
+@pytest.mark.asyncio
+async def test_patch_marker_renames_type_and_preserves_old_alias(client, session_factory):
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="marker-rename.pdf",
+            filepath="/tmp/marker-rename.pdf",
+            mime_type="application/pdf",
+            page_count=1,
+        )
+        measurement_type = MeasurementType(
+            name="CRP",
+            normalized_key="crp",
+            canonical_unit="mg/L",
+            group_name="Inflammation & Infection",
+        )
+        session.add_all([lab_file, measurement_type])
+        await session.flush()
+        session.add(
+            Measurement(
+                lab_file_id=lab_file.id,
+                measurement_type_id=measurement_type.id,
+                raw_marker_name="CRP",
+                normalized_marker_key="crp",
+                original_value=18.0,
+                original_unit="mg/L",
+                canonical_value=18.0,
+                canonical_unit="mg/L",
+                normalization_status="resolved",
+            )
+        )
+        await session.commit()
+
+    response = await client.patch("/api/markers/CRP", json={"name": "C-Reactive Protein"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["marker_name"] == "C-Reactive Protein"
+    assert "CRP" in body["aliases"]
+
+    renamed_detail = await client.get("/api/measurements/detail", params={"marker_name": "C-Reactive Protein"})
+    assert renamed_detail.status_code == 200
+    assert renamed_detail.json()["marker_name"] == "C-Reactive Protein"
+
+    alias_detail = await client.get("/api/measurements/detail", params={"marker_name": "CRP"})
+    assert alias_detail.status_code == 200
+    alias_body = alias_detail.json()
+    assert alias_body["marker_name"] == "C-Reactive Protein"
+    assert "CRP" in alias_body["aliases"]
+
+    markers_response = await client.get("/api/measurements/markers")
+    assert markers_response.status_code == 200
+    assert markers_response.json() == ["C-Reactive Protein"]
+
+
+@pytest.mark.asyncio
+async def test_patch_marker_updates_canonical_unit_and_recanonicalizes_measurements(client, session_factory):
+    older_measured_at = datetime(2026, 3, 20, 8, 0, tzinfo=UTC)
+    latest_measured_at = datetime(2026, 4, 20, 8, 0, tzinfo=UTC)
+
+    async with session_factory() as session:
+        first_file = LabFile(
+            filename="marker-unit-first.pdf",
+            filepath="backend/data/marker-unit-first.pdf",
+            mime_type="application/pdf",
+            page_count=1,
+        )
+        second_file = LabFile(
+            filename="marker-unit-second.pdf",
+            filepath="backend/data/marker-unit-second.pdf",
+            mime_type="application/pdf",
+            page_count=1,
+        )
+        measurement_type = MeasurementType(
+            name="Ferritin",
+            normalized_key="ferritin",
+            canonical_unit="ug/L",
+            group_name="Iron Status",
+        )
+        session.add_all([first_file, second_file, measurement_type])
+        await session.flush()
+        await rescaling.upsert_rescaling_rule(
+            session,
+            original_unit="ug/L",
+            canonical_unit="mg/L",
+            scale_factor=0.001,
+            measurement_type=measurement_type,
+        )
+        older_measurement = Measurement(
+            lab_file_id=first_file.id,
+            measurement_type_id=measurement_type.id,
+            raw_marker_name="Ferritin",
+            normalized_marker_key="ferritin",
+            original_value=80.0,
+            original_unit="ug/L",
+            canonical_value=80.0,
+            canonical_unit="ug/L",
+            canonical_reference_low=30.0,
+            canonical_reference_high=400.0,
+            user_canonical_value_override=True,
+            user_canonical_value=999.0,
+            user_canonical_unit_override=True,
+            user_canonical_unit="custom-unit",
+            normalization_status="resolved",
+            measured_at=older_measured_at,
+        )
+        latest_measurement = Measurement(
+            lab_file_id=second_file.id,
+            measurement_type_id=measurement_type.id,
+            raw_marker_name="Ferritin",
+            normalized_marker_key="ferritin",
+            original_value=120.0,
+            original_unit="ug/L",
+            canonical_value=120.0,
+            canonical_unit="ug/L",
+            canonical_reference_low=30.0,
+            canonical_reference_high=400.0,
+            normalization_status="resolved",
+            measured_at=latest_measured_at,
+        )
+        session.add_all([older_measurement, latest_measurement])
+        await session.commit()
+        older_measurement_id = older_measurement.id
+        latest_measurement_id = latest_measurement.id
+
+    response = await client.patch("/api/markers/Ferritin", json={"canonical_unit": "mg/L"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["canonical_unit"] == "mg/L"
+    assert body["latest_measurement"]["id"] == latest_measurement_id
+    assert body["latest_measurement"]["canonical_unit"] == "mg/L"
+    assert body["latest_measurement"]["canonical_value"] == pytest.approx(0.12)
+    assert body["reference_low"] == pytest.approx(0.03)
+    assert body["reference_high"] == pytest.approx(0.4)
+    previous_measurement = next(
+        measurement for measurement in body["measurements"] if measurement["id"] == older_measurement_id
+    )
+    assert previous_measurement["canonical_unit"] == "custom-unit"
+    assert previous_measurement["canonical_value"] == 999.0
+
+    list_response = await client.get("/api/measurements", params={"marker_name": "Ferritin"})
+    assert list_response.status_code == 200
+    measurements = {measurement["id"]: measurement for measurement in list_response.json()}
+    assert measurements[latest_measurement_id]["canonical_unit"] == "mg/L"
+    assert measurements[latest_measurement_id]["canonical_value"] == pytest.approx(0.12)
+    assert measurements[latest_measurement_id]["canonical_reference_low"] == pytest.approx(0.03)
+    assert measurements[latest_measurement_id]["canonical_reference_high"] == pytest.approx(0.4)
+    assert measurements[older_measurement_id]["canonical_unit"] == "custom-unit"
+
+    reset_response = await client.patch(
+        f"/api/measurements/{older_measurement_id}",
+        json={"reset_fields": ["canonical_value", "canonical_unit"]},
+    )
+    assert reset_response.status_code == 200
+    reset_body = reset_response.json()
+    assert reset_body["canonical_unit"] == "mg/L"
+    assert reset_body["canonical_value"] == pytest.approx(0.08)
+    assert reset_body["has_user_edits"] is False
+
+    async with session_factory() as session:
+        refreshed_type = await session.get(MeasurementType, measurement_type.id)
+        assert refreshed_type is not None
+        assert refreshed_type.canonical_unit == "mg/L"
+
+
+@pytest.mark.asyncio
+async def test_patch_marker_invalidates_cached_insight_and_defers_regeneration(client, session_factory):
+    measured_at = datetime(2026, 4, 20, 8, 0, tzinfo=UTC)
+
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="marker-insight.pdf",
+            filepath="backend/data/marker-insight.pdf",
+            mime_type="application/pdf",
+            page_count=1,
+        )
+        measurement_type = MeasurementType(
+            name="Ferritin",
+            normalized_key="ferritin",
+            canonical_unit="ug/L",
+            group_name="Iron Status",
+        )
+        session.add_all([lab_file, measurement_type])
+        await session.flush()
+        await rescaling.upsert_rescaling_rule(
+            session,
+            original_unit="ug/L",
+            canonical_unit="mg/L",
+            scale_factor=0.001,
+            measurement_type=measurement_type,
+        )
+        measurement = Measurement(
+            lab_file_id=lab_file.id,
+            measurement_type_id=measurement_type.id,
+            raw_marker_name="Ferritin",
+            normalized_marker_key="ferritin",
+            original_value=120.0,
+            original_unit="ug/L",
+            canonical_value=120.0,
+            canonical_unit="ug/L",
+            canonical_reference_low=30.0,
+            canonical_reference_high=400.0,
+            normalization_status="resolved",
+            measured_at=measured_at,
+        )
+        session.add(measurement)
+        await session.flush()
+        session.add(
+            BiomarkerInsight(
+                measurement_type_id=measurement_type.id,
+                measurement_signature=marker_signature([measurement]),
+                summary_markdown="stale cached insight",
+            )
+        )
+        await session.commit()
+
+    response = await client.patch("/api/markers/Ferritin", json={"canonical_unit": "mg/L"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["canonical_unit"] == "mg/L"
+    assert body["explanation"] is None
+    assert body["explanation_cached"] is False
+
+    async with session_factory() as session:
+        result = await session.execute(select(BiomarkerInsight))
+        assert result.scalar_one_or_none() is None
+
+    with patch("illdashboard.services.insights.explain_marker_history", AsyncMock(return_value="fresh insight")):
+        insight_response = await client.get("/api/measurements/insight", params={"marker_name": "Ferritin"})
+
+    assert insight_response.status_code == 200
+    insight_body = insight_response.json()
+    assert insight_body["explanation"] == "fresh insight"
+    assert insight_body["explanation_cached"] is False
+
+    detail_response = await client.get("/api/measurements/detail", params={"marker_name": "Ferritin"})
+    assert detail_response.status_code == 200
+    detail_body = detail_response.json()
+    assert detail_body["explanation"] == "fresh insight"
+    assert detail_body["explanation_cached"] is True
+
+
+@pytest.mark.asyncio
+async def test_patch_measurement_original_unit_override_updates_conversion_warning(client, session_factory):
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="glucose-override.pdf",
+            filepath="/tmp/glucose-override.pdf",
+            mime_type="application/pdf",
+            page_count=1,
+        )
+        measurement_type = MeasurementType(
+            name="Glucose",
+            normalized_key="glucose",
+            canonical_unit="mmol/L",
+            group_name="Metabolic",
+        )
+        session.add_all([lab_file, measurement_type])
+        await session.flush()
+        measurement = Measurement(
+            lab_file_id=lab_file.id,
+            measurement_type_id=measurement_type.id,
+            raw_marker_name="Glucose",
+            normalized_marker_key="glucose",
+            original_value=90.0,
+            original_unit="mg/dL",
+            canonical_value=None,
+            canonical_unit="mmol/L",
+            normalization_status="resolved",
+        )
+        session.add(measurement)
+        await session.commit()
+        measurement_id = measurement.id
+
+    list_response = await client.get("/api/measurements", params={"marker_name": "Glucose"})
+    assert list_response.status_code == 200
+    assert list_response.json()[0]["unit_conversion_missing"] is True
+
+    patch_response = await client.patch(
+        f"/api/measurements/{measurement_id}",
+        json={"original_unit": "mmol/L"},
+    )
+    assert patch_response.status_code == 200
+    assert patch_response.json()["unit_conversion_missing"] is False
 
 
 @pytest.mark.asyncio
@@ -859,9 +1419,7 @@ async def test_ensure_measurement_extraction_respects_split_child_jobs(session_f
         extract_jobs = list(
             (
                 await session.execute(
-                    select(Job)
-                    .where(Job.task_type == pipeline.TASK_EXTRACT_MEASUREMENTS)
-                    .order_by(Job.task_key.asc())
+                    select(Job).where(Job.task_type == pipeline.TASK_EXTRACT_MEASUREMENTS).order_by(Job.task_key.asc())
                 )
             ).scalars()
         )

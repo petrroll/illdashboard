@@ -6,10 +6,12 @@ import {
   deleteFile,
   fetchFiles,
   fetchFileTags,
+  patchFile,
   processUnprocessedFiles,
   setFileTags,
   uploadFile,
 } from "../api";
+import InlineEditableValue from "../components/InlineEditableValue";
 import TagInput from "../components/TagInput";
 import TagFilter from "../components/TagFilter";
 import { isShareExportMode } from "../export/runtime";
@@ -89,6 +91,14 @@ function renderStatusBadge(file: LabFile) {
       <span className="spinner" style={{ width: 12, height: 12 }} /> {getProcessingLabel(file)}…
     </span>
   );
+}
+
+function toDateInputValue(value: string | null | undefined) {
+  return value ? value.slice(0, 10) : "";
+}
+
+function toUtcNoonIso(dateValue: string) {
+  return `${dateValue}T12:00:00Z`;
 }
 
 export default function Files() {
@@ -237,10 +247,38 @@ export default function Files() {
       return;
     }
 
+    const selectedFiles = files.filter((file) => selected.has(file.id));
+    if (
+      selectedFiles.some((file) => file.has_measurement_edits)
+      && !confirm("Reprocessing will discard manual measurement edits for the selected files. Continue?")
+    ) {
+      return;
+    }
+
     const fileIds = Array.from(selected);
     await runPrimaryAction("reprocess", async () => {
       await batchProcessFiles(fileIds);
     });
+  };
+
+  const applyUpdatedFile = (updatedFile: LabFile) => {
+    setFiles((previousFiles) =>
+      previousFiles.map((currentFile) =>
+        currentFile.id === updatedFile.id ? updatedFile : currentFile,
+      ),
+    );
+  };
+
+  const saveFileLabDate = async (file: LabFile, nextLabDate: string) => {
+    applyUpdatedFile(
+      await patchFile(file.id, {
+        lab_date: nextLabDate ? toUtcNoonIso(nextLabDate) : null,
+      }),
+    );
+  };
+
+  const resetFileLabDate = async (file: LabFile) => {
+    applyUpdatedFile(await patchFile(file.id, { reset_fields: ["lab_date"] }));
   };
 
   const handleCancelProcessing = () => {
@@ -424,21 +462,36 @@ export default function Files() {
                         </td>
                       )}
                       <td>
-                        <Link to={`/files/${file.id}`} style={{ fontWeight: 600 }}>
-                          {file.filename}
-                        </Link>
-                        {" "}
-                        <span style={{ color: "var(--text-muted)", fontSize: "0.8rem" }}>
-                          ({file.page_count} {file.page_count === 1 ? "page" : "pages"})
+                        <span className="file-list-name-cell">
+                          <Link to={`/files/${file.id}`} className="marker-name-link" style={{ fontWeight: 600 }}>
+                            {file.filename}
+                          </Link>
+                          <span style={{ color: "var(--text-muted)", fontSize: "0.8rem" }}>
+                            ({file.page_count} {file.page_count === 1 ? "page" : "pages"})
+                          </span>
                         </span>
                       </td>
-                      <td>{formatDate(file.lab_date)}</td>
+                      <td>
+                        <InlineEditableValue
+                          display={<span>{formatDate(file.lab_date)}</span>}
+                          editValue={toDateInputValue(file.lab_date)}
+                          onSave={(nextValue) => saveFileLabDate(file, nextValue)}
+                          onReset={() => resetFileLabDate(file)}
+                          edited={file.user_edited_fields?.includes("lab_date")}
+                          readOnly={!canManageFiles}
+                          inputType="date"
+                          ariaLabel={`Edit lab date for ${file.filename}`}
+                          title="Double-click to override the file lab date"
+                          hint="Used as the fallback date when a measurement does not include its own timestamp."
+                        />
+                      </td>
                       <td>{formatDate(file.uploaded_at)}</td>
                       <td>
                         <div>{renderStatusBadge(file)}</div>
                         <div style={{ color: "var(--text-muted)", fontSize: "0.78rem", marginTop: "0.25rem" }}>
                           {getProgressSummary(file)}
                         </div>
+
                       </td>
                       <td style={{ minWidth: 160 }}>
                         {canManageFiles && editingTagsFileId === file.id ? (

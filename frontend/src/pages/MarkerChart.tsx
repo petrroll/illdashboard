@@ -1,4 +1,4 @@
-import { startTransition, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import {
   LineChart,
@@ -18,8 +18,12 @@ import {
   fetchMarkerInsight,
   fetchMarkerOverview,
   fetchMarkerTags,
+  patchMeasurement,
+  patchMarkerCanonicalUnit,
+  renameMarker,
   setMarkerTags,
 } from "../api";
+import InlineEditableValue from "../components/InlineEditableValue";
 import StackedMeasurementValue from "../components/StackedMeasurementValue";
 import TagInput from "../components/TagInput";
 import TagFilter from "../components/TagFilter";
@@ -30,10 +34,14 @@ import type {
   Measurement,
 } from "../types";
 import {
+  areUnitsEquivalent,
   buildNiceNumericAxis,
+  formatEditableMeasurementReferenceRange,
+  formatEditableMeasurementUnits,
+  formatEditableMeasurementValue,
   formatDate,
+  formatMeasurementScalarValue,
   formatMeasurementValue,
-  getMeasurementStatusClassName,
   formatPreferredMeasurementScalarValue,
   formatPreferredMeasurementUnit,
   formatPreferredMeasurementValue,
@@ -42,12 +50,19 @@ import {
   formatSignificantValue,
   getCanonicalTrendValue,
   getDisplayUnit,
+  getEffectiveMeasuredAt,
+  getMeasurementStatusClassName,
   getMarkerStatusLabel,
+  getOriginalMeasurementReferenceHigh,
+  getOriginalMeasurementReferenceLow,
   getOriginalMeasurementUnit,
   getOriginalMeasurementValue,
   getUnitConversionWarning,
+  hasEditedMeasurementField,
   hasRescaledMeasurementValue,
   isUnitConversionMissing,
+  looksLikeQualitativeExpression,
+  parseEditableReferenceRange,
 } from "../utils/measurements";
 import {
   getShareExportMarkerSparklineUrl,
@@ -95,7 +110,7 @@ function parseMeasuredAtTimestamp(measuredAt: string | null) {
 
 
 function effectiveMeasuredAt(measurement: Measurement): string | null {
-  return measurement.effective_measured_at ?? measurement.measured_at ?? null;
+  return getEffectiveMeasuredAt(measurement);
 }
 
 
@@ -105,6 +120,14 @@ function formatTimestampLabel(timestamp: number | null) {
   }
 
   return new Date(timestamp).toLocaleDateString(undefined);
+}
+
+function toDateInputValue(value: string | null | undefined) {
+  return value ? value.slice(0, 10) : "";
+}
+
+function toUtcNoonIso(dateValue: string) {
+  return `${dateValue}T12:00:00Z`;
 }
 
 function getMonthStartTimestamp(timestamp: number) {
@@ -218,6 +241,13 @@ export default function MarkerChart() {
   const [filterTags, setFilterTags] = useState<string[]>([]);
   const [timeWeightedAxis, setTimeWeightedAxis] = useState(getStoredTimeWeightedAxis);
   const [collapsedGroups, setCollapsedGroups] = useState(getStoredCollapsedGroups);
+  const latestInsightRequestRef = useRef(0);
+
+  const syncMarkerQuery = (markerName: string) => {
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.set("marker", markerName);
+    setSearchParams(nextParams, { replace: true, preventScrollReset: true });
+  };
 
   const clampListPaneWidth = (nextWidth: number) => {
     const browserWidth = markerBrowserRef.current?.clientWidth ?? window.innerWidth;
@@ -227,6 +257,39 @@ export default function MarkerChart() {
     );
     return Math.min(Math.max(nextWidth, MIN_LIST_PANE_WIDTH), maxAllowedWidth);
   };
+
+  const cancelPendingInsightRefresh = useCallback(() => {
+    latestInsightRequestRef.current += 1;
+    setLoadingInsight(false);
+  }, []);
+
+  const refreshMarkerInsight = useCallback(async (markerName: string) => {
+    if (shareExportMode) {
+      cancelPendingInsightRefresh();
+      return;
+    }
+
+    const requestId = latestInsightRequestRef.current + 1;
+    latestInsightRequestRef.current = requestId;
+    setLoadingInsight(true);
+
+    try {
+      const response = await fetchMarkerInsight(markerName);
+      if (latestInsightRequestRef.current !== requestId) {
+        return;
+      }
+      setInsight(response.explanation);
+      setInsightCached(response.explanation_cached);
+    } catch {
+      if (latestInsightRequestRef.current !== requestId) {
+        return;
+      }
+    } finally {
+      if (latestInsightRequestRef.current === requestId) {
+        setLoadingInsight(false);
+      }
+    }
+  }, [cancelPendingInsightRefresh, shareExportMode]);
 
   useEffect(() => {
     let cancelled = false;
@@ -291,7 +354,10 @@ export default function MarkerChart() {
   }, [collapsedGroups]);
 
   useEffect(() => {
-    if (!selectedMarker) return;
+    if (!selectedMarker) {
+      cancelPendingInsightRefresh();
+      return;
+    }
     let cancelled = false;
 
     setInsight(null);
@@ -303,6 +369,10 @@ export default function MarkerChart() {
         const response = await fetchMarkerDetail(selectedMarker);
         if (!cancelled) {
           setDetail(response);
+          if (response.marker_name !== selectedMarker) {
+            setSelectedMarker(response.marker_name);
+            syncMarkerQuery(response.marker_name);
+          }
           if (shareExportMode) {
             setInsight(null);
             setInsightCached(false);
@@ -318,32 +388,14 @@ export default function MarkerChart() {
       }
     };
 
-    const loadInsight = async () => {
-      setLoadingInsight(true);
-      try {
-        const response = await fetchMarkerInsight(selectedMarker);
-        if (!cancelled) {
-          setInsight(response.explanation);
-          setInsightCached(response.explanation_cached);
-        }
-      } finally {
-        if (!cancelled) {
-          setLoadingInsight(false);
-        }
-      }
-    };
-
     void loadDetail();
-    if (shareExportMode) {
-      setLoadingInsight(false);
-    } else {
-      void loadInsight();
-    }
+    void refreshMarkerInsight(selectedMarker);
 
     return () => {
       cancelled = true;
+      cancelPendingInsightRefresh();
     };
-  }, [selectedMarker, shareExportMode]);
+  }, [cancelPendingInsightRefresh, refreshMarkerInsight, selectedMarker, shareExportMode]);
 
   const filteredOverview = useMemo(
     () =>
@@ -499,7 +551,7 @@ export default function MarkerChart() {
       )
     : "value-neutral";
 
-  const unit = getDisplayUnit(latestChartMeasurement?.canonical_unit) ?? "";
+  const unit = getDisplayUnit(summarySource?.canonical_unit ?? latestChartMeasurement?.canonical_unit) ?? "";
   const yAxisScale = useMemo(() => {
     const yAxisValues = chartMeasurements.flatMap((measurement) => {
       const values = [
@@ -544,13 +596,165 @@ export default function MarkerChart() {
   const selectMarker = (markerName: string) => {
     startTransition(() => {
       setSelectedMarker(markerName);
-      const nextParams = new URLSearchParams(searchParams);
-      if (nextParams.get("marker") === markerName) {
+      if (searchParams.get("marker") === markerName) {
         return;
       }
-      nextParams.set("marker", markerName);
-      setSearchParams(nextParams, { replace: true, preventScrollReset: true });
+      syncMarkerQuery(markerName);
     });
+  };
+
+  const applyUpdatedMarkerDetail = async (updatedDetail: MarkerDetailResponse) => {
+    cancelPendingInsightRefresh();
+    const refreshedOverview = await fetchMarkerOverview(filterTags);
+    setOverview(refreshedOverview);
+    setDetail(updatedDetail);
+    setSelectedMarker(updatedDetail.marker_name);
+    syncMarkerQuery(updatedDetail.marker_name);
+    if (shareExportMode) {
+      setInsight(null);
+      setInsightCached(false);
+    } else {
+      setInsight(updatedDetail.explanation);
+      setInsightCached(updatedDetail.explanation_cached);
+    }
+  };
+
+  const handleMarkerRename = async (nextMarkerName: string) => {
+    if (!detail) {
+      return;
+    }
+
+    const trimmedMarkerName = nextMarkerName.trim();
+    if (!trimmedMarkerName) {
+      throw new Error("Marker name is required.");
+    }
+
+    const renamedDetail = await renameMarker(detail.marker_name, { name: trimmedMarkerName });
+    await applyUpdatedMarkerDetail(renamedDetail);
+    if (!shareExportMode && !renamedDetail.explanation_cached) {
+      void refreshMarkerInsight(renamedDetail.marker_name);
+    }
+  };
+
+  const handleMarkerCanonicalUnitSave = async (nextCanonicalUnit: string) => {
+    if (!detail) {
+      return;
+    }
+
+    const trimmedCanonicalUnit = nextCanonicalUnit.trim();
+    if (!trimmedCanonicalUnit) {
+      throw new Error("Canonical unit is required.");
+    }
+
+    const updatedDetail = await patchMarkerCanonicalUnit(detail.marker_name, trimmedCanonicalUnit);
+    await applyUpdatedMarkerDetail(updatedDetail);
+    if (!shareExportMode && !updatedDetail.explanation_cached) {
+      void refreshMarkerInsight(updatedDetail.marker_name);
+    }
+  };
+
+  const refreshMarkerDetail = async (markerName: string) => {
+    const refreshedDetail = await fetchMarkerDetail(markerName);
+    await applyUpdatedMarkerDetail(refreshedDetail);
+    if (!shareExportMode && !refreshedDetail.explanation_cached) {
+      void refreshMarkerInsight(refreshedDetail.marker_name);
+    }
+  };
+
+  const saveMeasurementValue = async (measurement: Measurement, nextValue: string) => {
+    if (!detail) {
+      throw new Error("Biomarker detail is still loading.");
+    }
+    const trimmedValue = nextValue.trim();
+    if (!trimmedValue) {
+      throw new Error("Enter a value or use Reset.");
+    }
+
+    const shouldTreatAsQualitative =
+      measurement.qualitative_value != null || looksLikeQualitativeExpression(trimmedValue);
+    if (shouldTreatAsQualitative) {
+      await patchMeasurement(measurement.id, { qualitative_expression: trimmedValue });
+      await refreshMarkerDetail(detail.marker_name);
+      return;
+    }
+
+    const numericValue = Number(trimmedValue);
+    if (!Number.isFinite(numericValue)) {
+      throw new Error("Enter a valid number.");
+    }
+
+    await patchMeasurement(measurement.id, { canonical_value: numericValue });
+    await refreshMarkerDetail(detail.marker_name);
+  };
+
+  const resetMeasurementValue = async (measurement: Measurement) => {
+    if (!detail) {
+      throw new Error("Biomarker detail is still loading.");
+    }
+    await patchMeasurement(measurement.id, { reset_fields: ["canonical_value", "qualitative"] });
+    await refreshMarkerDetail(detail.marker_name);
+  };
+
+  const saveMeasurementUnits = async (measurement: Measurement, nextValue: string) => {
+    if (!detail) {
+      throw new Error("Biomarker detail is still loading.");
+    }
+    const separatorIndex = nextValue.indexOf("|");
+    const canonicalUnit = (
+      separatorIndex === -1 ? nextValue : nextValue.slice(0, separatorIndex)
+    ).trim();
+    const payload = {
+      canonical_unit: canonicalUnit || null,
+      ...(separatorIndex === -1
+        ? {}
+        : { original_unit: nextValue.slice(separatorIndex + 1).trim() || null }),
+    };
+    await patchMeasurement(measurement.id, payload);
+    await refreshMarkerDetail(detail.marker_name);
+  };
+
+  const resetMeasurementUnits = async (measurement: Measurement) => {
+    if (!detail) {
+      throw new Error("Biomarker detail is still loading.");
+    }
+    await patchMeasurement(measurement.id, { reset_fields: ["canonical_unit", "original_unit"] });
+    await refreshMarkerDetail(detail.marker_name);
+  };
+
+  const saveMeasurementReferenceRange = async (measurement: Measurement, nextValue: string) => {
+    if (!detail) {
+      throw new Error("Biomarker detail is still loading.");
+    }
+    await patchMeasurement(measurement.id, parseEditableReferenceRange(nextValue));
+    await refreshMarkerDetail(detail.marker_name);
+  };
+
+  const resetMeasurementReferenceRange = async (measurement: Measurement) => {
+    if (!detail) {
+      throw new Error("Biomarker detail is still loading.");
+    }
+    await patchMeasurement(measurement.id, {
+      reset_fields: ["canonical_reference_low", "canonical_reference_high"],
+    });
+    await refreshMarkerDetail(detail.marker_name);
+  };
+
+  const saveMeasurementDate = async (measurement: Measurement, nextMeasuredAt: string) => {
+    if (!detail) {
+      throw new Error("Biomarker detail is still loading.");
+    }
+    await patchMeasurement(measurement.id, {
+      measured_at: nextMeasuredAt ? toUtcNoonIso(nextMeasuredAt) : null,
+    });
+    await refreshMarkerDetail(detail.marker_name);
+  };
+
+  const resetMeasurementDate = async (measurement: Measurement) => {
+    if (!detail) {
+      throw new Error("Biomarker detail is still loading.");
+    }
+    await patchMeasurement(measurement.id, { reset_fields: ["measured_at"] });
+    await refreshMarkerDetail(detail.marker_name);
   };
 
   const trendMeter = (item: MarkerOverviewItem) => {
@@ -744,7 +948,7 @@ export default function MarkerChart() {
                       : previous == null
                       ? "First result"
                       : delta != null
-                      ? `${delta > 0 ? "+" : ""}${formatMeasurementValue(delta, latest.canonical_unit)}`
+                      ? `${delta > 0 ? "+" : ""}${formatMeasurementValue(delta, item.canonical_unit ?? latest.canonical_unit)}`
                       : "";
                     const otherCount = item.total_count - 1 - (previous ? 1 : 0);
 
@@ -811,20 +1015,39 @@ export default function MarkerChart() {
           </div>
         ) : (
           <>
-             <div className="detail-header">
-               <div>
-                 <p className="detail-group-label">{summarySource.group_name}</p>
-                <h2>
-                  {summarySource.marker_name}
-                  {getDisplayUnit(summarySource.canonical_unit) && (
-                    <span className="detail-canonical-unit"> ({getDisplayUnit(summarySource.canonical_unit)})</span>
-                  )}
-                </h2>
-                <p className="detail-latest-meta">
-                  Latest result on {formatDate(summarySource.latest_measurement.measured_at)}
-                </p>
-                <div style={{ marginTop: "0.35rem" }}>
-                  {shareExportMode ? (
+              <div className="detail-header">
+                <div>
+                  <p className="detail-group-label">{summarySource.group_name}</p>
+                  <div className="marker-detail-heading" role="heading" aria-level={2}>
+                    <InlineEditableValue
+                      display={<span className="marker-detail-name-text">{summarySource.marker_name}</span>}
+                      editValue={summarySource.marker_name}
+                      onSave={handleMarkerRename}
+                      readOnly={shareExportMode}
+                      ariaLabel={`Rename biomarker ${summarySource.marker_name}`}
+                      title="Double-click to rename this shared biomarker"
+                      hint="Renames the canonical biomarker across files and charts. Historical names remain searchable as aliases."
+                    />
+                    <InlineEditableValue
+                      display={(
+                        <span className="detail-canonical-unit detail-canonical-unit-inline">
+                          ({getDisplayUnit(summarySource.canonical_unit) ?? "—"})
+                        </span>
+                      )}
+                      editValue={summarySource.canonical_unit ?? ""}
+                      onSave={handleMarkerCanonicalUnitSave}
+                      readOnly={shareExportMode}
+                      ariaLabel={`Edit canonical unit for ${summarySource.marker_name}`}
+                      title="Double-click to edit the shared canonical unit"
+                      hint="Refreshes the marker's shared target unit so charts, lists, and per-measurement resets stay aligned."
+                      monospace
+                    />
+                  </div>
+                  <p className="detail-latest-meta">
+                    Latest result on {formatDate(getEffectiveMeasuredAt(summarySource.latest_measurement))}
+                  </p>
+                  <div style={{ marginTop: "0.35rem" }}>
+                    {shareExportMode ? (
                     <div className="tag-list" style={{ minHeight: "1.5rem" }}>
                       {(detail?.marker_tags ?? summarySource.marker_tags).length > 0 ? (
                         (detail?.marker_tags ?? summarySource.marker_tags).map((tag) => (
@@ -859,14 +1082,14 @@ export default function MarkerChart() {
              </div>
 
              <div className="detail-summary-grid">
-              <div className={`detail-stat-card detail-stat-card-measurement ${latestDetailValueClassName}`}>
-                <span>Latest</span>
-                <strong>{formatPreferredMeasurementValue(summarySource.latest_measurement)}</strong>
-                <small>{formatDate(summarySource.latest_measurement.measured_at)}</small>
-                {getUnitConversionWarning(summarySource.latest_measurement) && (
-                  <small className="measurement-warning-note">{getUnitConversionWarning(summarySource.latest_measurement)}</small>
-                )}
-              </div>
+               <div className={`detail-stat-card detail-stat-card-measurement ${latestDetailValueClassName}`}>
+                 <span>Latest</span>
+                 <strong>{formatPreferredMeasurementValue(summarySource.latest_measurement)}</strong>
+                 <small>{formatDate(getEffectiveMeasuredAt(summarySource.latest_measurement))}</small>
+                 {getUnitConversionWarning(summarySource.latest_measurement) && (
+                   <small className="measurement-warning-note">{getUnitConversionWarning(summarySource.latest_measurement)}</small>
+                 )}
+               </div>
 
               <div className={`detail-stat-card detail-stat-card-measurement ${previousDetailValueClassName}`}>
                 <span>Previous</span>
@@ -875,11 +1098,11 @@ export default function MarkerChart() {
                     ? formatPreferredMeasurementValue(summarySource.previous_measurement)
                     : "—"}
                 </strong>
-                <small>
-                  {summarySource.previous_measurement
-                    ? formatDate(summarySource.previous_measurement.measured_at)
-                    : "No earlier result"}
-                </small>
+                 <small>
+                   {summarySource.previous_measurement
+                     ? formatDate(getEffectiveMeasuredAt(summarySource.previous_measurement))
+                     : "No earlier result"}
+                 </small>
                 {summarySource.previous_measurement && getUnitConversionWarning(summarySource.previous_measurement) && (
                   <small className="measurement-warning-note">{getUnitConversionWarning(summarySource.previous_measurement)}</small>
                 )}
@@ -1086,6 +1309,7 @@ export default function MarkerChart() {
                       <tr>
                         <th>Date</th>
                         <th>Value</th>
+                        <th>Unit</th>
                         <th>Reference</th>
                         <th>Source</th>
                       </tr>
@@ -1096,10 +1320,21 @@ export default function MarkerChart() {
                         .reverse()
                         .map((measurement) => {
                           const filename = measurement.lab_file_filename || `File ${measurement.lab_file_id}`;
+                          const canonicalUnit = measurement.canonical_unit;
+                          const canonicalReferenceLow = measurement.canonical_reference_low;
+                          const canonicalReferenceHigh = measurement.canonical_reference_high;
                           const originalValue = getOriginalMeasurementValue(measurement);
                           const originalUnit = getOriginalMeasurementUnit(measurement);
+                          const originalReferenceLow = getOriginalMeasurementReferenceLow(measurement);
+                          const originalReferenceHigh = getOriginalMeasurementReferenceHigh(measurement);
                           const conversionMissing = isUnitConversionMissing(measurement);
                           const conversionWarning = getUnitConversionWarning(measurement);
+                          const showOriginalReference = !conversionMissing
+                            && measurement.qualitative_value == null
+                            && (originalReferenceLow !== canonicalReferenceLow
+                              || originalReferenceHigh !== canonicalReferenceHigh);
+                          const showOriginalUnit = !conversionMissing
+                            && !areUnitsEquivalent(originalUnit, canonicalUnit);
                           const measurementValueClassName = getMeasurementStatusClassName(
                             measurement,
                             detail.reference_low,
@@ -1111,18 +1346,100 @@ export default function MarkerChart() {
 
                           return (
                             <tr key={measurement.id}>
-                              <td>{formatDate(measurement.measured_at)}</td>
-                              <td className={measurementValueClassName}>
-                                <StackedMeasurementValue
-                                  primary={renderPreferredMeasurementValue(measurement)}
-                                  secondary={conversionMissing
-                                    ? conversionWarning ?? undefined
-                                    : showOriginalValue
-                                    ? formatMeasurementValue(originalValue, originalUnit, measurement.qualitative_value)
-                                    : undefined}
+                              <td>
+                                <InlineEditableValue
+                                  display={<span>{formatDate(getEffectiveMeasuredAt(measurement))}</span>}
+                                  editValue={toDateInputValue(getEffectiveMeasuredAt(measurement))}
+                                  onSave={(nextValue) => saveMeasurementDate(measurement, nextValue)}
+                                  onReset={() => resetMeasurementDate(measurement)}
+                                  edited={hasEditedMeasurementField(measurement, "measured_at")}
+                                  readOnly={shareExportMode}
+                                  inputType="date"
+                                  ariaLabel={`Edit measurement date for ${detail.marker_name}`}
+                                  title="Double-click to override the measurement date"
+                                  hint="Overrides the explicit measurement date used for chronology and chart ordering."
                                 />
                               </td>
-                              <td>{formatPreferredReferenceRange(measurement)}</td>
+                              <td className={measurementValueClassName}>
+                                <InlineEditableValue
+                                  display={(
+                                    <StackedMeasurementValue
+                                      primary={formatPreferredMeasurementScalarValue(measurement)}
+                                      secondary={conversionMissing
+                                        ? conversionWarning ?? undefined
+                                        : showOriginalValue
+                                        ? formatMeasurementScalarValue(originalValue, measurement.qualitative_value)
+                                        : undefined}
+                                    />
+                                  )}
+                                  editValue={formatEditableMeasurementValue(measurement)}
+                                  onSave={(nextValue) => saveMeasurementValue(measurement, nextValue)}
+                                  onReset={() => resetMeasurementValue(measurement)}
+                                  edited={hasEditedMeasurementField(
+                                    measurement,
+                                    "canonical_value",
+                                    "qualitative_value",
+                                    "qualitative_bool",
+                                  )}
+                                  readOnly={shareExportMode}
+                                  ariaLabel={`Edit value for ${detail.marker_name}`}
+                                  title="Double-click to edit this displayed measurement value"
+                                  monospace={measurement.qualitative_value != null}
+                                  hint={measurement.qualitative_value != null
+                                    ? 'Examples: true("Reactive"), false("Not detected"), or "Borderline".'
+                                    : "Enter a number. Use Reset to restore the pipeline value."}
+                                />
+                              </td>
+                              <td>
+                                <InlineEditableValue
+                                  display={(
+                                    <StackedMeasurementValue
+                                      primary={formatPreferredMeasurementUnit(measurement)}
+                                      secondary={conversionMissing
+                                        ? getDisplayUnit(canonicalUnit)
+                                          ? `Target ${getDisplayUnit(canonicalUnit)}`
+                                          : undefined
+                                        : showOriginalUnit
+                                        ? getDisplayUnit(originalUnit) ?? "—"
+                                        : undefined}
+                                    />
+                                  )}
+                                  editValue={formatEditableMeasurementUnits(measurement)}
+                                  onSave={(nextValue) => saveMeasurementUnits(measurement, nextValue)}
+                                  onReset={() => resetMeasurementUnits(measurement)}
+                                  edited={hasEditedMeasurementField(measurement, "canonical_unit", "original_unit")}
+                                  readOnly={shareExportMode}
+                                  ariaLabel={`Edit units for ${detail.marker_name}`}
+                                  title="Double-click to edit canonical and original units"
+                                  monospace
+                                  hint="Use canonical or canonical | original to override both visible unit fields."
+                                />
+                              </td>
+                              <td>
+                                <InlineEditableValue
+                                  display={(
+                                    <StackedMeasurementValue
+                                      primary={formatPreferredReferenceRange(measurement)}
+                                      secondary={showOriginalReference
+                                        ? formatReferenceRange(originalReferenceLow, originalReferenceHigh)
+                                        : undefined}
+                                    />
+                                  )}
+                                  editValue={formatEditableMeasurementReferenceRange(measurement)}
+                                  onSave={(nextValue) => saveMeasurementReferenceRange(measurement, nextValue)}
+                                  onReset={() => resetMeasurementReferenceRange(measurement)}
+                                  edited={hasEditedMeasurementField(
+                                    measurement,
+                                    "canonical_reference_low",
+                                    "canonical_reference_high",
+                                  )}
+                                  readOnly={shareExportMode}
+                                  ariaLabel={`Edit reference range for ${detail.marker_name}`}
+                                  title="Double-click to edit this displayed reference range"
+                                  monospace
+                                  hint="Use low-high, low-, or -high."
+                                />
+                              </td>
                               <td>
                                 <div className="history-source-cell">
                                   <Link

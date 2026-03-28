@@ -8,7 +8,7 @@ import {
   isShareExportMode,
   throwUnavailableInShareExport,
 } from "../export/runtime";
-import type { LabFile, Measurement } from "../types";
+import type { FilePatchPayload, LabFile, Measurement } from "../types";
 
 export interface PageInfo {
   page_count: number;
@@ -59,6 +59,14 @@ export async function fetchFile(fileId: string | number) {
     return getShareExportFile(Number(fileId));
   }
   const response = await apiClient.get<LabFile>(`/files/${fileId}`);
+  return response.data;
+}
+
+export async function patchFile(fileId: string | number, payload: FilePatchPayload) {
+  if (isShareExportMode()) {
+    throwUnavailableInShareExport("Editing file metadata");
+  }
+  const response = await apiClient.patch<LabFile>(`/files/${fileId}`, payload);
   return response.data;
 }
 

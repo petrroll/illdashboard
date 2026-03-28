@@ -9,7 +9,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from illdashboard.copilot.explanations import explain_marker_history
 from illdashboard.models import BiomarkerInsight, Measurement, MeasurementType
-from illdashboard.services.markers import latest_reference_range_for_history, measurement_status_for_range
+from illdashboard.services.markers import (
+    effective_measurement_qualitative_bool,
+    effective_measurement_qualitative_value,
+    effective_measurement_reference_high,
+    effective_measurement_reference_low,
+    effective_measurement_unit,
+    effective_measurement_value,
+    latest_reference_range_for_history,
+    measurement_status_for_range,
+)
 
 
 def _measurement_snapshot(measurement: Measurement | None) -> dict | None:
@@ -18,35 +27,38 @@ def _measurement_snapshot(measurement: Measurement | None) -> dict | None:
 
     return {
         "id": measurement.id,
-        "numeric_value": measurement.canonical_value,
-        "qualitative_value": measurement.qualitative_value,
-        "qualitative_bool": measurement.qualitative_bool,
-        "measured_at": measurement.measured_at.isoformat() if measurement.measured_at else None,
-        "unit": measurement.canonical_unit,
-        "reference_low": measurement.canonical_reference_low,
-        "reference_high": measurement.canonical_reference_high,
+        "numeric_value": effective_measurement_value(measurement),
+        "qualitative_value": effective_measurement_qualitative_value(measurement),
+        "qualitative_bool": effective_measurement_qualitative_bool(measurement),
+        "measured_at": measurement.effective_measured_at.isoformat() if measurement.effective_measured_at else None,
+        "unit": effective_measurement_unit(measurement),
+        "reference_low": effective_measurement_reference_low(measurement),
+        "reference_high": effective_measurement_reference_high(measurement),
         "unit_conversion_missing": bool(getattr(measurement, "unit_conversion_missing", False)),
     }
 
 
 def _measurement_value_for_ai(measurement: Measurement) -> str | float | None:
-    if measurement.canonical_value is not None:
-        return measurement.canonical_value
-    return measurement.qualitative_value
+    numeric_value = effective_measurement_value(measurement)
+    if numeric_value is not None:
+        return numeric_value
+    return effective_measurement_qualitative_value(measurement)
 
 
 def _measurement_display_unit(measurement: Measurement) -> str | None:
-    return measurement.canonical_unit or measurement.original_unit
+    return effective_measurement_unit(measurement) or measurement.original_unit
 
 
 def _measurement_display_value(measurement: Measurement) -> str:
     unit = _measurement_display_unit(measurement)
     unit_suffix = f" {unit}" if unit else ""
 
-    if measurement.qualitative_value is not None:
-        return f"{measurement.qualitative_value}{unit_suffix}"
-    if measurement.canonical_value is not None:
-        return f"{measurement.canonical_value:g}{unit_suffix}"
+    qualitative_value = effective_measurement_qualitative_value(measurement)
+    if qualitative_value is not None:
+        return f"{qualitative_value}{unit_suffix}"
+    numeric_value = effective_measurement_value(measurement)
+    if numeric_value is not None:
+        return f"{numeric_value:g}{unit_suffix}"
     return f"unavailable{unit_suffix}".strip()
 
 
@@ -69,13 +81,19 @@ def serialize_history_for_ai(measurements: list[Measurement]) -> list[dict]:
     effective_reference_low, effective_reference_high = latest_reference_range_for_history(measurements)
     return [
         {
-            "date": measurement.measured_at.date().isoformat() if measurement.measured_at else "unknown date",
+            "date": measurement.effective_measured_at.date().isoformat()
+            if measurement.effective_measured_at
+            else "unknown date",
             "value": _measurement_value_for_ai(measurement),
             "unit": _measurement_display_unit(measurement),
-            "reference_low": effective_reference_low if measurement is latest else measurement.canonical_reference_low,
+            "reference_low": (
+                effective_reference_low
+                if measurement is latest
+                else effective_measurement_reference_low(measurement)
+            ),
             "reference_high": effective_reference_high
             if measurement is latest
-            else measurement.canonical_reference_high,
+            else effective_measurement_reference_high(measurement),
         }
         for measurement in measurements[-8:]
     ]
@@ -89,25 +107,30 @@ def fallback_marker_explanation(marker_name: str, measurements: list[Measurement
     latest_value = _measurement_display_value(latest)
     parts = [f"## {marker_name}"]
 
-    if latest.canonical_value is None and latest.qualitative_value is not None:
+    latest_value_number = effective_measurement_value(latest)
+    latest_qualitative_value = effective_measurement_qualitative_value(latest)
+    if latest_value_number is None and latest_qualitative_value is not None:
         parts.append(f"Latest result: **{latest_value}**.")
 
-        if latest.qualitative_bool is True:
+        if effective_measurement_qualitative_bool(latest) is True:
             parts.append("The latest result is reported as positive.")
-        elif latest.qualitative_bool is False:
+        elif effective_measurement_qualitative_bool(latest) is False:
             parts.append("The latest result is reported as negative.")
         else:
             parts.append("The latest result is qualitative, so there is no numeric reference range to compare against.")
 
-        if previous is not None and previous.qualitative_value is not None:
-            if previous.qualitative_value == latest.qualitative_value:
+        previous_qualitative_value = (
+            effective_measurement_qualitative_value(previous) if previous is not None else None
+        )
+        if previous is not None and previous_qualitative_value is not None:
+            if previous_qualitative_value == latest_qualitative_value:
                 parts.append(
-                    f"Compared with the previous result, it is **unchanged** at **{latest.qualitative_value}**."
+                    f"Compared with the previous result, it is **unchanged** at **{latest_qualitative_value}**."
                 )
             else:
                 parts.append(
                     "Compared with the previous result, it changed "
-                    f"from **{previous.qualitative_value}** to **{latest.qualitative_value}**."
+                    f"from **{previous_qualitative_value}** to **{latest_qualitative_value}**."
                 )
 
         return "\n\n".join(parts)
@@ -138,8 +161,9 @@ def fallback_marker_explanation(marker_name: str, measurements: list[Measurement
             "falls inside the lab's usual reference interval for this marker."
         )
 
-    if previous is not None and latest.canonical_value is not None and previous.canonical_value is not None:
-        delta = latest.canonical_value - previous.canonical_value
+    previous_value = effective_measurement_value(previous) if previous is not None else None
+    if previous is not None and latest_value_number is not None and previous_value is not None:
+        delta = latest_value_number - previous_value
         direction = "up" if delta > 0 else "down" if delta < 0 else "unchanged"
         parts.append(
             f"Compared with the previous result, the marker is **{direction}** by **{abs(delta):g}{unit_suffix}**."
@@ -179,6 +203,21 @@ async def get_cached_or_generated_insight(
 
     await db.commit()
     return explanation, False
+
+
+async def invalidate_cached_insight(
+    measurement_type: MeasurementType,
+    db: AsyncSession,
+) -> None:
+    result = await db.execute(
+        select(BiomarkerInsight).where(BiomarkerInsight.measurement_type_id == measurement_type.id)
+    )
+    cached_insight = result.scalar_one_or_none()
+    if cached_insight is None:
+        return
+
+    await db.delete(cached_insight)
+    await db.flush()
 
 
 async def get_cached_insight(

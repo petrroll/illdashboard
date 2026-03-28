@@ -9,15 +9,21 @@ import {
   fetchFilePageInfo,
   fetchFileTextPreview,
   fetchFileTags,
+  patchFile,
+  patchMeasurement,
   runFileOcr,
   setFileTags,
   type PageInfo,
 } from "../api";
+import InlineEditableValue from "../components/InlineEditableValue";
 import StackedMeasurementValue from "../components/StackedMeasurementValue";
 import TagInput from "../components/TagInput";
 import type { ExplainRequest, LabFile, Measurement } from "../types";
 import {
   areUnitsEquivalent,
+  formatEditableMeasurementReferenceRange,
+  formatEditableMeasurementUnits,
+  formatEditableMeasurementValue,
   formatDate,
   formatDateTime,
   formatMeasurementScalarValue,
@@ -26,14 +32,21 @@ import {
   formatPreferredReferenceRange,
   formatReferenceRange,
   getDisplayUnit,
-  getMeasurementValueClass,
+  getDisplayedMeasurementReferenceHigh,
+  getDisplayedMeasurementReferenceLow,
+  getDisplayedMeasurementValue,
+  getEffectiveMeasuredAt,
+  getMeasurementStatusClassName,
   getOriginalMeasurementReferenceHigh,
   getOriginalMeasurementReferenceLow,
   getOriginalMeasurementUnit,
   getOriginalMeasurementValue,
   getUnitConversionWarning,
+  hasEditedMeasurementField,
   hasRescaledMeasurementValue,
   isUnitConversionMissing,
+  looksLikeQualitativeExpression,
+  parseEditableReferenceRange,
 } from "../utils/measurements";
 import {
   getShareExportFileTextPreview,
@@ -88,6 +101,14 @@ function isTextPreviewMime(mimeType: string | null | undefined) {
 
 function isMarkdownPreviewMime(mimeType: string | null | undefined) {
   return mimeType === "text/markdown";
+}
+
+function toDateInputValue(value: string | null | undefined) {
+  return value ? value.slice(0, 10) : "";
+}
+
+function toUtcNoonIso(dateValue: string) {
+  return `${dateValue}T12:00:00Z`;
 }
 
 function getProgressSummary(file: LabFile) {
@@ -162,6 +183,14 @@ export default function FileDetail() {
     } catch {
       setPageInfo(null);
     }
+  }, [fileId]);
+
+  const refreshMeasurements = useCallback(async () => {
+    if (!fileId) {
+      return;
+    }
+
+    setMeasurements(await fetchFileMeasurements(fileId));
   }, [fileId]);
 
   useEffect(() => {
@@ -269,6 +298,14 @@ export default function FileDetail() {
     }
   };
 
+  const saveFileName = async (nextFilename: string) => {
+    if (!file) {
+      return;
+    }
+
+    setFile(await patchFile(file.id, { filename: nextFilename.trim() }));
+  };
+
   const handleFileExport = async (format: "markdown" | "pdf", includeHistory: boolean) => {
     if (!fileId) {
       return;
@@ -300,11 +337,11 @@ export default function FileDetail() {
       .filter((measurement) => selected.has(measurement.id))
       .map((measurement) => ({
         marker_name: measurement.marker_name,
-        value: getOriginalMeasurementValue(measurement),
+        value: getDisplayedMeasurementValue(measurement),
         qualitative_value: measurement.qualitative_value,
         unit: getOriginalMeasurementUnit(measurement),
-        reference_low: getOriginalMeasurementReferenceLow(measurement),
-        reference_high: getOriginalMeasurementReferenceHigh(measurement),
+        reference_low: getDisplayedMeasurementReferenceLow(measurement),
+        reference_high: getDisplayedMeasurementReferenceHigh(measurement),
       }));
     if (items.length === 0) return;
     await requestExplanation(() => explainMeasurements(items));
@@ -313,12 +350,104 @@ export default function FileDetail() {
   const explainSingle = async (measurement: Measurement) => {
     await requestExplanation(() => explainMeasurement({
       marker_name: measurement.marker_name,
-      value: getOriginalMeasurementValue(measurement),
+      value: getDisplayedMeasurementValue(measurement),
       qualitative_value: measurement.qualitative_value,
       unit: getOriginalMeasurementUnit(measurement),
-      reference_low: getOriginalMeasurementReferenceLow(measurement),
-      reference_high: getOriginalMeasurementReferenceHigh(measurement),
+      reference_low: getDisplayedMeasurementReferenceLow(measurement),
+      reference_high: getDisplayedMeasurementReferenceHigh(measurement),
     }));
+  };
+
+  const saveFileLabDate = async (nextLabDate: string) => {
+    if (!fileId) {
+      return;
+    }
+
+    setFile(
+      await patchFile(fileId, {
+        lab_date: nextLabDate ? toUtcNoonIso(nextLabDate) : null,
+      }),
+    );
+    await refreshMeasurements();
+  };
+
+  const resetFileLabDate = async () => {
+    if (!fileId) {
+      return;
+    }
+
+    setFile(await patchFile(fileId, { reset_fields: ["lab_date"] }));
+    await refreshMeasurements();
+  };
+
+  const saveMeasurementValue = async (measurement: Measurement, nextValue: string) => {
+    const trimmedValue = nextValue.trim();
+    if (!trimmedValue) {
+      throw new Error("Enter a value or use Reset.");
+    }
+
+    const shouldTreatAsQualitative = measurement.qualitative_value != null || looksLikeQualitativeExpression(trimmedValue);
+    if (shouldTreatAsQualitative) {
+      await patchMeasurement(measurement.id, { qualitative_expression: trimmedValue });
+      await refreshMeasurements();
+      return;
+    }
+
+    const numericValue = Number(trimmedValue);
+    if (!Number.isFinite(numericValue)) {
+      throw new Error("Enter a valid number.");
+    }
+
+    await patchMeasurement(measurement.id, { canonical_value: numericValue });
+    await refreshMeasurements();
+  };
+
+  const resetMeasurementValue = async (measurement: Measurement) => {
+    await patchMeasurement(measurement.id, { reset_fields: ["canonical_value", "qualitative"] });
+    await refreshMeasurements();
+  };
+
+  const saveMeasurementUnits = async (measurement: Measurement, nextValue: string) => {
+    const separatorIndex = nextValue.indexOf("|");
+    const canonicalUnit = (
+      separatorIndex === -1 ? nextValue : nextValue.slice(0, separatorIndex)
+    ).trim();
+    await patchMeasurement(measurement.id, {
+      canonical_unit: canonicalUnit || null,
+      ...(separatorIndex === -1
+        ? {}
+        : { original_unit: nextValue.slice(separatorIndex + 1).trim() || null }),
+    });
+    await refreshMeasurements();
+  };
+
+  const resetMeasurementUnits = async (measurement: Measurement) => {
+    await patchMeasurement(measurement.id, { reset_fields: ["canonical_unit", "original_unit"] });
+    await refreshMeasurements();
+  };
+
+  const saveMeasurementReferenceRange = async (measurement: Measurement, nextValue: string) => {
+    await patchMeasurement(measurement.id, parseEditableReferenceRange(nextValue));
+    await refreshMeasurements();
+  };
+
+  const resetMeasurementReferenceRange = async (measurement: Measurement) => {
+    await patchMeasurement(measurement.id, {
+      reset_fields: ["canonical_reference_low", "canonical_reference_high"],
+    });
+    await refreshMeasurements();
+  };
+
+  const saveMeasurementDate = async (measurement: Measurement, nextMeasuredAt: string) => {
+    await patchMeasurement(measurement.id, {
+      measured_at: nextMeasuredAt ? toUtcNoonIso(nextMeasuredAt) : null,
+    });
+    await refreshMeasurements();
+  };
+
+  const resetMeasurementDate = async (measurement: Measurement) => {
+    await patchMeasurement(measurement.id, { reset_fields: ["measured_at"] });
+    await refreshMeasurements();
   };
 
   const scrollToPage = useCallback((pageNum: number) => {
@@ -367,11 +496,34 @@ export default function FileDetail() {
       <Link to="/files" style={{ fontSize: "0.85rem", color: "var(--accent)" }}>
         ← Back to files
       </Link>
-      <h2 style={{ marginTop: "0.5rem" }}>{file.filename}</h2>
-      <p style={{ color: "var(--text-muted)", marginBottom: "1rem" }}>
-        Uploaded {formatDateTime(file.uploaded_at)}
-        {file.lab_date && ` · Lab date: ${formatDate(file.lab_date)}`}
-      </p>
+      <div className="file-detail-header-block">
+        <div role="heading" aria-level={2}>
+          <InlineEditableValue
+            display={<span className="file-detail-heading-text">{file.filename}</span>}
+            editValue={file.filename}
+            onSave={saveFileName}
+            readOnly={shareExportMode}
+            ariaLabel={`Rename file ${file.filename}`}
+            title="Double-click to rename this file"
+            hint="Renames the file everywhere it appears, including the files list and exports."
+          />
+        </div>
+        <div className="file-detail-meta-row" style={{ color: "var(--text-muted)" }}>
+          <span>Uploaded {formatDateTime(file.uploaded_at)}</span>
+          <InlineEditableValue
+            display={<span>· Lab date: {formatDate(file.lab_date)}</span>}
+            editValue={toDateInputValue(file.lab_date)}
+            onSave={saveFileLabDate}
+            onReset={resetFileLabDate}
+            edited={file.user_edited_fields?.includes("lab_date")}
+            readOnly={shareExportMode}
+            inputType="date"
+            ariaLabel={`Edit lab date for ${file.filename}`}
+            title="Double-click to override the file lab date"
+            hint="Used as the fallback date when a measurement does not include its own timestamp."
+          />
+        </div>
+      </div>
 
       <section className="card" style={{ marginBottom: "1rem" }}>
         <div style={{ display: "flex", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
@@ -639,7 +791,6 @@ export default function FileDetail() {
                 </thead>
                 <tbody>
                   {filteredMeasurements.map((measurement) => {
-                    const canonicalValue = measurement.canonical_value;
                     const canonicalUnit = measurement.canonical_unit;
                     const canonicalReferenceLow = measurement.canonical_reference_low;
                     const canonicalReferenceHigh = measurement.canonical_reference_high;
@@ -656,9 +807,6 @@ export default function FileDetail() {
                       && measurement.qualitative_value == null
                       && (originalReferenceLow !== canonicalReferenceLow || originalReferenceHigh !== canonicalReferenceHigh);
                     const showOriginalUnit = !conversionMissing && !areUnitsEquivalent(originalUnit, canonicalUnit);
-                    const statusValue = conversionMissing ? originalValue : canonicalValue;
-                    const statusReferenceLow = conversionMissing ? originalReferenceLow : canonicalReferenceLow;
-                    const statusReferenceHigh = conversionMissing ? originalReferenceHigh : canonicalReferenceHigh;
 
                     return (
                       <tr key={measurement.id}>
@@ -682,43 +830,101 @@ export default function FileDetail() {
                           </Link>
                         </td>
                         <td
-                          className={getMeasurementValueClass({
-                            value: statusValue,
-                            reference_low: statusReferenceLow,
-                            reference_high: statusReferenceHigh,
-                            qualitative_bool: measurement.qualitative_bool,
-                          })}
+                          className={getMeasurementStatusClassName(measurement, null, null)}
                         >
-                          <StackedMeasurementValue
-                            primary={formatPreferredMeasurementScalarValue(measurement)}
-                            secondary={conversionMissing
-                              ? conversionWarning ?? undefined
-                              : showOriginalValue
-                              ? formatMeasurementScalarValue(originalValue, measurement.qualitative_value)
-                              : undefined}
+                          <InlineEditableValue
+                            display={(
+                              <StackedMeasurementValue
+                                primary={formatPreferredMeasurementScalarValue(measurement)}
+                                secondary={conversionMissing
+                                  ? conversionWarning ?? undefined
+                                  : showOriginalValue
+                                  ? formatMeasurementScalarValue(originalValue, measurement.qualitative_value)
+                                  : undefined}
+                              />
+                            )}
+                            editValue={formatEditableMeasurementValue(measurement)}
+                            onSave={(nextValue) => saveMeasurementValue(measurement, nextValue)}
+                            onReset={() => resetMeasurementValue(measurement)}
+                            edited={hasEditedMeasurementField(
+                              measurement,
+                              "canonical_value",
+                              "qualitative_value",
+                              "qualitative_bool",
+                            )}
+                            readOnly={shareExportMode}
+                            ariaLabel={`Edit value for ${measurement.marker_name}`}
+                            title="Double-click to edit this displayed measurement value"
+                            monospace={measurement.qualitative_value != null}
+                            hint={measurement.qualitative_value != null
+                              ? 'Examples: true("Reactive"), false("Not detected"), or "Borderline".'
+                              : "Enter a number. Use Reset to restore the pipeline value."}
                           />
                         </td>
                         <td>
-                          <StackedMeasurementValue
-                            primary={formatPreferredMeasurementUnit(measurement)}
-                            secondary={conversionMissing
-                              ? getDisplayUnit(canonicalUnit)
-                                ? `Target ${getDisplayUnit(canonicalUnit)}`
-                                : undefined
-                              : showOriginalUnit
-                              ? getDisplayUnit(originalUnit) ?? "—"
-                              : undefined}
+                          <InlineEditableValue
+                            display={(
+                              <StackedMeasurementValue
+                                primary={formatPreferredMeasurementUnit(measurement)}
+                                secondary={conversionMissing
+                                  ? getDisplayUnit(canonicalUnit)
+                                    ? `Target ${getDisplayUnit(canonicalUnit)}`
+                                    : undefined
+                                  : showOriginalUnit
+                                  ? getDisplayUnit(originalUnit) ?? "—"
+                                  : undefined}
+                              />
+                            )}
+                            editValue={formatEditableMeasurementUnits(measurement)}
+                            onSave={(nextValue) => saveMeasurementUnits(measurement, nextValue)}
+                            onReset={() => resetMeasurementUnits(measurement)}
+                            edited={hasEditedMeasurementField(measurement, "canonical_unit", "original_unit")}
+                            readOnly={shareExportMode}
+                            ariaLabel={`Edit units for ${measurement.marker_name}`}
+                            title="Double-click to edit canonical and original units"
+                            monospace
+                            hint="Use canonical or canonical | original to override both visible unit fields."
                           />
                         </td>
                         <td>
-                          <StackedMeasurementValue
-                            primary={formatPreferredReferenceRange(measurement)}
-                            secondary={showOriginalReference
-                              ? formatReferenceRange(originalReferenceLow, originalReferenceHigh)
-                              : undefined}
+                          <InlineEditableValue
+                            display={(
+                              <StackedMeasurementValue
+                                primary={formatPreferredReferenceRange(measurement)}
+                                secondary={showOriginalReference
+                                  ? formatReferenceRange(originalReferenceLow, originalReferenceHigh)
+                                  : undefined}
+                              />
+                            )}
+                            editValue={formatEditableMeasurementReferenceRange(measurement)}
+                            onSave={(nextValue) => saveMeasurementReferenceRange(measurement, nextValue)}
+                            onReset={() => resetMeasurementReferenceRange(measurement)}
+                            edited={hasEditedMeasurementField(
+                              measurement,
+                              "canonical_reference_low",
+                              "canonical_reference_high",
+                            )}
+                            readOnly={shareExportMode}
+                            ariaLabel={`Edit reference range for ${measurement.marker_name}`}
+                            title="Double-click to edit this displayed reference range"
+                            monospace
+                            hint="Use low-high, low-, or -high."
                           />
                         </td>
-                        <td>{formatDate(measurement.measured_at)}</td>
+                        <td>
+                          <InlineEditableValue
+                            display={<span>{formatDate(getEffectiveMeasuredAt(measurement))}</span>}
+                            editValue={toDateInputValue(getEffectiveMeasuredAt(measurement))}
+                            onSave={(nextValue) => saveMeasurementDate(measurement, nextValue)}
+                            onReset={() => resetMeasurementDate(measurement)}
+                            edited={hasEditedMeasurementField(measurement, "measured_at")}
+                            readOnly={shareExportMode}
+                            inputType="date"
+                            ariaLabel={`Edit measurement date for ${measurement.marker_name}`}
+                            title="Double-click to override the measurement date"
+                            hint="Overrides the explicit measurement date used for chronology and chart ordering."
+                          />
+                        </td>
                         {hasPages && showPageColumn && (
                           <td>
                             {measurement.page_number ? (

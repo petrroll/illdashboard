@@ -430,16 +430,25 @@ async def missing_rescaling_measurement_ids(
     for measurement in measurements:
         if measurement.id is None or measurement.original_value is None or measurement.measurement_type_id is None:
             continue
-        if measurement.original_unit is None or measurement.canonical_unit is None:
+        if (
+            measurement.user_canonical_value_override
+            or measurement.user_canonical_unit_override
+            or measurement.user_qualitative_value_override
+            or measurement.user_qualitative_bool_override
+        ):
             continue
-        if units_equivalent(measurement.original_unit, measurement.canonical_unit):
+        effective_original_unit = getattr(measurement, "effective_original_unit", measurement.original_unit)
+        effective_canonical_unit = getattr(measurement, "effective_canonical_unit", measurement.canonical_unit)
+        if effective_original_unit is None or effective_canonical_unit is None:
+            continue
+        if units_equivalent(effective_original_unit, effective_canonical_unit):
             continue
 
-        requested_rules.append((measurement.measurement_type_id, measurement.original_unit, measurement.canonical_unit))
+        requested_rules.append((measurement.measurement_type_id, effective_original_unit, effective_canonical_unit))
         requested_pairs_by_measurement_id[measurement.id] = (
             measurement.measurement_type_id,
-            measurement.original_unit,
-            measurement.canonical_unit,
+            effective_original_unit,
+            effective_canonical_unit,
         )
 
     if not requested_pairs_by_measurement_id:

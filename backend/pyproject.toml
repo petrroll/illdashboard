@@ -17,6 +17,9 @@ dependencies = [
     "matplotlib>=3.10.8",
 ]
 
+[project.scripts]
+illdashboard-backend = "illdashboard.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8",

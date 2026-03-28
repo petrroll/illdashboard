@@ -2945,8 +2945,22 @@ async def _search_needs_refresh_by_timestamp(
         ]
         if candidate is not None
     ]
-    latest_input = max(freshness_candidates, default=file.search_indexed_at)
-    return latest_input > file.search_indexed_at
+    latest_input = max(
+        (_coerce_datetime_utc(candidate) for candidate in freshness_candidates),
+        default=_coerce_datetime_utc(file.search_indexed_at),
+    )
+    indexed_at = _coerce_datetime_utc(file.search_indexed_at)
+    if latest_input is None or indexed_at is None:
+        return False
+    return latest_input > indexed_at
+
+
+def _coerce_datetime_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone(UTC)
+    return value.replace(tzinfo=UTC)
 
 
 def _coverage_complete(page_count: int, ranges: list[tuple[int, int]]) -> bool:

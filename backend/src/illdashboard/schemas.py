@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from typing import Any, Literal
 
@@ -46,6 +47,9 @@ class LabFileOut(BaseModel):
     summary_generated_at: datetime | None = None
     source_resolved_at: datetime | None = None
     search_indexed_at: datetime | None = None
+    has_user_edits: bool = False
+    user_edited_fields: list[str] = Field(default_factory=list)
+    has_measurement_edits: bool = False
     tags: list[str] = Field(default_factory=list)
     progress: FileProgressOut
 
@@ -55,18 +59,26 @@ class LabFileOut(BaseModel):
         if isinstance(data, dict):
             return data
         if hasattr(data, "__table__"):
-            raw_tags = data.__dict__.get("tags", [])
-            data = {column.key: getattr(data, column.key) for column in data.__table__.columns}
-            data["tags"] = [tag.tag for tag in raw_tags] if raw_tags and hasattr(raw_tags[0], "tag") else list(raw_tags)
+            model = data
+            raw_tags = model.__dict__.get("tags", [])
+            flattened = {column.key: getattr(model, column.key) for column in model.__table__.columns}
+            flattened["lab_date"] = getattr(model, "effective_lab_date", getattr(model, "lab_date", None))
+            flattened["has_user_edits"] = bool(getattr(model, "has_user_edits", False))
+            flattened["user_edited_fields"] = list(getattr(model, "user_edited_fields", []))
+            flattened["has_measurement_edits"] = bool(getattr(model, "has_measurement_edits", False))
+            flattened["tags"] = (
+                [tag.tag for tag in raw_tags] if raw_tags and hasattr(raw_tags[0], "tag") else list(raw_tags)
+            )
+            return flattened
         return data
 
 
 def _resolve_effective_measured_at(
-    measured_at: datetime | None,
+    effective_measured_at: datetime | None,
     lab_date: datetime | None,
     uploaded_at: datetime | None,
 ) -> datetime | None:
-    return measured_at or lab_date or uploaded_at
+    return effective_measured_at or lab_date or uploaded_at
 
 
 class MeasurementOut(BaseModel):
@@ -92,6 +104,8 @@ class MeasurementOut(BaseModel):
     original_reference_high: float | None = None
     measured_at: datetime | None = None
     page_number: int | None = None
+    has_user_edits: bool = False
+    user_edited_fields: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -99,7 +113,9 @@ class MeasurementOut(BaseModel):
         if isinstance(data, dict):
             lab_file = data.get("lab_file")
             nested_lab_date = (
-                lab_file.get("lab_date") if isinstance(lab_file, dict) else getattr(lab_file, "lab_date", None)
+                lab_file.get("lab_date")
+                if isinstance(lab_file, dict)
+                else getattr(lab_file, "effective_lab_date", getattr(lab_file, "lab_date", None))
             )
             nested_uploaded_at = (
                 lab_file.get("uploaded_at") if isinstance(lab_file, dict) else getattr(lab_file, "uploaded_at", None)
@@ -108,7 +124,7 @@ class MeasurementOut(BaseModel):
             data.setdefault(
                 "effective_measured_at",
                 _resolve_effective_measured_at(
-                    data.get("measured_at"),
+                    data.get("effective_measured_at") or data.get("measured_at"),
                     data.get("lab_date") or data.get("lab_file_lab_date") or nested_lab_date,
                     data.get("uploaded_at") or data.get("lab_file_uploaded_at") or nested_uploaded_at,
                 ),
@@ -128,25 +144,27 @@ class MeasurementOut(BaseModel):
                 "lab_file_filename": getattr(lab_file, "filename", None),
                 "lab_file_source_tag": source_tag,
                 "effective_measured_at": _resolve_effective_measured_at(
-                    data.measured_at,
-                    getattr(lab_file, "lab_date", None),
+                    getattr(data, "effective_measured_at", None),
+                    getattr(lab_file, "effective_lab_date", getattr(lab_file, "lab_date", None)),
                     getattr(lab_file, "uploaded_at", None),
                 ),
                 "marker_name": getattr(data, "marker_name", None) or getattr(measurement_type, "name", None),
-                "canonical_unit": data.canonical_unit or getattr(measurement_type, "canonical_unit", None),
-                "canonical_value": data.canonical_value,
+                "canonical_unit": getattr(data, "effective_canonical_unit", None),
+                "canonical_value": getattr(data, "effective_canonical_value", None),
                 "original_value": data.original_value,
                 "original_qualitative_value": data.original_qualitative_value,
-                "qualitative_bool": data.qualitative_bool,
-                "qualitative_value": data.qualitative_value,
-                "original_unit": data.original_unit,
+                "qualitative_bool": getattr(data, "effective_qualitative_bool", None),
+                "qualitative_value": getattr(data, "effective_qualitative_value", None),
+                "original_unit": getattr(data, "effective_original_unit", None),
                 "unit_conversion_missing": bool(getattr(data, "unit_conversion_missing", False)),
-                "canonical_reference_low": data.canonical_reference_low,
-                "canonical_reference_high": data.canonical_reference_high,
+                "canonical_reference_low": getattr(data, "effective_canonical_reference_low", None),
+                "canonical_reference_high": getattr(data, "effective_canonical_reference_high", None),
                 "original_reference_low": data.original_reference_low,
                 "original_reference_high": data.original_reference_high,
                 "measured_at": data.measured_at,
                 "page_number": data.page_number,
+                "has_user_edits": bool(getattr(data, "has_user_edits", False)),
+                "user_edited_fields": list(getattr(data, "user_edited_fields", [])),
             }
         return data
 
@@ -243,6 +261,33 @@ def _normalize_optional_text(value: Any) -> str | None:
         return None
     normalized = str(value).strip()
     return normalized or None
+
+
+_QUALITATIVE_BOOL_EXPR_RE = re.compile(
+    r"^(?P<bool>true|false)\s*\(\s*(?P<quote>['\"])(?P<label>.*)(?P=quote)\s*\)\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_qualitative_expression(value: str | None) -> tuple[str | None, bool | None]:
+    normalized = _normalize_optional_text(value)
+    if normalized is None:
+        return None, None
+
+    match = _QUALITATIVE_BOOL_EXPR_RE.fullmatch(normalized)
+    if match is not None:
+        bool_text = match.group("bool").casefold()
+        label = match.group("label").strip()
+        return (label or None, bool_text == "true")
+
+    if normalized.casefold() == "true":
+        return "Positive", True
+    if normalized.casefold() == "false":
+        return "Negative", False
+
+    if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {'"', "'"}:
+        normalized = normalized[1:-1].strip()
+    return (normalized or None, None)
 
 
 class MedicationEpisodeWrite(BaseModel):
@@ -395,6 +440,83 @@ class TimelineEventOut(BaseModel):
 
 class TagsUpdate(BaseModel):
     tags: list[str]
+
+
+class FilePatchRequest(BaseModel):
+    filename: str | None = None
+    lab_date: datetime | None = None
+    reset_fields: list[Literal["lab_date"]] = Field(default_factory=list)
+
+    @field_validator("filename", mode="before")
+    @classmethod
+    def _normalize_filename(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        return _normalize_required_text(value, "filename")
+
+    @model_validator(mode="after")
+    def _validate_change_set(self):
+        changed_fields = set(self.model_fields_set) - {"reset_fields"}
+        if not changed_fields and not self.reset_fields:
+            raise ValueError("Provide at least one field to update or reset.")
+        return self
+
+
+MeasurementResetField = Literal[
+    "canonical_value",
+    "canonical_unit",
+    "original_unit",
+    "canonical_reference_low",
+    "canonical_reference_high",
+    "measured_at",
+    "qualitative",
+]
+
+
+class MeasurementPatchRequest(BaseModel):
+    canonical_value: float | None = None
+    canonical_unit: str | None = None
+    original_unit: str | None = None
+    canonical_reference_low: float | None = None
+    canonical_reference_high: float | None = None
+    measured_at: datetime | None = None
+    qualitative_expression: str | None = None
+    reset_fields: list[MeasurementResetField] = Field(default_factory=list)
+
+    @field_validator("canonical_unit", "original_unit", "qualitative_expression", mode="before")
+    @classmethod
+    def _normalize_text_fields(cls, value: Any) -> str | None:
+        return _normalize_optional_text(value)
+
+    @model_validator(mode="after")
+    def _validate_change_set(self):
+        changed_fields = set(self.model_fields_set) - {"reset_fields"}
+        if not changed_fields and not self.reset_fields:
+            raise ValueError("Provide at least one field to update or reset.")
+        return self
+
+
+class MarkerPatchRequest(BaseModel):
+    name: str | None = None
+    canonical_unit: str | None = None
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _normalize_name(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        return _normalize_required_text(value, "name")
+
+    @field_validator("canonical_unit", mode="before")
+    @classmethod
+    def _normalize_canonical_unit(cls, value: Any) -> str | None:
+        return _normalize_optional_text(value)
+
+    @model_validator(mode="after")
+    def _validate_change_set(self):
+        if not self.model_fields_set:
+            raise ValueError("Provide at least one field to update.")
+        return self
 
 
 class SearchSnippet(BaseModel):

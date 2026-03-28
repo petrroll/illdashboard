@@ -21,6 +21,14 @@ class Base(DeclarativeBase):
     pass
 
 
+class SchemaMigration(Base):
+    __tablename__ = "schema_migrations"
+
+    version: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+
 class LabFile(Base):
     __tablename__ = "lab_files"
 
@@ -39,6 +47,8 @@ class LabFile(Base):
     ocr_text_english: Mapped[str | None] = mapped_column(Text, nullable=True)
     ocr_summary_english: Mapped[str | None] = mapped_column(Text, nullable=True)
     lab_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    user_lab_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    user_lab_date_override: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     text_assembled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     summary_generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -74,6 +84,21 @@ class LabFile(Base):
     @property
     def is_complete(self) -> bool:
         return self.status == COMPLETE_FILE_STATUS
+
+    @property
+    def effective_lab_date(self) -> datetime | None:
+        return self.user_lab_date if self.user_lab_date_override else self.lab_date
+
+    @property
+    def user_edited_fields(self) -> list[str]:
+        fields: list[str] = []
+        if self.user_lab_date_override:
+            fields.append("lab_date")
+        return fields
+
+    @property
+    def has_user_edits(self) -> bool:
+        return bool(self.user_edited_fields)
 
 
 class MeasurementBatch(Base):
@@ -197,6 +222,23 @@ class Measurement(Base):
     original_reference_high: Mapped[float | None] = mapped_column(Float, nullable=True)
     canonical_reference_low: Mapped[float | None] = mapped_column(Float, nullable=True)
     canonical_reference_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    user_original_unit: Mapped[str | None] = mapped_column(String, nullable=True)
+    user_original_unit_override: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    user_canonical_unit: Mapped[str | None] = mapped_column(String, nullable=True)
+    user_canonical_unit_override: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    user_canonical_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    user_canonical_value_override: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    user_qualitative_value: Mapped[str | None] = mapped_column(String, nullable=True)
+    user_qualitative_value_override: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    user_qualitative_bool: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    user_qualitative_bool_override: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    user_canonical_reference_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    user_canonical_reference_low_override: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    user_canonical_reference_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    user_canonical_reference_high_override: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    user_measured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    user_measured_at_override: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    user_edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     measured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     batch_key: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
@@ -223,6 +265,73 @@ class Measurement(Base):
         if self.measurement_type is not None and self.measurement_type.group_name:
             return self.measurement_type.group_name
         return DEFAULT_GROUP_NAME
+
+    @property
+    def effective_original_unit(self) -> str | None:
+        return self.user_original_unit if self.user_original_unit_override else self.original_unit
+
+    @property
+    def effective_canonical_unit(self) -> str | None:
+        if self.user_canonical_unit_override:
+            return self.user_canonical_unit
+        if self.canonical_unit is not None:
+            return self.canonical_unit
+        if self.measurement_type is not None:
+            return self.measurement_type.canonical_unit
+        return None
+
+    @property
+    def effective_canonical_value(self) -> float | None:
+        return self.user_canonical_value if self.user_canonical_value_override else self.canonical_value
+
+    @property
+    def effective_qualitative_value(self) -> str | None:
+        return self.user_qualitative_value if self.user_qualitative_value_override else self.qualitative_value
+
+    @property
+    def effective_qualitative_bool(self) -> bool | None:
+        return self.user_qualitative_bool if self.user_qualitative_bool_override else self.qualitative_bool
+
+    @property
+    def effective_canonical_reference_low(self) -> float | None:
+        if self.user_canonical_reference_low_override:
+            return self.user_canonical_reference_low
+        return self.canonical_reference_low
+
+    @property
+    def effective_canonical_reference_high(self) -> float | None:
+        if self.user_canonical_reference_high_override:
+            return self.user_canonical_reference_high
+        return self.canonical_reference_high
+
+    @property
+    def effective_measured_at(self) -> datetime | None:
+        return self.user_measured_at if self.user_measured_at_override else self.measured_at
+
+    @property
+    def user_edited_fields(self) -> list[str]:
+        fields: list[str] = []
+        if self.user_canonical_value_override:
+            fields.append("canonical_value")
+        if self.user_canonical_unit_override:
+            fields.append("canonical_unit")
+        if self.user_original_unit_override:
+            fields.append("original_unit")
+        if self.user_qualitative_value_override:
+            fields.append("qualitative_value")
+        if self.user_qualitative_bool_override:
+            fields.append("qualitative_bool")
+        if self.user_canonical_reference_low_override:
+            fields.append("canonical_reference_low")
+        if self.user_canonical_reference_high_override:
+            fields.append("canonical_reference_high")
+        if self.user_measured_at_override:
+            fields.append("measured_at")
+        return fields
+
+    @property
+    def has_user_edits(self) -> bool:
+        return bool(self.user_edited_fields)
 
 
 class LabFileTag(Base):

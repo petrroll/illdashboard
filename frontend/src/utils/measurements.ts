@@ -287,6 +287,179 @@ export function getOriginalMeasurementReferenceHigh(
   return measurement.original_reference_high ?? measurement.canonical_reference_high;
 }
 
+export function getDisplayedMeasurementValue(
+  measurement: Pick<
+    Measurement,
+    "unit_conversion_missing" | "canonical_value" | "original_value" | "user_edited_fields"
+  >,
+) {
+  if (!isUnitConversionMissing(measurement)) {
+    return measurement.canonical_value;
+  }
+  // Missing conversion rules still keep the row in original units, but once the
+  // user edits the visible value we should prefer that override instead of
+  // snapping the UI back to the raw pipeline fallback.
+  return hasEditedMeasurementField(measurement, "canonical_value")
+    ? measurement.canonical_value
+    : getOriginalMeasurementValue(measurement);
+}
+
+export function getDisplayedMeasurementReferenceLow(
+  measurement: Pick<
+    Measurement,
+    | "unit_conversion_missing"
+    | "original_reference_low"
+    | "canonical_reference_low"
+    | "user_edited_fields"
+  >,
+) {
+  if (!isUnitConversionMissing(measurement)) {
+    return measurement.canonical_reference_low;
+  }
+  return hasEditedMeasurementField(measurement, "canonical_reference_low")
+    ? measurement.canonical_reference_low
+    : getOriginalMeasurementReferenceLow(measurement);
+}
+
+export function getDisplayedMeasurementReferenceHigh(
+  measurement: Pick<
+    Measurement,
+    | "unit_conversion_missing"
+    | "original_reference_high"
+    | "canonical_reference_high"
+    | "user_edited_fields"
+  >,
+) {
+  if (!isUnitConversionMissing(measurement)) {
+    return measurement.canonical_reference_high;
+  }
+  return hasEditedMeasurementField(measurement, "canonical_reference_high")
+    ? measurement.canonical_reference_high
+    : getOriginalMeasurementReferenceHigh(measurement);
+}
+
+export function looksLikeQualitativeExpression(value: string) {
+  const normalized = value.trim();
+  if (!normalized) {
+    return false;
+  }
+  if (/^(true|false)\b/i.test(normalized)) {
+    return true;
+  }
+  return normalized.length >= 2
+    && normalized[0] === normalized[normalized.length - 1]
+    && (`"'`.includes(normalized[0]));
+}
+
+export function formatEditableQualitativeValue(
+  measurement: Pick<Measurement, "qualitative_value" | "qualitative_bool">,
+) {
+  if (!measurement.qualitative_value) {
+    return "";
+  }
+  if (measurement.qualitative_bool === true) {
+    return measurement.qualitative_value === "Positive"
+      ? "true"
+      : `true("${measurement.qualitative_value}")`;
+  }
+  if (measurement.qualitative_bool === false) {
+    return measurement.qualitative_value === "Negative"
+      ? "false"
+      : `false("${measurement.qualitative_value}")`;
+  }
+  return `"${measurement.qualitative_value}"`;
+}
+
+export function formatEditableMeasurementValue(
+  measurement: Pick<
+    Measurement,
+    | "qualitative_value"
+    | "qualitative_bool"
+    | "unit_conversion_missing"
+    | "canonical_value"
+    | "original_value"
+    | "user_edited_fields"
+  >,
+) {
+  if (measurement.qualitative_value != null) {
+    return formatEditableQualitativeValue(measurement);
+  }
+  const numericValue = getDisplayedMeasurementValue(measurement);
+  return numericValue == null ? "" : String(numericValue);
+}
+
+export function formatEditableMeasurementUnits(
+  measurement: Pick<Measurement, "canonical_unit" | "original_unit">,
+) {
+  const canonicalUnit = measurement.canonical_unit?.trim() ?? "";
+  const originalUnit = measurement.original_unit?.trim() ?? "";
+  if (!canonicalUnit) {
+    return originalUnit;
+  }
+  if (!originalUnit || areUnitsEquivalent(canonicalUnit, originalUnit)) {
+    return canonicalUnit;
+  }
+  return `${canonicalUnit} | ${originalUnit}`;
+}
+
+export function formatEditableMeasurementReferenceRange(
+  measurement: Pick<
+    Measurement,
+    | "unit_conversion_missing"
+    | "original_reference_low"
+    | "original_reference_high"
+    | "canonical_reference_low"
+    | "canonical_reference_high"
+    | "user_edited_fields"
+  >,
+) {
+  const low = getDisplayedMeasurementReferenceLow(measurement);
+  const high = getDisplayedMeasurementReferenceHigh(measurement);
+  const formattedLow = low == null ? "" : String(low);
+  const formattedHigh = high == null ? "" : String(high);
+  if (!formattedLow && !formattedHigh) {
+    return "";
+  }
+  return `${formattedLow}-${formattedHigh}`;
+}
+
+export function parseEditableReferenceRange(value: string) {
+  const normalized = value.trim();
+  if (!normalized) {
+    return {
+      canonical_reference_low: null,
+      canonical_reference_high: null,
+    };
+  }
+
+  const match = normalized.match(
+    /^\s*(?<low>-?(?:\d+(?:\.\d+)?|\.\d+)?)?\s*(?:-|–|—)\s*(?<high>-?(?:\d+(?:\.\d+)?|\.\d+)?)?\s*$/,
+  );
+  if (!match?.groups) {
+    throw new Error("Use low-high, low-, or -high.");
+  }
+
+  const lowText = match.groups.low?.trim() ?? "";
+  const highText = match.groups.high?.trim() ?? "";
+  const low = lowText ? Number(lowText) : null;
+  const high = highText ? Number(highText) : null;
+  if ((lowText && !Number.isFinite(low)) || (highText && !Number.isFinite(high))) {
+    throw new Error("Reference bounds must be valid numbers.");
+  }
+  return {
+    canonical_reference_low: low,
+    canonical_reference_high: high,
+  };
+}
+
+export function hasEditedMeasurementField(
+  measurement: Pick<Measurement, "user_edited_fields">,
+  ...fieldNames: string[]
+) {
+  const editedFields = new Set(measurement.user_edited_fields ?? []);
+  return fieldNames.some((fieldName) => editedFields.has(fieldName));
+}
+
 export function formatPreferredMeasurementValue(
   measurement: Pick<
     Measurement,
@@ -296,11 +469,12 @@ export function formatPreferredMeasurementValue(
     | "qualitative_value"
     | "original_value"
     | "original_unit"
+    | "user_edited_fields"
   >,
 ) {
   return isUnitConversionMissing(measurement)
     ? formatMeasurementValue(
-        getOriginalMeasurementValue(measurement),
+        getDisplayedMeasurementValue(measurement),
         getOriginalMeasurementUnit(measurement),
         measurement.qualitative_value,
       )
@@ -318,11 +492,12 @@ export function formatPreferredMeasurementScalarValue(
     | "canonical_value"
     | "qualitative_value"
     | "original_value"
+    | "user_edited_fields"
   >,
 ) {
   return isUnitConversionMissing(measurement)
     ? formatMeasurementScalarValue(
-        getOriginalMeasurementValue(measurement),
+        getDisplayedMeasurementValue(measurement),
         measurement.qualitative_value,
       )
     : formatMeasurementScalarValue(
@@ -348,12 +523,13 @@ export function formatPreferredReferenceRange(
     | "original_reference_high"
     | "canonical_reference_low"
     | "canonical_reference_high"
+    | "user_edited_fields"
   >,
 ) {
   return isUnitConversionMissing(measurement)
     ? formatReferenceRange(
-        getOriginalMeasurementReferenceLow(measurement),
-        getOriginalMeasurementReferenceHigh(measurement),
+        getDisplayedMeasurementReferenceLow(measurement),
+        getDisplayedMeasurementReferenceHigh(measurement),
       )
     : formatReferenceRange(
         measurement.canonical_reference_low,
@@ -376,6 +552,12 @@ export function getCanonicalTrendValue(
   measurement: Pick<Measurement, "unit_conversion_missing" | "canonical_value">,
 ) {
   return isUnitConversionMissing(measurement) ? null : measurement.canonical_value;
+}
+
+export function getEffectiveMeasuredAt(
+  measurement: Pick<Measurement, "effective_measured_at" | "measured_at">,
+) {
+  return measurement.effective_measured_at ?? measurement.measured_at ?? null;
 }
 
 export function formatDate(value: string | null, options?: Intl.DateTimeFormatOptions) {
@@ -438,13 +620,13 @@ export function getMeasurementStatusClassName(
 
   const conversionMissing = isUnitConversionMissing(measurement);
   const statusValue = conversionMissing
-    ? getOriginalMeasurementValue(measurement)
+    ? getDisplayedMeasurementValue(measurement)
     : measurement.canonical_value;
   const statusReferenceLow = conversionMissing
-    ? getOriginalMeasurementReferenceLow(measurement)
+    ? getDisplayedMeasurementReferenceLow(measurement)
     : measurement.canonical_reference_low ?? fallbackReferenceLow;
   const statusReferenceHigh = conversionMissing
-    ? getOriginalMeasurementReferenceHigh(measurement)
+    ? getDisplayedMeasurementReferenceHigh(measurement)
     : measurement.canonical_reference_high ?? fallbackReferenceHigh;
 
   return getMeasurementValueClass({

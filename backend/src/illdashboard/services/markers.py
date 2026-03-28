@@ -7,7 +7,7 @@ import re
 import unicodedata
 from collections import defaultdict
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -86,6 +86,51 @@ NO_RANGE_TAG = f"{RANGE_TAG_PREFIX}noRange"
 SOURCE_TAG_PREFIX = "source:"
 
 
+def effective_lab_date_sql():
+    return case((LabFile.user_lab_date_override.is_(True), LabFile.user_lab_date), else_=LabFile.lab_date)
+
+
+def effective_measurement_timestamp_sql():
+    return func.coalesce(
+        case(
+            (Measurement.user_measured_at_override.is_(True), Measurement.user_measured_at),
+            else_=Measurement.measured_at,
+        ),
+        effective_lab_date_sql(),
+        LabFile.uploaded_at,
+    )
+
+
+def effective_measurement_value(measurement: Measurement) -> float | None:
+    return getattr(measurement, "effective_canonical_value", measurement.canonical_value)
+
+
+def effective_measurement_unit(measurement: Measurement) -> str | None:
+    return getattr(measurement, "effective_canonical_unit", measurement.canonical_unit)
+
+
+def marker_canonical_unit(measurement: Measurement) -> str | None:
+    if measurement.measurement_type is not None:
+        return measurement.measurement_type.canonical_unit
+    return effective_measurement_unit(measurement)
+
+
+def effective_measurement_qualitative_value(measurement: Measurement) -> str | None:
+    return getattr(measurement, "effective_qualitative_value", measurement.qualitative_value)
+
+
+def effective_measurement_qualitative_bool(measurement: Measurement) -> bool | None:
+    return getattr(measurement, "effective_qualitative_bool", measurement.qualitative_bool)
+
+
+def effective_measurement_reference_low(measurement: Measurement) -> float | None:
+    return getattr(measurement, "effective_canonical_reference_low", measurement.canonical_reference_low)
+
+
+def effective_measurement_reference_high(measurement: Measurement) -> float | None:
+    return getattr(measurement, "effective_canonical_reference_high", measurement.canonical_reference_high)
+
+
 def normalize_source_tag_value(value: str) -> str:
     normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
     normalized = normalized.casefold().strip()
@@ -150,13 +195,13 @@ def measurement_range_tag_bucket(
     reference_high: float | None = None,
 ) -> str:
     effective_reference_low = (
-        measurement.canonical_reference_low
-        if measurement.canonical_reference_low is not None
+        effective_measurement_reference_low(measurement)
+        if effective_measurement_reference_low(measurement) is not None
         else reference_low
     )
     effective_reference_high = (
-        measurement.canonical_reference_high
-        if measurement.canonical_reference_high is not None
+        effective_measurement_reference_high(measurement)
+        if effective_measurement_reference_high(measurement) is not None
         else reference_high
     )
     status = measurement_status_for_range(
@@ -476,7 +521,7 @@ async def load_measurements_for_marker(db: AsyncSession, marker_name: str) -> li
         )
         .where(Measurement.measurement_type_id == measurement_type.id)
         .order_by(
-            func.coalesce(Measurement.measured_at, LabFile.lab_date, LabFile.uploaded_at).asc(),
+            effective_measurement_timestamp_sql().asc(),
             Measurement.id.asc(),
         )
     )
@@ -542,8 +587,8 @@ async def merge_measurement_types(source: MeasurementType, target: MeasurementTy
 def measurement_status(measurement: Measurement) -> str:
     return measurement_status_for_range(
         measurement,
-        measurement.canonical_reference_low,
-        measurement.canonical_reference_high,
+        effective_measurement_reference_low(measurement),
+        effective_measurement_reference_high(measurement),
     )
 
 
@@ -553,22 +598,22 @@ def measurement_status_for_range(
     reference_high: float | None,
 ) -> str:
     comparator_status = qualitative_values.infer_threshold_range_status(
-        measurement.qualitative_value,
+        effective_measurement_qualitative_value(measurement),
         reference_low=reference_low,
         reference_high=reference_high,
     )
     if comparator_status is not None:
         return comparator_status
 
-    if measurement.qualitative_bool is True:
+    if effective_measurement_qualitative_bool(measurement) is True:
         return "positive"
-    if measurement.qualitative_bool is False:
+    if effective_measurement_qualitative_bool(measurement) is False:
         return "negative"
 
     if getattr(measurement, "unit_conversion_missing", False):
         return "no_range"
 
-    value = measurement.canonical_value
+    value = effective_measurement_value(measurement)
     if value is None:
         return "no_range"
 
@@ -584,8 +629,8 @@ def measurement_status_for_range(
 def range_position(measurement: Measurement) -> float | None:
     return range_position_for_range(
         measurement,
-        measurement.canonical_reference_low,
-        measurement.canonical_reference_high,
+        effective_measurement_reference_low(measurement),
+        effective_measurement_reference_high(measurement),
     )
 
 
@@ -597,7 +642,7 @@ def range_position_for_range(
     if getattr(measurement, "unit_conversion_missing", False):
         return None
 
-    value = measurement.canonical_value
+    value = effective_measurement_value(measurement)
 
     if value is None or reference_low is None or reference_high is None or reference_high <= reference_low:
         return None
@@ -612,10 +657,12 @@ def latest_reference_range_for_history(measurements: list[Measurement]) -> tuple
     if getattr(latest, "unit_conversion_missing", False):
         return None, None
 
-    if latest.canonical_reference_low is not None or latest.canonical_reference_high is not None:
-        return latest.canonical_reference_low, latest.canonical_reference_high
+    latest_reference_low = effective_measurement_reference_low(latest)
+    latest_reference_high = effective_measurement_reference_high(latest)
+    if latest_reference_low is not None or latest_reference_high is not None:
+        return latest_reference_low, latest_reference_high
 
-    if latest.canonical_value is None:
+    if effective_measurement_value(latest) is None:
         return None, None
 
     # Follow-up reports often omit the range even though the biomarker still has a
@@ -623,8 +670,10 @@ def latest_reference_range_for_history(measurements: list[Measurement]) -> tuple
     for measurement in reversed(measurements):
         if getattr(measurement, "unit_conversion_missing", False):
             continue
-        if measurement.canonical_reference_low is not None or measurement.canonical_reference_high is not None:
-            return measurement.canonical_reference_low, measurement.canonical_reference_high
+        reference_low = effective_measurement_reference_low(measurement)
+        reference_high = effective_measurement_reference_high(measurement)
+        if reference_low is not None or reference_high is not None:
+            return reference_low, reference_high
 
     return None, None
 
@@ -633,18 +682,23 @@ def build_marker_payload(measurements: list[Measurement]) -> dict:
     latest = measurements[-1]
     previous = measurements[-2] if len(measurements) > 1 else None
     reference_low, reference_high = latest_reference_range_for_history(measurements)
-    has_numeric_history = any(measurement.canonical_value is not None for measurement in measurements)
-    has_qualitative_trend = sum(measurement.qualitative_bool is not None for measurement in measurements) > 1
+    has_numeric_history = any(effective_measurement_value(measurement) is not None for measurement in measurements)
+    has_qualitative_trend = (
+        sum(effective_measurement_qualitative_bool(measurement) is not None for measurement in measurements) > 1
+    )
     values = [
-        measurement.canonical_value
+        effective_measurement_value(measurement)
         for measurement in measurements
-        if measurement.canonical_value is not None and not getattr(measurement, "unit_conversion_missing", False)
+        if (
+            effective_measurement_value(measurement) is not None
+            and not getattr(measurement, "unit_conversion_missing", False)
+        )
     ]
     return {
         "marker_name": latest.marker_name,
         "aliases": measurement_alias_names(latest.measurement_type),
         "group_name": latest.group_name,
-        "canonical_unit": latest.canonical_unit,
+        "canonical_unit": marker_canonical_unit(latest),
         "latest_measurement": latest,
         "previous_measurement": previous,
         "reference_low": reference_low,

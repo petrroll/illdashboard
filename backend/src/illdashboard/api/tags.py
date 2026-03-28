@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -37,7 +37,7 @@ async def list_marker_tags(db: AsyncSession = Depends(get_db)):
         .where(Measurement.normalization_status == VISIBLE_MEASUREMENT_STATUS)
         .order_by(
             MeasurementType.name.asc(),
-            func.coalesce(Measurement.measured_at, LabFile.lab_date, LabFile.uploaded_at).asc(),
+            marker_service.effective_measurement_timestamp_sql().asc(),
             Measurement.id.asc(),
         )
     )

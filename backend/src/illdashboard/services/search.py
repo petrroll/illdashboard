@@ -7,8 +7,10 @@ from collections import defaultdict
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from illdashboard.models import COMPLETE_FILE_STATUS, LabFileTag, Measurement, MeasurementType
+from illdashboard.services import markers as marker_service
 
 SEARCH_TABLE_NAME = "lab_file_search"
 
@@ -71,16 +73,32 @@ async def ensure_search_schema(db: AsyncSession) -> None:
 
 async def refresh_lab_search_document(file_id: int, db: AsyncSession) -> None:
     file_result = await db.execute(
+        select(Measurement)
+        .options(selectinload(Measurement.measurement_type))
+        .where(Measurement.lab_file_id == file_id, Measurement.normalization_status == "resolved")
+        .order_by(Measurement.id.asc())
+    )
+    measurements = list(file_result.scalars().all())
+
+    lab_file_result = await db.execute(
         text(
             """
-            SELECT filename, ocr_summary_english, ocr_text_raw, ocr_text_english, status
+            SELECT
+                filename,
+                ocr_summary_english,
+                ocr_text_raw,
+                ocr_text_english,
+                status,
+                lab_date,
+                user_lab_date,
+                user_lab_date_override
             FROM lab_files
             WHERE id = :file_id
             """
         ),
         {"file_id": file_id},
     )
-    row = file_result.mappings().first()
+    row = lab_file_result.mappings().first()
     if row is None:
         return
     if row["status"] != COMPLETE_FILE_STATUS:
@@ -92,18 +110,16 @@ async def refresh_lab_search_document(file_id: int, db: AsyncSession) -> None:
     )
     tags = tag_result.scalars().all()
 
-    measurement_result = await db.execute(
-        select(
-            MeasurementType.name,
-            Measurement.canonical_value,
-            Measurement.qualitative_value,
-            Measurement.canonical_unit,
+    measurement_rows = [
+        (
+            measurement.marker_name,
+            marker_service.effective_measurement_value(measurement),
+            marker_service.effective_measurement_qualitative_value(measurement),
+            marker_service.effective_measurement_unit(measurement),
         )
-        .join(Measurement.measurement_type)
-        .where(Measurement.lab_file_id == file_id, Measurement.normalization_status == "resolved")
-        .order_by(MeasurementType.name.asc(), Measurement.id.asc())
-    )
-    measurement_rows = measurement_result.all()
+        for measurement in measurements
+        if measurement.measurement_type is not None
+    ]
 
     await db.execute(text(f"DELETE FROM {SEARCH_TABLE_NAME} WHERE rowid = :file_id"), {"file_id": file_id})
     await db.execute(
@@ -181,7 +197,10 @@ async def search_lab_files(raw_query: str, tags: list[str], db: AsyncSession, *,
             lf.id AS file_id,
             lf.filename,
             lf.uploaded_at,
-            lf.lab_date,
+            CASE
+                WHEN lf.user_lab_date_override THEN lf.user_lab_date
+                ELSE lf.lab_date
+            END AS lab_date,
             snippet({SEARCH_TABLE_NAME}, 2, '', '', ' … ', 20) AS summary_snippet,
             snippet({SEARCH_TABLE_NAME}, 4, '', '', ' … ', 20) AS translated_snippet,
             snippet({SEARCH_TABLE_NAME}, 3, '', '', ' … ', 20) AS raw_snippet,

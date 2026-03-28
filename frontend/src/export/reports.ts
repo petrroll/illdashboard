@@ -12,11 +12,7 @@ import {
   formatPreferredReferenceRange,
   getCanonicalTrendValue,
   getDisplayUnit,
-  getMeasurementValueClass,
-  getOriginalMeasurementReferenceHigh,
-  getOriginalMeasurementReferenceLow,
-  getOriginalMeasurementValue,
-  isUnitConversionMissing,
+  getMeasurementStatusClassName,
 } from "../utils/measurements";
 import {
   getShareExportMarkerSparklineUrl,
@@ -180,23 +176,11 @@ function getMeasurementValueClassName(
   fallbackReferenceLow: number | null,
   fallbackReferenceHigh: number | null,
 ) {
-  const conversionMissing = isUnitConversionMissing(measurement);
-  const statusValue = conversionMissing
-    ? getOriginalMeasurementValue(measurement)
-    : measurement.canonical_value;
-  const statusReferenceLow = conversionMissing
-    ? getOriginalMeasurementReferenceLow(measurement)
-    : measurement.canonical_reference_low ?? fallbackReferenceLow;
-  const statusReferenceHigh = conversionMissing
-    ? getOriginalMeasurementReferenceHigh(measurement)
-    : measurement.canonical_reference_high ?? fallbackReferenceHigh;
-
-  return getMeasurementValueClass({
-    value: statusValue,
-    reference_low: statusReferenceLow,
-    reference_high: statusReferenceHigh,
-    qualitative_bool: measurement.qualitative_bool,
-  });
+  return getMeasurementStatusClassName(
+    measurement,
+    fallbackReferenceLow,
+    fallbackReferenceHigh,
+  );
 }
 
 function getMarkdownRangeEmoji(

@@ -31,6 +31,9 @@ export interface LabFile {
   summary_generated_at: string | null;
   source_resolved_at: string | null;
   search_indexed_at: string | null;
+  has_user_edits?: boolean;
+  user_edited_fields?: string[];
+  has_measurement_edits?: boolean;
   tags: string[];
   progress: FileProgress;
 }
@@ -56,6 +59,8 @@ export interface Measurement {
   original_reference_high?: number | null;
   measured_at: string | null;
   page_number: number | null;
+  has_user_edits?: boolean;
+  user_edited_fields?: string[];
 }
 
 export interface MedicationEpisode {
@@ -205,4 +210,35 @@ export interface SearchResult {
   tags: string[];
   marker_names: string[];
   snippets: SearchSnippet[];
+}
+
+export interface FilePatchPayload {
+  filename?: string | null;
+  lab_date?: string | null;
+  reset_fields?: Array<"lab_date">;
+}
+
+export type MeasurementResetField =
+  | "canonical_value"
+  | "canonical_unit"
+  | "original_unit"
+  | "canonical_reference_low"
+  | "canonical_reference_high"
+  | "measured_at"
+  | "qualitative";
+
+export interface MeasurementPatchPayload {
+  canonical_value?: number | null;
+  canonical_unit?: string | null;
+  original_unit?: string | null;
+  canonical_reference_low?: number | null;
+  canonical_reference_high?: number | null;
+  measured_at?: string | null;
+  qualitative_expression?: string | null;
+  reset_fields?: MeasurementResetField[];
+}
+
+export interface MarkerPatchPayload {
+  name?: string;
+  canonical_unit?: string | null;
 }

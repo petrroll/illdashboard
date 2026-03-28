@@ -11,11 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from illdashboard import config
 from illdashboard.database import create_database_engine, dispose_database_engine, get_db
+from illdashboard.database_migrations import prepare_main_database
 from illdashboard.medications_database import dispose_medications_engine, get_medications_db
 from illdashboard.medications_models import MedicationsBase
-from illdashboard.models import Base
-from illdashboard.services.markers import ensure_marker_groups
-from illdashboard.services.search import ensure_search_schema
 
 
 @pytest.fixture
@@ -31,13 +29,7 @@ async def session_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     engine = create_database_engine(db_url)
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    async with factory() as session:
-        await ensure_marker_groups(session)
-        await ensure_search_schema(session)
-        await session.commit()
+    await prepare_main_database(engine)
 
     try:
         yield factory

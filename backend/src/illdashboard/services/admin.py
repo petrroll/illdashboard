@@ -6,11 +6,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.orm import selectinload
 
+from illdashboard.database_migrations import prepare_main_database
 from illdashboard.medications_database import reset_medications_database
 from illdashboard.models import Base, BiomarkerInsight, RescalingRule
 from illdashboard.services import pipeline as pipeline_service
-from illdashboard.services.markers import ensure_marker_groups
-from illdashboard.services.search import ensure_search_schema
 from illdashboard.sparkline import SPARKLINE_CACHE_DIR
 
 
@@ -37,12 +36,9 @@ async def reset_database(database_engine: AsyncEngine) -> int:
     async def perform_reset() -> int:
         async with database_engine.begin() as conn:
             await conn.run_sync(Base.metadata.drop_all)
-            await conn.run_sync(Base.metadata.create_all)
         await reset_medications_database()
+        await prepare_main_database(database_engine)
         async with AsyncSession(database_engine, expire_on_commit=False) as session:
-            await ensure_marker_groups(session)
-            await ensure_search_schema(session)
-            await session.commit()
             await pipeline_service.preload_uploaded_files(session)
         return purge_sparkline_cache()
 

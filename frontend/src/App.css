@@ -157,6 +157,171 @@ button,
   background: var(--accent-subtle);
 }
 
+.inline-edit {
+  display: grid;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.inline-edit-view {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.inline-edit-view:not(.inline-edit-view--readonly) {
+  cursor: text;
+}
+
+.inline-edit-view:not(.inline-edit-view--readonly):hover,
+.inline-edit-view:not(.inline-edit-view--readonly):focus-visible {
+  outline: none;
+}
+
+.inline-edit-display {
+  flex: 1;
+  min-width: 0;
+}
+
+.inline-edit-view-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+/* In table cells, stack the badge below the value to avoid horizontal crowding */
+td .inline-edit-view {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.15rem;
+}
+
+.inline-edit-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.15rem 0.4rem;
+  border-radius: 999px;
+  background: rgba(181, 117, 255, 0.14);
+  color: var(--purple);
+  font-size: 0.72rem;
+  font-weight: 600;
+  border: none;
+}
+
+/* Clickable badge that resets the value on click */
+button.inline-edit-badge--resettable {
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+button.inline-edit-badge--resettable:hover {
+  background: rgba(181, 117, 255, 0.28);
+  color: var(--purple);
+}
+
+.inline-edit-editor {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.inline-edit-input {
+  width: 100%;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+  font-size: 0.875rem;
+}
+
+.inline-edit-input::placeholder {
+  color: var(--text-muted);
+}
+
+.inline-edit-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-subtle);
+}
+
+.inline-edit-input--monospace {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+.inline-edit-input--right {
+  text-align: right;
+}
+
+.inline-edit-actions {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.inline-edit-action {
+  min-width: 0;
+}
+
+.inline-edit-meta {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.inline-edit-hint {
+  color: var(--text-muted);
+  font-size: 0.76rem;
+  line-height: 1.4;
+}
+
+.inline-edit-error {
+  color: var(--danger);
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.file-list-name-cell,
+.file-detail-marker-cell,
+.marker-detail-name-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.file-detail-header-block {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0.5rem 0 1rem;
+}
+
+.file-detail-heading-text {
+  font-size: 1.4rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.file-detail-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+/* Keep the lab-date inline-edit flush with the uploaded-date text so
+   the row reads as a single line, matching the original static layout. */
+.file-detail-meta-row > .inline-edit {
+  display: inline-grid;
+  gap: 0;
+}
+
+.file-detail-meta-row .inline-edit-view {
+  gap: 0.35rem;
+}
+
 /* ── Tables ───────────────────────────────────────────────────── */
 
 table {
@@ -637,18 +802,6 @@ input[type="file"] {
   display: flex;
   justify-content: flex-end;
   margin-bottom: 0.5rem;
-}
-
-.chart-event-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem 1rem;
-  margin-top: 0.65rem;
-  font-size: 0.78rem;
-}
-
-.chart-event-label {
-  white-space: nowrap;
 }
 
 .toggle-switch {
@@ -1188,12 +1341,6 @@ input[type="file"] {
 .export-marker-row span,
 .export-marker-row .marker-row-value span,
 .export-marker-row .marker-row-previous span,
-.detail-canonical-unit {
-  font-size: 0.55em;
-  color: var(--text-muted);
-  font-weight: 400;
-}
-
 .detail-latest-meta,
 .detail-stat-card small {
   color: var(--text-muted);
@@ -1319,6 +1466,53 @@ input[type="file"] {
 
 .detail-group-label {
   margin-bottom: 0.55rem;
+}
+
+/* The marker-detail heading places the name and the canonical unit as two
+   independent inline-edit targets on the same baseline row. The gap keeps
+   them visually separated without the old dedicated "Canonical unit:" row. */
+.marker-detail-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+  min-width: 0;
+  margin-bottom: 1rem;
+}
+
+/* Collapse the inline-edit wrapper boxes so the name and unit sit on
+   a single tight line, matching the original <h2> inline layout. */
+.marker-detail-heading > .inline-edit {
+  display: inline-grid;
+  gap: 0;
+}
+
+.marker-detail-heading .inline-edit-view {
+  justify-content: flex-start;
+  gap: 0.35rem;
+}
+
+.marker-detail-heading .inline-edit-display {
+  flex: 0 1 auto;
+}
+
+.marker-detail-heading .inline-edit-view-actions {
+  align-self: baseline;
+}
+
+.marker-detail-name-text {
+  font-size: 1.4rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.detail-canonical-unit {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.detail-canonical-unit-inline {
+  font-size: 0.77rem;
 }
 
 .detail-summary-grid {

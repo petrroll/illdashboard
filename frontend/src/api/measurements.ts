@@ -8,10 +8,12 @@ import {
   throwUnavailableInShareExport,
 } from "../export/runtime";
 import type {
+  MarkerPatchPayload,
   MarkerDetailResponse,
   MarkerInsightResponse,
   MarkerOverviewGroup,
   Measurement,
+  MeasurementPatchPayload,
 } from "../types";
 
 function buildTagQueryParams(tags: string[]) {
@@ -58,6 +60,28 @@ export async function fetchMarkerDetail(markerName: string) {
   return response.data;
 }
 
+export async function renameMarker(markerName: string, payload: MarkerPatchPayload) {
+  if (isShareExportMode()) {
+    throwUnavailableInShareExport("Renaming biomarkers");
+  }
+  const response = await apiClient.patch<MarkerDetailResponse>(
+    `/markers/${encodeURIComponent(markerName)}`,
+    payload,
+  );
+  return response.data;
+}
+
+export async function patchMarkerCanonicalUnit(markerName: string, canonicalUnit: string) {
+  if (isShareExportMode()) {
+    throwUnavailableInShareExport("Editing biomarker units");
+  }
+  const response = await apiClient.patch<MarkerDetailResponse>(
+    `/markers/${encodeURIComponent(markerName)}`,
+    { canonical_unit: canonicalUnit },
+  );
+  return response.data;
+}
+
 export async function fetchMarkerInsight(markerName: string) {
   if (isShareExportMode()) {
     throwUnavailableInShareExport("Generating biomarker interpretations");
@@ -65,5 +89,13 @@ export async function fetchMarkerInsight(markerName: string) {
   const response = await apiClient.get<MarkerInsightResponse>("/measurements/insight", {
     params: { marker_name: markerName },
   });
+  return response.data;
+}
+
+export async function patchMeasurement(measurementId: string | number, payload: MeasurementPatchPayload) {
+  if (isShareExportMode()) {
+    throwUnavailableInShareExport("Editing measurements");
+  }
+  const response = await apiClient.patch<Measurement>(`/measurements/${measurementId}`, payload);
   return response.data;
 }

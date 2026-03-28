@@ -11,14 +11,14 @@ from pathlib import Path
 import fitz
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from illdashboard.config import settings
 from illdashboard.database import get_db
-from illdashboard.models import LabFile, LabFileTag
-from illdashboard.schemas import BatchOcrRequest, FileProgressOut, LabFileOut, QueueFilesResponse
+from illdashboard.models import LabFile, LabFileTag, Measurement, utc_now
+from illdashboard.schemas import BatchOcrRequest, FilePatchRequest, FileProgressOut, LabFileOut, QueueFilesResponse
 from illdashboard.services import file_types, pipeline, upload_metadata
 from illdashboard.services import search as search_service
 
@@ -49,6 +49,23 @@ def get_page_count(file_path: Path, mime_type: str) -> int:
 
 async def serialize_lab_file(lab: LabFile, db: AsyncSession) -> LabFileOut:
     progress = await pipeline.get_file_progress(db, lab)
+    edited_measurement_result = await db.execute(
+        select(Measurement.id)
+        .where(
+            Measurement.lab_file_id == lab.id,
+            or_(
+                Measurement.user_canonical_value_override,
+                Measurement.user_canonical_unit_override,
+                Measurement.user_original_unit_override,
+                Measurement.user_qualitative_value_override,
+                Measurement.user_qualitative_bool_override,
+                Measurement.user_canonical_reference_low_override,
+                Measurement.user_canonical_reference_high_override,
+                Measurement.user_measured_at_override,
+            ),
+        )
+        .limit(1)
+    )
     raw_tags = lab.__dict__.get("tags", [])
     tags = [tag.tag for tag in raw_tags if hasattr(tag, "tag")]
     return LabFileOut(
@@ -64,12 +81,15 @@ async def serialize_lab_file(lab: LabFile, db: AsyncSession) -> LabFileOut:
         ocr_text_raw=lab.ocr_text_raw,
         ocr_text_english=lab.ocr_text_english,
         ocr_summary_english=lab.ocr_summary_english,
-        lab_date=lab.lab_date,
+        lab_date=lab.effective_lab_date,
         source_name=lab.source_name,
         text_assembled_at=lab.text_assembled_at,
         summary_generated_at=lab.summary_generated_at,
         source_resolved_at=lab.source_resolved_at,
         search_indexed_at=lab.search_indexed_at,
+        has_user_edits=lab.has_user_edits,
+        user_edited_fields=lab.user_edited_fields,
+        has_measurement_edits=edited_measurement_result.scalar_one_or_none() is not None,
         tags=tags,
         progress=FileProgressOut(
             measurement_pages_done=progress.measurement_pages_done,
@@ -85,6 +105,16 @@ async def serialize_lab_file(lab: LabFile, db: AsyncSession) -> LabFileOut:
             is_complete=progress.is_complete,
         ),
     )
+
+
+async def refresh_search_projection(lab: LabFile, db: AsyncSession) -> None:
+    progress = await pipeline.get_file_progress(db, lab)
+    if progress.is_complete:
+        await search_service.refresh_lab_search_document(lab.id, db)
+        lab.search_indexed_at = utc_now()
+    else:
+        await search_service.remove_lab_search_document(lab.id, db)
+        lab.search_indexed_at = None
 
 
 def render_pdf_page(file_path: Path, page_num: int) -> bytes:
@@ -153,6 +183,28 @@ async def list_files(
 
 @router.get("/files/{file_id}", response_model=LabFileOut, tags=["files"])
 async def get_file(file_id: int, db: AsyncSession = Depends(get_db)):
+    return await serialize_lab_file(await get_lab_file_or_404(file_id, db), db)
+
+
+@router.patch("/files/{file_id}", response_model=LabFileOut, tags=["files"])
+async def update_file(file_id: int, body: FilePatchRequest, db: AsyncSession = Depends(get_db)):
+    lab = await get_lab_file_or_404(file_id, db)
+
+    if "filename" in body.model_fields_set:
+        if body.filename is None:
+            raise HTTPException(400, "filename is required")
+        lab.filename = body.filename
+
+    reset_fields = set(body.reset_fields)
+    if "lab_date" in reset_fields:
+        lab.user_lab_date_override = False
+        lab.user_lab_date = None
+    elif "lab_date" in body.model_fields_set:
+        lab.user_lab_date_override = True
+        lab.user_lab_date = body.lab_date
+
+    await refresh_search_projection(lab, db)
+    await db.commit()
     return await serialize_lab_file(await get_lab_file_or_404(file_id, db), db)
 
 

@@ -105,6 +105,9 @@ just dev
 
 If you prefer split terminals, run `just dev-backend` and `just dev-frontend` separately.
 
+> [!NOTE]
+> `just dev-backend` (and `just dev`) automatically applies pending database migrations before starting the server. Use `just migrate-backend` to apply migrations without starting the server.
+
 Then open:
 
 - App: <http://localhost:5173>
@@ -119,8 +122,9 @@ Then open:
 | --- | --- |
 | `just setup` | Install backend and frontend dependencies |
 | `just dev` | Run the backend and frontend dev servers together |
-| `just dev-backend` | Run FastAPI with auto-reload on port `8000` |
+| `just dev-backend` | Apply pending backend migrations, then run FastAPI with auto-reload on port `8000` |
 | `just dev-frontend` | Run the Vite dev server on port `5173` |
+| `just migrate-backend` | Apply pending backend database migrations without starting the server |
 | `just build-backend` | Build the backend Python package |
 | `just build-frontend` | Build the frontend bundle and share-export shell |
 | `just build` | Build both backend and frontend artifacts |

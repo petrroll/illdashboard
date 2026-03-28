@@ -23,14 +23,11 @@ import type {
 import {
   formatDate,
   formatDateTime,
-  formatMeasurementScalarValue,
-  formatReferenceRange,
-  getDisplayUnit,
-  getMeasurementValueClass,
-  getOriginalMeasurementReferenceHigh,
-  getOriginalMeasurementReferenceLow,
-  getOriginalMeasurementUnit,
-  getOriginalMeasurementValue,
+  formatPreferredMeasurementScalarValue,
+  formatPreferredMeasurementUnit,
+  formatPreferredReferenceRange,
+  getEffectiveMeasuredAt,
+  getMeasurementStatusClassName,
 } from "../utils/measurements";
 
 type SettingsAction =
@@ -133,12 +130,12 @@ function ExportSettings() {
           <div style={{ fontSize: "2rem", fontWeight: 700 }}>{bundle?.marker_names.length ?? 0}</div>
           <div style={{ color: "var(--text-muted)" }}>Unique Markers</div>
         </div>
-        <div className="card" style={{ textAlign: "center" }}>
-          <div style={{ fontSize: "2rem", fontWeight: 700 }}>
-            {formatDate(latestMeasurement?.measured_at ?? null)}
+          <div className="card" style={{ textAlign: "center" }}>
+            <div style={{ fontSize: "2rem", fontWeight: 700 }}>
+              {formatDate(getEffectiveMeasuredAt(latestMeasurement ?? { effective_measured_at: null, measured_at: null }))}
+            </div>
+            <div style={{ color: "var(--text-muted)" }}>Latest Result</div>
           </div>
-          <div style={{ color: "var(--text-muted)" }}>Latest Result</div>
-        </div>
         <div className="card" style={{ textAlign: "center" }}>
           <div style={{ fontSize: "2rem", fontWeight: 700 }}>{bundle ? formatDate(bundle.exported_at) : "—"}</div>
           <div style={{ color: "var(--text-muted)" }}>Exported</div>
@@ -220,12 +217,12 @@ function OnlineSettings() {
           <div style={{ fontSize: "2rem", fontWeight: 700 }}>{markers.length}</div>
           <div style={{ color: "var(--text-muted)" }}>Unique Markers</div>
         </div>
-        <div className="card" style={{ textAlign: "center" }}>
-          <div style={{ fontSize: "2rem", fontWeight: 700 }}>
-            {formatDate(latestMeasurement?.measured_at ?? null)}
+          <div className="card" style={{ textAlign: "center" }}>
+            <div style={{ fontSize: "2rem", fontWeight: 700 }}>
+              {formatDate(getEffectiveMeasuredAt(latestMeasurement ?? { effective_measured_at: null, measured_at: null }))}
+            </div>
+            <div style={{ color: "var(--text-muted)" }}>Latest Result</div>
           </div>
-          <div style={{ color: "var(--text-muted)" }}>Latest Result</div>
-        </div>
         <div className="card" style={{ textAlign: "center" }}>
           <div style={{ fontSize: "2rem", fontWeight: 700 }}>
             {copilotRequestCount ?? "—"}
@@ -307,22 +304,17 @@ function OnlineSettings() {
               </tr>
             </thead>
             <tbody>
-              {recentMeasurements.map((m) => {
-                const originalValue = getOriginalMeasurementValue(m);
-                const originalUnit = getOriginalMeasurementUnit(m);
-                const originalReferenceLow = getOriginalMeasurementReferenceLow(m);
-                const originalReferenceHigh = getOriginalMeasurementReferenceHigh(m);
-
-                return (
-                  <tr key={m.id}>
-                    <td>{m.marker_name}</td>
-                    <td className={getMeasurementValueClass({ value: originalValue, reference_low: originalReferenceLow, reference_high: originalReferenceHigh, qualitative_bool: m.qualitative_bool })}>{formatMeasurementScalarValue(originalValue, m.qualitative_value)}</td>
-                    <td>{getDisplayUnit(originalUnit) ?? "—"}</td>
-                    <td>{formatReferenceRange(originalReferenceLow, originalReferenceHigh)}</td>
-                    <td>{formatDate(m.measured_at)}</td>
-                  </tr>
-                );
-              })}
+              {recentMeasurements.map((measurement) => (
+                <tr key={measurement.id}>
+                  <td>{measurement.marker_name}</td>
+                  <td className={getMeasurementStatusClassName(measurement, null, null)}>
+                    {formatPreferredMeasurementScalarValue(measurement)}
+                  </td>
+                  <td>{formatPreferredMeasurementUnit(measurement)}</td>
+                  <td>{formatPreferredReferenceRange(measurement)}</td>
+                  <td>{formatDate(getEffectiveMeasuredAt(measurement))}</td>
+                </tr>
+              ))}
             </tbody>
           </table>
         )}
