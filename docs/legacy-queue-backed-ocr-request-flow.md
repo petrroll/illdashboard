@@ -1,5 +1,8 @@
 # Legacy queue-backed OCR request flow
 
+> [!WARNING]
+> Historical reference only. This document describes the pre-artifact-first reconcile/publish pipeline. For the current runtime, see [`artifact-first-pipeline.md`](./artifact-first-pipeline.md).
+
 This document describes the **old** queue-backed/reconcile/publish pipeline that existed before the artifact-first rewrite.
 
 This version separates the explanation into two smaller views:

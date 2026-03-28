@@ -2,6 +2,8 @@
 
 This document describes the **current** job system and pipeline state after the artifact-first rewrite.
 
+For a broader docs map, start with [`docs/README.md`](./README.md). The old reconcile/publish design lives in [`legacy-queue-backed-ocr-request-flow.md`](./legacy-queue-backed-ocr-request-flow.md) and is historical background only.
+
 It replaces the old `reconcile` / `publish` / `READY` design with:
 
 - durable batch artifacts for measurement OCR and text OCR
@@ -10,6 +12,8 @@ It replaces the old `reconcile` / `publish` / `READY` design with:
 - text-driven summary generation
 - completion-gated search refresh
 - rerun-while-leased job semantics, with normalization lanes serialized by worker topology
+- persistent canonical artifacts for markers, groups, units, conversions, qualitative values, and sources
+- anomalous-rescaling review jobs for suspicious numeric conversions
 
 ## 1) High-level job graph
 
@@ -58,6 +62,16 @@ flowchart TD
 
 `process.measurements` is the only job that makes measurements visible. Canonization jobs only create shared canonical artifacts, then re-request processing.
 
+Canonization is the step that turns OCR-local fields into shared, reusable data:
+
+- `MeasurementAlias` maps raw marker names to a canonical `MeasurementType`
+- `MeasurementType` stores the canonical marker name, group, and canonical unit
+- `MarkerGroup` keeps biomarker grouping stable across the UI
+- `RescalingRule` stores reusable numeric conversion factors for a biomarker and unit pair
+- `QualitativeRule` stores reusable canonical text/boolean mappings for qualitative results
+
+Once those rows exist, later files hit the database first and often skip new model work entirely.
+
 ```mermaid
 flowchart TD
     A["Raw Measurement row"] --> B["process.measurements"]
@@ -97,6 +111,16 @@ flowchart TD
     T --> U
 ```
 
+Numeric unit conversion can add one extra review loop before a measurement settles. When a rescaled value lands far outside the marker's historical envelope, `process.measurements` can either apply a deterministic corrective factor immediately or queue `review.anomalous-rescaling`. That review lane batch-processes suspicious conversions, stores the chosen factor (or an explicit no-change result), and re-requests `process.measurements`.
+
+Automatic conversion follows a strict order:
+
+1. normalize the original and canonical unit keys
+2. if the units are equivalent, copy the numeric value and reference range directly into canonical fields
+3. otherwise, reuse an existing `RescalingRule` or queue `canonize.conversion` to learn one
+4. apply the scale factor to the value and reference range together
+5. if the converted result still looks implausible against resolved history, apply a deterministic correction when possible or queue `review.anomalous-rescaling`
+
 ## 3) Text, summary, source, and search lane
 
 ```mermaid
@@ -120,6 +144,8 @@ flowchart TD
     O -->|yes| P["refresh.search"]
     P --> Q["search_indexed_at"]
 ```
+
+`canonize.source` plays the same reuse game as marker canonization: it stores `SourceAlias` rows so recurring source strings can resolve to a canonical source name without redoing the whole decision each time.
 
 ## 4) Controller, completeness, and startup self-healing
 
@@ -207,8 +233,9 @@ stateDiagram-v2
   - `canonize.unit`
   - `canonize.conversion`
   - `canonize.qualitative`
+  - `review.anomalous-rescaling`
 
-- For those batchable canonization lanes, one worker claims multiple job rows into a single batch session and may call the LLM on that combined batch. The lane still keeps `concurrency = 1`, so only one batch for that lane can run at a time.
+- For those batchable normalization/review lanes, one worker claims multiple job rows into a single batch session and may call the LLM on that combined batch. The lane still keeps `concurrency = 1`, so only one batch for that lane can run at a time.
 - Those lanes now use the same handler path for `1..N` claimed jobs; they do not keep separate single-job handler variants.
 
 ## 6) API / UI projections
@@ -225,6 +252,10 @@ The API no longer exposes old per-stage file columns as pipeline truth.
   - completeness
 - Measurement endpoints expose only `Measurement.normalization_status == resolved`.
 - File detail and file list views render progress from those derived facts rather than from old stage enums.
+- Biomarker views, exports, and search snippets consume canonical marker names, canonical units, converted numeric values, and normalized qualitative values rather than raw OCR tokens.
+- Supported uploads include PDF/image files plus `.txt`/`.md`; text documents behave as single-page text sources for preview, export, and share bundles.
+- Search indexes complete files across filename, tags, summary, raw text, translated text, and measurement text.
+- Share export builds a read-only HTML snapshot from sanitized file projections, page/text previews, measurement data, biomarker views, and search documents; uploads, reprocessing, admin actions, and generated summaries are intentionally disabled there.
 
 ## 7) Why `pipeline.py` is large
 
