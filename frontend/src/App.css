@@ -639,6 +639,18 @@ input[type="file"] {
   margin-bottom: 0.5rem;
 }
 
+.chart-event-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  margin-top: 0.65rem;
+  font-size: 0.78rem;
+}
+
+.chart-event-label {
+  white-space: nowrap;
+}
+
 .toggle-switch {
   display: inline-flex;
   align-items: center;

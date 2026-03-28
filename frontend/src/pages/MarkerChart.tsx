@@ -62,14 +62,26 @@ const DEFAULT_LIST_PANE_WIDTH = 680;
 const MAX_LIST_PANE_WIDTH = 680;
 const MIN_DETAIL_PANE_WIDTH = 380;
 
+// Chart colors: green for in-range/negative, orange for out-of-range/positive,
+// gray for no-range/unknown. Matches the sparkline and status-pill palette.
+const CHART_COLOR_OK = "#22d9a0";
+const CHART_COLOR_OOR = "#f5a254";
+const CHART_COLOR_NEUTRAL = "#96a1ae";
+
 type MarkerChartPoint = {
   dateLabel: string;
   axisDateLabel: string;
   timestamp: number;
+  /** Numeric trend value; null for qualitative-only points. */
   value: number | null;
+  /** Y coordinate for qualitative event diamonds (bottom of chart); null for numeric points. */
+  eventY: number | null;
   reference_low: number | null;
   reference_high: number | null;
   hasEstimatedDate: boolean;
+  statusColor: string;
+  /** Non-null for qualitative-only measurements rendered as event diamonds. */
+  qualitativeLabel: string | null;
 };
 
 function parseMeasuredAtTimestamp(measuredAt: string | null) {
@@ -104,6 +116,26 @@ function getMonthStartTimestamp(timestamp: number) {
 
 function mergeUniqueTags(...tagGroups: string[][]) {
   return Array.from(new Set(tagGroups.flat()));
+}
+
+/** Map a numeric value to a chart color based on reference range bounds. */
+function numericPointColor(
+  value: number | null,
+  refLow: number | null,
+  refHigh: number | null,
+): string {
+  if (value == null) return CHART_COLOR_NEUTRAL;
+  if (refLow != null && value < refLow) return CHART_COLOR_OOR;
+  if (refHigh != null && value > refHigh) return CHART_COLOR_OOR;
+  if (refLow == null && refHigh == null) return CHART_COLOR_NEUTRAL;
+  return CHART_COLOR_OK;
+}
+
+/** Map a qualitative boolean to a chart color. */
+function qualitativeEventColor(qualBool: boolean | null): string {
+  if (qualBool === true) return CHART_COLOR_OOR;
+  if (qualBool === false) return CHART_COLOR_OK;
+  return CHART_COLOR_NEUTRAL;
 }
 
 function getStoredListPaneWidth() {
@@ -361,37 +393,70 @@ export default function MarkerChart() {
     () => measurements.filter((measurement) => getCanonicalTrendValue(measurement) != null),
     [measurements],
   );
+
+  // Build a unified timeline that includes both numeric and qualitative-only
+  // measurements.  Numeric points carry a `value`; qualitative-only points
+  // carry `qualitativeLabel` (value stays null so the Line gaps over them).
   const chartSeries = useMemo(() => {
-    const effectiveMeasuredDates = chartMeasurements.map((measurement) => effectiveMeasuredAt(measurement));
-    const measuredTimestamps = effectiveMeasuredDates.map((measuredAt) => parseMeasuredAtTimestamp(measuredAt));
+    const numericIds = new Set(chartMeasurements.map((m) => m.id));
+    const qualitativeOnly = measurements.filter(
+      (m) => !numericIds.has(m.id) && m.qualitative_value != null,
+    );
+
+    // Merge both sets and sort chronologically so the X axis is ordered.
+    const allForChart = [
+      ...chartMeasurements.map((m) => ({ measurement: m, isQualitative: false })),
+      ...qualitativeOnly.map((m) => ({ measurement: m, isQualitative: true })),
+    ].sort((a, b) => {
+      const tsA = parseMeasuredAtTimestamp(effectiveMeasuredAt(a.measurement));
+      const tsB = parseMeasuredAtTimestamp(effectiveMeasuredAt(b.measurement));
+      return (tsA ?? 0) - (tsB ?? 0);
+    });
+
+    const measuredTimestamps = allForChart.map(({ measurement }) =>
+      parseMeasuredAtTimestamp(effectiveMeasuredAt(measurement)),
+    );
     const firstMeasuredTimestamp = measuredTimestamps.find(
-      (timestamp): timestamp is number => timestamp != null,
+      (ts): ts is number => ts != null,
     ) ?? null;
     const fallbackTimestamp = firstMeasuredTimestamp == null
       ? null
       : getMonthStartTimestamp(firstMeasuredTimestamp);
 
-    return {
-      chartData: chartMeasurements.map<MarkerChartPoint>((measurement, index) => {
-        const effectiveMeasuredDate = effectiveMeasuredDates[index];
-        const measuredTimestamp = measuredTimestamps[index];
-        const axisTimestamp = measuredTimestamp ?? fallbackTimestamp ?? index;
+    const chartData = allForChart.map<MarkerChartPoint>(({ measurement, isQualitative }, index) => {
+      const effectiveDate = effectiveMeasuredAt(measurement);
+      const measuredTimestamp = measuredTimestamps[index];
+      const axisTimestamp = measuredTimestamp ?? fallbackTimestamp ?? index;
+      const pointRefLow = measurement.unit_conversion_missing ? null : measurement.canonical_reference_low;
+      const pointRefHigh = measurement.unit_conversion_missing ? null : measurement.canonical_reference_high;
+      const trendValue = isQualitative ? null : getCanonicalTrendValue(measurement);
 
-        return {
-          dateLabel: formatDate(effectiveMeasuredDate),
-          axisDateLabel: formatTimestampLabel(measuredTimestamp ?? fallbackTimestamp),
-          timestamp: axisTimestamp,
-          value: getCanonicalTrendValue(measurement),
-          reference_low: measurement.unit_conversion_missing ? null : measurement.canonical_reference_low,
-          reference_high: measurement.unit_conversion_missing ? null : measurement.canonical_reference_high,
-          hasEstimatedDate: measurement.measured_at == null && measuredTimestamp != null,
-        };
-      }),
+      return {
+        dateLabel: formatDate(effectiveDate),
+        axisDateLabel: formatTimestampLabel(measuredTimestamp ?? fallbackTimestamp),
+        timestamp: axisTimestamp,
+        value: trendValue,
+        eventY: null, // Filled after Y-axis scale is computed.
+        reference_low: pointRefLow,
+        reference_high: pointRefHigh,
+        hasEstimatedDate: measurement.measured_at == null && measuredTimestamp != null,
+        statusColor: isQualitative
+          ? qualitativeEventColor(measurement.qualitative_bool)
+          : numericPointColor(trendValue, pointRefLow, pointRefHigh),
+        qualitativeLabel: isQualitative ? (measurement.qualitative_value ?? null) : null,
+      };
+    });
+
+    const qualitativeEventCount = allForChart.filter((e) => e.isQualitative).length;
+
+    return {
+      chartData,
       fallbackTimestamp,
       hasMeasuredDates: firstMeasuredTimestamp != null,
-      undatedCount: measuredTimestamps.filter((timestamp) => timestamp == null).length,
+      undatedCount: measuredTimestamps.filter((ts) => ts == null).length,
+      qualitativeEventCount,
     };
-  }, [chartMeasurements]);
+  }, [measurements, chartMeasurements]);
   const chartData = chartSeries.chartData;
   const hasMissingUnitConversions = useMemo(
     () => measurements.some((measurement) => isUnitConversionMissing(measurement)),
@@ -402,6 +467,9 @@ export default function MarkerChart() {
   const timeAxisFallbackLabel = chartSeries.fallbackTimestamp == null
     ? null
     : formatTimestampLabel(chartSeries.fallbackTimestamp);
+
+  // Show the chart whenever there is anything to display (numeric points or qualitative events).
+  const hasChartContent = chartData.length > 0;
 
   const totalMarkers = overview.reduce((count, group) => count + group.markers.length, 0);
   const selectedOverviewItem = useMemo(
@@ -450,6 +518,17 @@ export default function MarkerChart() {
     });
   }, [chartMeasurements, refLow, refHigh]);
 
+  // Fill in eventY for qualitative points now that the Y-axis domain is known.
+  // Placed at the bottom of the chart so they sit on the axis without
+  // interfering with the numeric trend line.
+  const enrichedChartData = useMemo(() => {
+    if (chartSeries.qualitativeEventCount === 0) return chartData;
+    const bottomY = yAxisScale.domain[0];
+    return chartData.map((point) =>
+      point.qualitativeLabel != null ? { ...point, eventY: bottomY } : point,
+    );
+  }, [chartData, yAxisScale, chartSeries.qualitativeEventCount]);
+
   const toggleGroupCollapsed = (groupName: string) => {
     setCollapsedGroups((previous) => {
       const next = new Set(previous);
@@ -473,11 +552,6 @@ export default function MarkerChart() {
       setSearchParams(nextParams, { replace: true, preventScrollReset: true });
     });
   };
-  const hideDetailTrendChart = Boolean(
-    detail
-      && !detail.has_numeric_history
-      && detail.measurements.some((measurement) => measurement.qualitative_value != null),
-  );
 
   const trendMeter = (item: MarkerOverviewItem) => {
     const sparklineSrc = shareExportMode
@@ -834,7 +908,7 @@ export default function MarkerChart() {
                     Some history points stay in their original units because no conversion rule exists yet.
                   </p>
                 )}
-                {!hideDetailTrendChart && chartMeasurements.length > 0 ? (
+                {hasChartContent ? (
                   <div className="chart-wrapper mb-1">
                     <div className="chart-toolbar">
                       <label className="toggle-switch">
@@ -858,72 +932,152 @@ export default function MarkerChart() {
                       </p>
                     )}
                     <ResponsiveContainer width="100%" height={320}>
-                      <LineChart data={chartData}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#303c4d" />
-                        {timeWeightedAxisActive ? (
-                          <XAxis
-                            dataKey="timestamp"
-                            type="number"
-                            scale="time"
-                            domain={["dataMin", "dataMax"]}
+                      <LineChart data={enrichedChartData}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#303c4d" />
+                          {timeWeightedAxisActive ? (
+                            <XAxis
+                              dataKey="timestamp"
+                              type="number"
+                              scale="time"
+                              domain={["dataMin", "dataMax"]}
+                              stroke="#96a1ae"
+                              tickFormatter={(ts: number) => formatTimestampLabel(ts)}
+                            />
+                          ) : (
+                            <XAxis dataKey="dateLabel" stroke="#96a1ae" />
+                          )}
+                          <YAxis
+                            domain={yAxisScale.domain}
+                            ticks={chartMeasurements.length > 0 ? yAxisScale.ticks : []}
+                            interval={0}
                             stroke="#96a1ae"
-                            tickFormatter={(ts: number) => formatTimestampLabel(ts)}
+                            width={chartMeasurements.length > 0 ? 96 : 20}
+                            tickFormatter={chartMeasurements.length > 0 ? formatSignificantValue : () => ""}
+                            label={chartMeasurements.length > 0 ? {
+                              value: unit,
+                              angle: -90,
+                              position: "insideLeft",
+                            } : undefined}
                           />
-                        ) : (
-                          <XAxis dataKey="dateLabel" stroke="#96a1ae" />
-                        )}
-                        <YAxis
-                          domain={yAxisScale.domain}
-                          ticks={yAxisScale.ticks}
-                          interval={0}
-                          stroke="#96a1ae"
-                          width={96}
-                          tickFormatter={formatSignificantValue}
-                          label={{
-                            value: unit,
-                            angle: -90,
-                            position: "insideLeft",
-                          }}
-                        />
-                        <Tooltip
-                          formatter={(value) => formatMeasurementValue(Number(value ?? 0), unit)}
-                          labelFormatter={(_label, payload) => {
-                            const point = payload[0]?.payload as MarkerChartPoint | undefined;
-                            if (!point) {
-                              return "Date: —";
-                            }
+                          <Tooltip
+                            content={({ payload }) => {
+                              const point = payload?.[0]?.payload as MarkerChartPoint | undefined;
+                              if (!point) return null;
 
-                            const label = timeWeightedAxisActive ? point.axisDateLabel : point.dateLabel;
-                            return `Date: ${label}`;
-                          }}
-                          contentStyle={{ background: "#161d27", border: "1px solid #303c4d", borderRadius: "8px", color: "#edf1f7" }}
-                        />
-                        {refLow != null && refHigh != null && (
-                          <ReferenceArea y1={refLow} y2={refHigh} fill="#12c78e" fillOpacity={0.1} />
-                        )}
-                        {refLow != null && (
-                          <ReferenceLine y={refLow} stroke="#12c78e" strokeDasharray="5 5" label={refLowLabel} />
-                        )}
-                        {refHigh != null && (
-                          <ReferenceLine y={refHigh} stroke="#f85149" strokeDasharray="5 5" label={refHighLabel} />
-                        )}
-                        <Line
-                          type="monotone"
-                          dataKey="value"
-                          stroke="#b575ff"
-                          strokeWidth={3}
-                          dot={{ r: 5, strokeWidth: 2 }}
-                          activeDot={{ r: 7 }}
-                          name={detail.marker_name}
-                        />
-                      </LineChart>
-                    </ResponsiveContainer>
+                              const dateLabel = timeWeightedAxisActive ? point.axisDateLabel : point.dateLabel;
+                              const range = formatReferenceRange(point.reference_low, point.reference_high);
+                              const isQualitative = point.qualitativeLabel != null;
+                              const displayValue = isQualitative
+                                ? point.qualitativeLabel
+                                : point.value != null
+                                  ? formatMeasurementValue(point.value, unit)
+                                  : null;
+
+                              return (
+                                <div style={{
+                                  background: "#161d27",
+                                  border: "1px solid #303c4d",
+                                  borderRadius: "8px",
+                                  padding: "0.55rem 0.75rem",
+                                  fontSize: "0.82rem",
+                                  lineHeight: 1.5,
+                                }}>
+                                  <div style={{ color: "#edf1f7" }}>
+                                    Date: {dateLabel}
+                                    {range !== "—" && <span style={{ color: "#96a1ae" }}> · Range: {range}</span>}
+                                  </div>
+                                  {displayValue != null && (
+                                    <div style={{ color: point.statusColor }}>
+                                      {detail?.marker_name ?? "Value"}: {displayValue}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            }}
+                          />
+                          {refLow != null && refHigh != null && (
+                            <ReferenceArea y1={refLow} y2={refHigh} fill="#12c78e" fillOpacity={0.1} />
+                          )}
+                          {refLow != null && (
+                            <ReferenceLine y={refLow} stroke="#12c78e" strokeDasharray="5 5" label={refLowLabel} />
+                          )}
+                          {refHigh != null && (
+                            <ReferenceLine y={refHigh} stroke="#f85149" strokeDasharray="5 5" label={refHighLabel} />
+                          )}
+                          <Line
+                            type="monotone"
+                            dataKey="value"
+                            stroke="#b575ff"
+                            strokeWidth={3}
+                            connectNulls
+                            dot={(props: Record<string, unknown>) => {
+                              const { cx, cy, payload, index: dotIndex } = props as {
+                                cx: number; cy: number; payload: MarkerChartPoint; index: number;
+                              };
+                              return (
+                                <circle
+                                  key={`nd-${dotIndex}`}
+                                  cx={cx}
+                                  cy={cy}
+                                  r={5}
+                                  fill={payload.statusColor}
+                                  stroke={payload.statusColor}
+                                  strokeWidth={2}
+                                />
+                              );
+                            }}
+                            activeDot={{ r: 7 }}
+                            name={detail.marker_name}
+                          />
+                          {/* Qualitative-only measurements as colored diamonds sitting on
+                              the X axis.  A separate invisible Line with dataKey="eventY"
+                              gives each diamond the correct X position on the shared
+                              timeline axis. */}
+                          {chartSeries.qualitativeEventCount > 0 && (
+                            <Line
+                              dataKey="eventY"
+                              stroke="none"
+                              dot={(props: Record<string, unknown>) => {
+                                const { cx, cy, payload, index: dotIndex } = props as {
+                                  cx: number; cy: number; payload: MarkerChartPoint; index: number;
+                                };
+                                if (payload.qualitativeLabel == null) return <g key={`eq-${dotIndex}`} />;
+                                const s = 6;
+                                return (
+                                  <polygon
+                                    key={`qd-${dotIndex}`}
+                                    points={`${cx},${cy - s} ${cx + s},${cy} ${cx},${cy + s} ${cx - s},${cy}`}
+                                    fill={payload.statusColor}
+                                    stroke={payload.statusColor}
+                                    strokeWidth={1}
+                                    opacity={0.9}
+                                  />
+                                );
+                              }}
+                              activeDot={false}
+                              legendType="none"
+                              name="Result"
+                            />
+                          )}
+                        </LineChart>
+                      </ResponsiveContainer>
+                    {chartSeries.qualitativeEventCount > 0 && (
+                      <div className="chart-event-legend">
+                        {enrichedChartData
+                          .filter((p) => p.qualitativeLabel != null)
+                          .map((point, i) => (
+                            <span key={`ql-${i}`} className="chart-event-label" style={{ color: point.statusColor }}>
+                              ◆ {point.dateLabel}: {point.qualitativeLabel}
+                            </span>
+                          ))}
+                      </div>
+                    )}
                   </div>
-                ) : !hideDetailTrendChart ? (
+                ) : (
                   <div className="card-empty detail-loading-block">
                     Trend chart unavailable until at least one value has a valid conversion rule.
                   </div>
-                ) : null}
+                )}
 
                 <div className="detail-history card">
                   <h3>History</h3>
