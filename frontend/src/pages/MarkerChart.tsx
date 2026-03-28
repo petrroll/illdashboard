@@ -717,7 +717,7 @@ export default function MarkerChart() {
                       >
                         <div className="marker-row-name">
                           <strong>{item.marker_name}</strong>
-                          <span className="marker-row-date">{formatDate(latest.measured_at)}</span>
+                          <span className="marker-row-date">{formatDate(effectiveMeasuredAt(latest))}</span>
                         </div>
 
                         <div className={`marker-row-value ${latestValueClassName}`}>
