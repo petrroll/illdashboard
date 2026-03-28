@@ -1176,6 +1176,12 @@ input[type="file"] {
 .export-marker-row span,
 .export-marker-row .marker-row-value span,
 .export-marker-row .marker-row-previous span,
+.detail-canonical-unit {
+  font-size: 0.55em;
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
 .detail-latest-meta,
 .detail-stat-card small {
   color: var(--text-muted);

@@ -740,7 +740,12 @@ export default function MarkerChart() {
              <div className="detail-header">
                <div>
                  <p className="detail-group-label">{summarySource.group_name}</p>
-                <h2>{summarySource.marker_name}</h2>
+                <h2>
+                  {summarySource.marker_name}
+                  {getDisplayUnit(summarySource.canonical_unit) && (
+                    <span className="detail-canonical-unit"> ({getDisplayUnit(summarySource.canonical_unit)})</span>
+                  )}
+                </h2>
                 <p className="detail-latest-meta">
                   Latest result on {formatDate(summarySource.latest_measurement.measured_at)}
                 </p>
