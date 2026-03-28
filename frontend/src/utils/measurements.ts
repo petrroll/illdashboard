@@ -241,11 +241,23 @@ export function formatReferenceRange(
   referenceLow?: number | null,
   referenceHigh?: number | null,
 ) {
-  return referenceLow != null && referenceHigh != null
+  // Some assays only provide a single cutoff. Show that bound explicitly so the
+  // reference text matches the status coloring instead of looking missing.
+  if (referenceLow != null && referenceHigh != null) {
     // Keep range bounds on the same display precision as values so converted
     // results like 0.098 vs 0.1 do not look contradictory after rounding.
-    ? `${formatMeasurementScalarValue(referenceLow)}–${formatMeasurementScalarValue(referenceHigh)}`
-    : "—";
+    return `${formatMeasurementScalarValue(referenceLow)}–${formatMeasurementScalarValue(referenceHigh)}`;
+  }
+
+  if (referenceLow != null) {
+    return `Low ${formatMeasurementScalarValue(referenceLow)}`;
+  }
+
+  if (referenceHigh != null) {
+    return `High ${formatMeasurementScalarValue(referenceHigh)}`;
+  }
+
+  return "—";
 }
 
 export function getOriginalMeasurementValue(measurement: Pick<Measurement, "original_value" | "canonical_value">) {

@@ -441,7 +441,7 @@ export default function MarkerChart() {
         reference_high: pointRefHigh,
         hasEstimatedDate: measurement.measured_at == null && measuredTimestamp != null,
         statusColor: isQualitative
-          ? qualitativeEventColor(measurement.qualitative_bool)
+          ? qualitativeEventColor(measurement.qualitative_bool ?? null)
           : numericPointColor(trendValue, pointRefLow, pointRefHigh),
         qualitativeLabel: isQualitative ? (measurement.qualitative_value ?? null) : null,
       };
