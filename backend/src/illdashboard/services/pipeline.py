@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -83,6 +84,7 @@ TASK_CANONIZE_UNIT = "canonize.unit"
 TASK_CANONIZE_CONVERSION = "canonize.conversion"
 TASK_CANONIZE_QUALITATIVE = "canonize.qualitative"
 TASK_CANONIZE_SOURCE = "canonize.source"
+TASK_REVIEW_ANOMALOUS_RESCALING = "review.anomalous-rescaling"
 
 MEASUREMENT_BATCH_SIZE = 2
 TEXT_BATCH_SIZE = 2
@@ -108,6 +110,7 @@ CANONIZE_GROUP_CLAIM_LIMIT = copilot_normalization.MARKER_GROUP_CLASSIFICATION_B
 CANONIZE_UNIT_CLAIM_LIMIT = copilot_normalization.UNIT_NORMALIZATION_BATCH_SIZE
 CANONIZE_CONVERSION_CLAIM_LIMIT = copilot_normalization.UNIT_NORMALIZATION_BATCH_SIZE
 CANONIZE_QUALITATIVE_CLAIM_LIMIT = copilot_normalization.QUALITATIVE_NORMALIZATION_BATCH_SIZE
+REVIEW_ANOMALOUS_RESCALING_CLAIM_LIMIT = copilot_normalization.ANOMALOUS_RESCALING_BATCH_SIZE
 
 PRIORITY_ENSURE_FILE = 5
 PRIORITY_ENSURE_LANE = 10
@@ -119,6 +122,11 @@ PRIORITY_ASSEMBLE_TEXT = 60
 PRIORITY_SUMMARY = 70
 PRIORITY_SEARCH = 80
 RUNTIME_RESTART_RETRY_DELAYS = (0.05, 0.1, 0.2)
+ANOMALOUS_RESCALING_ORDER_FACTOR = 10.0
+ANOMALOUS_RESCALING_CANDIDATE_FACTORS = (0.001, 0.01, 0.1, 10.0, 100.0, 1000.0)
+ANOMALOUS_RESCALING_MIN_HISTORY_VALUES = 2
+ANOMALOUS_RESCALING_MIN_HISTORY_FILES = 2
+ANOMALOUS_RESCALING_MIN_RANGE_COUNT = 2
 
 _runtime: PipelineRuntime | None = None
 _runtime_reset_lock = asyncio.Lock()
@@ -284,6 +292,13 @@ class PipelineRuntime:
             CANONIZE_WORKER_CONCURRENCY,
             self._handle_qualitative_jobs,
         )
+        self._spawn_workers(
+            "review-anomalous-rescaling",
+            [TASK_REVIEW_ANOMALOUS_RESCALING],
+            REVIEW_ANOMALOUS_RESCALING_CLAIM_LIMIT,
+            CANONIZE_WORKER_CONCURRENCY,
+            self._handle_anomalous_rescaling_jobs,
+        )
 
     async def stop(self, *, abort_copilot_requests: bool = False) -> None:
         self.stop_event.set()
@@ -432,6 +447,9 @@ class PipelineRuntime:
 
     async def _handle_qualitative_jobs(self, _session: AsyncSession, jobs: list[Job]) -> None:
         await self._run_jobs_in_fresh_session([job.id for job in jobs], _canonize_qualitative_jobs)
+
+    async def _handle_anomalous_rescaling_jobs(self, _session: AsyncSession, jobs: list[Job]) -> None:
+        await self._run_jobs_in_fresh_session([job.id for job in jobs], _review_anomalous_rescaling_jobs)
 
 
 async def start_pipeline_runtime(session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -1612,6 +1630,112 @@ async def _canonize_qualitative_jobs(session: AsyncSession, jobs: list[Job]) -> 
     _log_batch_span_finish(TASK_CANONIZE_QUALITATIVE, [job for _, job in qualitative_jobs], started_at)
 
 
+async def _review_anomalous_rescaling_jobs(session: AsyncSession, jobs: list[Job]) -> None:
+    review_jobs: list[tuple[Job, Measurement, dict]] = []
+    measurement_ids: dict[int, int] = {}
+    for job in jobs:
+        payload = job_service.json_loads(job.payload_json)
+        measurement_id = payload.get("measurement_id")
+        if not isinstance(measurement_id, int):
+            await job_service.mark_job_resolved(session, job, {"skipped": True})
+            continue
+        measurement_ids[job.id] = measurement_id
+
+    requested_ids = list(dict.fromkeys(measurement_ids.values()))
+    measurements_by_id: dict[int, Measurement] = {}
+    if requested_ids:
+        result = await session.execute(
+            select(Measurement)
+            .options(selectinload(Measurement.measurement_type))
+            .where(Measurement.id.in_(requested_ids))
+        )
+        measurements_by_id = {
+            measurement.id: measurement
+            for measurement in result.scalars().all()
+            if measurement.id is not None
+        }
+
+    for job in jobs:
+        measurement_id = measurement_ids.get(job.id)
+        if measurement_id is None:
+            continue
+        measurement = measurements_by_id.get(measurement_id)
+        if measurement is None:
+            await job_service.delete_job(session, job)
+            continue
+        review_jobs.append((job, measurement, job_service.json_loads(job.payload_json)))
+
+    if not review_jobs:
+        return
+
+    started_at = _log_batch_span_start(TASK_REVIEW_ANOMALOUS_RESCALING, [job for job, _, _ in review_jobs])
+    requests: list[copilot_normalization.AnomalousRescalingRequest] = []
+    for job, measurement, payload in review_jobs:
+        measurement_type = measurement.measurement_type
+        if measurement_type is None:
+            await job_service.mark_job_resolved(session, job, {"scale_factor": None, "skipped": True})
+            continue
+        provisional_value = payload.get("provisional_value")
+        candidate_factors = payload.get("candidate_factors")
+        if not isinstance(provisional_value, (int, float)) or not isinstance(candidate_factors, list):
+            await job_service.mark_job_resolved(session, job, {"scale_factor": None, "skipped": True})
+            continue
+        requests.append(
+            copilot_normalization.AnomalousRescalingRequest(
+                id=job.task_key,
+                marker_name=measurement_type.name,
+                original_unit=measurement.original_unit,
+                canonical_unit=measurement.canonical_unit,
+                provisional_value=provisional_value,
+                provisional_reference_low=payload.get("provisional_reference_low"),
+                provisional_reference_high=payload.get("provisional_reference_high"),
+                historical_value_min=payload.get("historical_value_min"),
+                historical_value_max=payload.get("historical_value_max"),
+                historical_reference_low_min=payload.get("historical_reference_low_min"),
+                historical_reference_low_max=payload.get("historical_reference_low_max"),
+                historical_reference_high_min=payload.get("historical_reference_high_min"),
+                historical_reference_high_max=payload.get("historical_reference_high_max"),
+                history_sample_count=int(payload.get("history_sample_count", 0)),
+                history_range_count=int(payload.get("history_range_count", 0)),
+                candidate_factors=[
+                    float(candidate)
+                    for candidate in candidate_factors
+                    if isinstance(candidate, (int, float)) and math.isfinite(float(candidate))
+                ],
+            )
+        )
+
+    if requests:
+        await _commit_before_external_normalization_call(session)
+        resolved = await copilot_normalization.review_anomalous_rescaling(requests)
+        for job, _, payload in review_jobs:
+            if job.task_key not in resolved:
+                continue
+            await job_service.mark_job_resolved(
+                session,
+                job,
+                {
+                    "measurement_id": payload.get("measurement_id"),
+                    "review_signature": payload.get("review_signature"),
+                    "scale_factor": resolved.get(job.task_key),
+                },
+            )
+
+    for job, _, _ in review_jobs:
+        if job.status == job_service.JOB_STATUS_LEASED:
+            await job_service.mark_job_resolved(
+                session,
+                job,
+                {
+                    "measurement_id": job_service.json_loads(job.payload_json).get("measurement_id"),
+                    "review_signature": job_service.json_loads(job.payload_json).get("review_signature"),
+                    "scale_factor": None,
+                },
+            )
+    await _request_processing_for_review_jobs(session, [job.task_key for job, _, _ in review_jobs])
+    _log_batch_span_finish(TASK_REVIEW_ANOMALOUS_RESCALING, [job for job, _, _ in review_jobs], started_at)
+
+
 async def _refresh_search(session: AsyncSession, job: Job) -> None:
     payload = job_service.json_loads(job.payload_json)
     file_id = int(payload.get("file_id", 0))
@@ -1761,6 +1885,341 @@ async def _refresh_file_status_projection(
     file.processing_error = None
 
 
+@dataclass(frozen=True)
+class _AnomalousReviewState:
+    status: str
+    scale_factor: float | None
+    review_signature: str | None
+
+
+def _anomalous_rescaling_task_key(measurement_id: int) -> str:
+    return f"measurement:{measurement_id}"
+
+
+def _measurement_id_from_anomalous_task_key(task_key: str) -> int | None:
+    prefix = "measurement:"
+    if not task_key.startswith(prefix):
+        return None
+    try:
+        return int(task_key[len(prefix) :])
+    except ValueError:
+        return None
+
+
+def _signature_number(value: float | None) -> str | None:
+    if value is None or not math.isfinite(value):
+        return None
+    return f"{value:.12g}"
+
+
+def _build_anomalous_review_signature(
+    *,
+    canonical_unit: str | None,
+    canonical_value: float | None,
+    reference_low: float | None,
+    reference_high: float | None,
+    historical_value_min: float | None,
+    historical_value_max: float | None,
+    historical_reference_low_min: float | None,
+    historical_reference_low_max: float | None,
+    historical_reference_high_min: float | None,
+    historical_reference_high_max: float | None,
+    history_sample_count: int,
+    history_range_count: int,
+    candidate_factors: list[float],
+) -> str:
+    payload = {
+        "canonical_unit": canonical_unit,
+        "canonical_value": _signature_number(canonical_value),
+        "reference_low": _signature_number(reference_low),
+        "reference_high": _signature_number(reference_high),
+        "historical_value_min": _signature_number(historical_value_min),
+        "historical_value_max": _signature_number(historical_value_max),
+        "historical_reference_low_min": _signature_number(historical_reference_low_min),
+        "historical_reference_low_max": _signature_number(historical_reference_low_max),
+        "historical_reference_high_min": _signature_number(historical_reference_high_min),
+        "historical_reference_high_max": _signature_number(historical_reference_high_max),
+        "history_sample_count": history_sample_count,
+        "history_range_count": history_range_count,
+        "candidate_factors": [_signature_number(candidate) for candidate in candidate_factors],
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+async def _load_anomalous_review_states(
+    session: AsyncSession,
+    file_id: int | None,
+) -> dict[int, _AnomalousReviewState]:
+    if file_id is None:
+        return {}
+
+    result = await session.execute(
+        select(Job.task_key, Job.status, Job.payload_json, Job.resolved_json).where(
+            Job.task_type == TASK_REVIEW_ANOMALOUS_RESCALING,
+            Job.file_id == file_id,
+        )
+    )
+    states: dict[int, _AnomalousReviewState] = {}
+    for task_key, status, payload_json, resolved_json in result.all():
+        measurement_id = _measurement_id_from_anomalous_task_key(task_key)
+        if measurement_id is None:
+            continue
+        payload = job_service.json_loads(payload_json)
+        resolved_payload = job_service.json_loads(resolved_json)
+        raw_scale_factor = resolved_payload.get("scale_factor")
+        scale_factor = None
+        if isinstance(raw_scale_factor, (int, float)) and math.isfinite(float(raw_scale_factor)):
+            scale_factor = float(raw_scale_factor)
+        raw_review_signature = payload.get("review_signature")
+        if not isinstance(raw_review_signature, str):
+            raw_review_signature = resolved_payload.get("review_signature")
+        states[measurement_id] = _AnomalousReviewState(
+            status=status,
+            scale_factor=scale_factor,
+            review_signature=raw_review_signature if isinstance(raw_review_signature, str) else None,
+        )
+    return states
+
+
+def _history_supports_anomalous_rescaling(
+    envelope: rescaling.MeasurementHistoryEnvelope | None,
+) -> bool:
+    if envelope is None:
+        return False
+    if envelope.value_count < ANOMALOUS_RESCALING_MIN_HISTORY_VALUES:
+        return False
+    if envelope.file_count < ANOMALOUS_RESCALING_MIN_HISTORY_FILES:
+        return False
+    value_spread = rescaling.positive_ratio(envelope.value_min, envelope.value_max)
+    if value_spread is None or value_spread >= ANOMALOUS_RESCALING_ORDER_FACTOR:
+        return False
+    return True
+
+
+def _history_has_tight_range_envelopes(
+    envelope: rescaling.MeasurementHistoryEnvelope,
+) -> bool:
+    if (
+        envelope.reference_low_count < ANOMALOUS_RESCALING_MIN_RANGE_COUNT
+        or envelope.reference_high_count < ANOMALOUS_RESCALING_MIN_RANGE_COUNT
+    ):
+        return False
+    low_spread = rescaling.positive_ratio(envelope.reference_low_min, envelope.reference_low_max)
+    high_spread = rescaling.positive_ratio(envelope.reference_high_min, envelope.reference_high_max)
+    return (
+        low_spread is not None
+        and high_spread is not None
+        and low_spread < ANOMALOUS_RESCALING_ORDER_FACTOR
+        and high_spread < ANOMALOUS_RESCALING_ORDER_FACTOR
+    )
+
+
+def _range_candidate_matches_history(
+    envelope: rescaling.MeasurementHistoryEnvelope,
+    *,
+    factor: float,
+    reference_low: float | None,
+    reference_high: float | None,
+) -> bool:
+    adjusted_low = rescaling.apply_scale_factor(reference_low, factor)
+    adjusted_high = rescaling.apply_scale_factor(reference_high, factor)
+    return (
+        rescaling.value_within_envelope(
+            adjusted_low,
+            envelope.reference_low_min,
+            envelope.reference_low_max,
+        )
+        and rescaling.value_within_envelope(
+            adjusted_high,
+            envelope.reference_high_min,
+            envelope.reference_high_max,
+        )
+    )
+
+
+async def _apply_anomalous_rescaling_if_needed(
+    session: AsyncSession,
+    measurement: Measurement,
+    measurement_type: MeasurementType,
+    *,
+    history_envelope: rescaling.MeasurementHistoryEnvelope | None,
+    review_states: dict[int, _AnomalousReviewState],
+) -> tuple[bool, bool, str | None]:
+    if (
+        measurement.id is None
+        or measurement.original_value is None
+        or measurement.canonical_value is None
+        or measurement.lab_file_id is None
+        or not _history_supports_anomalous_rescaling(history_envelope)
+    ):
+        return False, True, None
+
+    value_outlier = rescaling.value_outside_order_of_magnitude(
+        measurement.canonical_value,
+        history_envelope.value_min,
+        history_envelope.value_max,
+        factor=ANOMALOUS_RESCALING_ORDER_FACTOR,
+    )
+    range_outlier = False
+    if _history_has_tight_range_envelopes(history_envelope):
+        range_outlier = any(
+            (
+                rescaling.value_outside_order_of_magnitude(
+                    measurement.canonical_reference_low,
+                    history_envelope.reference_low_min,
+                    history_envelope.reference_low_max,
+                    factor=ANOMALOUS_RESCALING_ORDER_FACTOR,
+                ),
+                rescaling.value_outside_order_of_magnitude(
+                    measurement.canonical_reference_high,
+                    history_envelope.reference_high_min,
+                    history_envelope.reference_high_max,
+                    factor=ANOMALOUS_RESCALING_ORDER_FACTOR,
+                ),
+            )
+        )
+
+    if not value_outlier and not range_outlier:
+        return False, True, None
+
+    candidate_factors = [
+        factor
+        for factor in ANOMALOUS_RESCALING_CANDIDATE_FACTORS
+        if rescaling.value_within_envelope(
+            rescaling.apply_scale_factor(measurement.canonical_value, factor),
+            history_envelope.value_min,
+            history_envelope.value_max,
+        )
+    ]
+    if not candidate_factors:
+        return False, True, None
+
+    review_signature = _build_anomalous_review_signature(
+        canonical_unit=measurement.canonical_unit,
+        canonical_value=measurement.canonical_value,
+        reference_low=measurement.canonical_reference_low,
+        reference_high=measurement.canonical_reference_high,
+        historical_value_min=history_envelope.value_min,
+        historical_value_max=history_envelope.value_max,
+        historical_reference_low_min=history_envelope.reference_low_min,
+        historical_reference_low_max=history_envelope.reference_low_max,
+        historical_reference_high_min=history_envelope.reference_high_min,
+        historical_reference_high_max=history_envelope.reference_high_max,
+        history_sample_count=history_envelope.value_count,
+        history_range_count=min(
+            history_envelope.reference_low_count,
+            history_envelope.reference_high_count,
+        ),
+        candidate_factors=list(candidate_factors),
+    )
+    # Keep one stable review job per measurement so changed provisional context
+    # updates the same row and uses rerun_requested instead of orphaning stale
+    # per-signature jobs.
+    task_key = _anomalous_rescaling_task_key(measurement.id)
+    review_state = review_states.get(measurement.id)
+    signature_matches = review_state is not None and review_state.review_signature == review_signature
+
+    if signature_matches and review_state is not None and review_state.status == job_service.JOB_STATUS_RESOLVED:
+        if review_state.scale_factor is not None:
+            measurement.canonical_value = rescaling.apply_scale_factor(
+                measurement.canonical_value,
+                review_state.scale_factor,
+            )
+            measurement.canonical_reference_low = rescaling.apply_scale_factor(
+                measurement.canonical_reference_low,
+                review_state.scale_factor,
+            )
+            measurement.canonical_reference_high = rescaling.apply_scale_factor(
+                measurement.canonical_reference_high,
+                review_state.scale_factor,
+            )
+            logger.info(
+                "Applied anomalous rescaling review measurement_id=%s marker=%s scale_factor=%s",
+                measurement.id,
+                measurement_type.name,
+                review_state.scale_factor,
+            )
+        return False, True, None
+    if signature_matches and review_state is not None and review_state.status in {
+        job_service.JOB_STATUS_FAILED,
+        job_service.JOB_STATUS_CANCELLED,
+    }:
+        return False, False, f"Anomalous rescaling review failed for {measurement_type.name}"
+
+    if _history_has_tight_range_envelopes(history_envelope):
+        deterministic_candidates = [
+            factor
+            for factor in candidate_factors
+            if _range_candidate_matches_history(
+                history_envelope,
+                factor=factor,
+                reference_low=measurement.canonical_reference_low,
+                reference_high=measurement.canonical_reference_high,
+            )
+        ]
+        if len(deterministic_candidates) == 1:
+            factor = deterministic_candidates[0]
+            measurement.canonical_value = rescaling.apply_scale_factor(measurement.canonical_value, factor)
+            measurement.canonical_reference_low = rescaling.apply_scale_factor(
+                measurement.canonical_reference_low,
+                factor,
+            )
+            measurement.canonical_reference_high = rescaling.apply_scale_factor(
+                measurement.canonical_reference_high,
+                factor,
+            )
+            logger.info(
+                "Applied deterministic anomalous rescaling measurement_id=%s marker=%s scale_factor=%s "
+                "value=%s history_min=%s history_max=%s",
+                measurement.id,
+                measurement_type.name,
+                factor,
+                measurement.original_value,
+                history_envelope.value_min,
+                history_envelope.value_max,
+            )
+            return False, True, None
+
+    requested_new_work = await _request_job(
+        session,
+        task_type=TASK_REVIEW_ANOMALOUS_RESCALING,
+        task_key=task_key,
+        payload={
+            "measurement_id": measurement.id,
+            "measurement_type_id": measurement_type.id,
+            "review_signature": review_signature,
+            "provisional_value": measurement.canonical_value,
+            "provisional_reference_low": measurement.canonical_reference_low,
+            "provisional_reference_high": measurement.canonical_reference_high,
+            "historical_value_min": history_envelope.value_min,
+            "historical_value_max": history_envelope.value_max,
+            "historical_reference_low_min": history_envelope.reference_low_min,
+            "historical_reference_low_max": history_envelope.reference_low_max,
+            "historical_reference_high_min": history_envelope.reference_high_min,
+            "historical_reference_high_max": history_envelope.reference_high_max,
+            "history_sample_count": history_envelope.value_count,
+            "history_range_count": min(
+                history_envelope.reference_low_count,
+                history_envelope.reference_high_count,
+            ),
+            "candidate_factors": list(candidate_factors),
+        },
+        file_id=measurement.lab_file_id,
+        priority=PRIORITY_CANONIZE,
+    )
+    logger.info(
+        "Queued anomalous rescaling review measurement_id=%s marker=%s candidates=%s value=%s "
+        "history_min=%s history_max=%s",
+        measurement.id,
+        measurement_type.name,
+        json.dumps(candidate_factors),
+        measurement.canonical_value,
+        history_envelope.value_min,
+        history_envelope.value_max,
+    )
+    return requested_new_work, False, None
+
+
 async def _apply_known_measurement_rules(session: AsyncSession, measurements: list[Measurement]) -> bool:
     requested_new_work = False
     alias_map = await load_measurement_type_aliases(
@@ -1821,6 +2280,15 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
         select(MeasurementType).options(selectinload(MeasurementType.group)).where(MeasurementType.id.in_(type_ids))
     )
     measurement_types = {measurement_type.id: measurement_type for measurement_type in type_result.scalars().all()}
+    history_envelopes = await rescaling.load_measurement_history_envelopes(
+        session,
+        list(measurement_types.keys()),
+        exclude_file_id=measurements[0].lab_file_id if measurements else None,
+    )
+    review_states = await _load_anomalous_review_states(
+        session,
+        measurements[0].lab_file_id if measurements else None,
+    )
 
     group_job_statuses = await _load_job_statuses(
         session,
@@ -2022,6 +2490,21 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
             measurement.canonical_reference_low = measurement.original_reference_low
             measurement.canonical_reference_high = measurement.original_reference_high
 
+        if resolved and measurement.original_value is not None:
+            anomaly_requested_new_work, anomaly_resolved, anomaly_error = await _apply_anomalous_rescaling_if_needed(
+                session,
+                measurement,
+                measurement_type,
+                history_envelope=history_envelopes.get(measurement_type.id),
+                review_states=review_states,
+            )
+            requested_new_work = anomaly_requested_new_work or requested_new_work
+            if anomaly_error is not None:
+                measurement.normalization_status = MEASUREMENT_STATE_ERROR
+                measurement.normalization_error = anomaly_error
+                continue
+            resolved = anomaly_resolved
+
         measurement.normalization_status = MEASUREMENT_STATE_RESOLVED if resolved else MEASUREMENT_STATE_PENDING
         if resolved:
             measurement.normalization_error = None
@@ -2053,6 +2536,16 @@ async def _handle_terminal_job_failure(session: AsyncSession, job: Job, error_te
             await _request_processing_for_conversion(session, measurement_type_id, original_unit)
     elif job.task_type == TASK_CANONIZE_QUALITATIVE:
         await _request_processing_for_qualitative_keys(session, [job.task_key])
+    elif job.task_type == TASK_REVIEW_ANOMALOUS_RESCALING:
+        measurement_id = payload.get("measurement_id")
+        if isinstance(measurement_id, int):
+            result = await session.execute(
+                select(Measurement.lab_file_id).where(Measurement.id == measurement_id).limit(1)
+            )
+            file_id = result.scalar_one_or_none()
+            if isinstance(file_id, int):
+                await _request_process_measurements(session, file_id)
+                await _request_file_ensure(session, file_id)
     elif job.task_type == TASK_CANONIZE_SOURCE:
         await _mark_source_failure(session, job.task_key, error_text)
 
@@ -2293,6 +2786,23 @@ async def _request_processing_for_qualitative_keys(session: AsyncSession, keys: 
         if normalized_value in normalized_keys:
             affected_file_ids.add(file_id)
     for file_id in sorted(affected_file_ids):
+        await _request_process_measurements(session, file_id)
+        await _request_file_ensure(session, file_id)
+
+
+async def _request_processing_for_review_jobs(session: AsyncSession, keys: list[str]) -> None:
+    measurement_ids = [
+        measurement_id
+        for key in dict.fromkeys(keys)
+        if (measurement_id := _measurement_id_from_anomalous_task_key(key)) is not None
+    ]
+    if not measurement_ids:
+        return
+
+    result = await session.execute(
+        select(Measurement.lab_file_id).where(Measurement.id.in_(measurement_ids)).distinct()
+    )
+    for file_id in result.scalars().all():
         await _request_process_measurements(session, file_id)
         await _request_file_ensure(session, file_id)
 

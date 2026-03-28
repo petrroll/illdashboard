@@ -41,6 +41,7 @@ _NORMALIZATION_REQUEST_NAMES = {
     "normalize_source_name",
     "choose_canonical_units",
     "infer_rescaling_factors",
+    "review_anomalous_rescaling",
     "normalize_qualitative_values",
     "classify_marker_groups",
 }
@@ -52,6 +53,7 @@ _NORMALIZATION_LANE_LIMITS = {
     "normalize_source_name": 1,
     "choose_canonical_units": 1,
     "infer_rescaling_factors": 1,
+    "review_anomalous_rescaling": 1,
     "normalize_qualitative_values": 1,
     "classify_marker_groups": 1,
 }

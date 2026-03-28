@@ -118,8 +118,10 @@ def test_normalization_requests_use_separate_serialized_lanes():
     assert copilot_client._request_lane_name("medical_summary") == "summary"
     assert copilot_client._request_lane_name("normalize_source_name") == "normalize_source_name"
     assert copilot_client._request_lane_name("normalize_qualitative_values") == "normalize_qualitative_values"
+    assert copilot_client._request_lane_name("review_anomalous_rescaling") == "review_anomalous_rescaling"
     assert copilot_client._request_lane_limit("normalize_source_name") == 1
     assert copilot_client._request_lane_limit("normalize_qualitative_values") == 1
+    assert copilot_client._request_lane_limit("review_anomalous_rescaling") == 1
     assert copilot_client._request_lane_limit("classify_marker_groups") == 1
 
 
@@ -1464,6 +1466,43 @@ async def test_infer_rescaling_factors_handles_dimensionless_ratio_units_without
 
     assert result == {"ml/l=>%": pytest.approx(0.1)}
     ask_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_review_anomalous_rescaling_treats_candidate_factors_as_hints():
+    request = copilot_normalization.AnomalousRescalingRequest(
+        id="measurement:7:abc",
+        marker_name="Lymphocytes (%)",
+        original_unit="1",
+        canonical_unit="1",
+        provisional_value=29.2,
+        provisional_reference_low=25.0,
+        provisional_reference_high=50.0,
+        historical_value_min=0.27,
+        historical_value_max=0.29,
+        historical_reference_low_min=0.20,
+        historical_reference_low_max=0.25,
+        historical_reference_high_min=0.45,
+        historical_reference_high_max=0.50,
+        history_sample_count=2,
+        history_range_count=2,
+        candidate_factors=[0.01, 0.1],
+    )
+
+    with patch(
+        "illdashboard.copilot.normalization._ask",
+        new=AsyncMock(return_value=json.dumps({request.id: {"scale_factor": 0.01}})),
+    ) as ask_mock:
+        result = await copilot_normalization.review_anomalous_rescaling([request])
+
+    assert result == {request.id: pytest.approx(0.01)}
+    ask_mock.assert_awaited_once()
+    system_prompt = ask_mock.await_args.args[0]
+    user_prompt = ask_mock.await_args.args[1]
+    assert "you may return a different" in system_prompt
+    assert "Suggested candidate factors (common powers of ten; you may choose another factor" in user_prompt
+    assert "0.01, 0.1" in user_prompt
+    assert "Historical reference envelopes:" in user_prompt
 
 
 @pytest.mark.asyncio

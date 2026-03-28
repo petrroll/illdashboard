@@ -38,6 +38,8 @@ MARKER_NORMALIZATION_BATCH_SIZE = 100
 MARKER_NORMALIZATION_CONCURRENCY = 1
 UNIT_NORMALIZATION_BATCH_SIZE = 80
 UNIT_NORMALIZATION_CONCURRENCY = 1
+ANOMALOUS_RESCALING_BATCH_SIZE = 80
+ANOMALOUS_RESCALING_CONCURRENCY = 1
 QUALITATIVE_NORMALIZATION_BATCH_SIZE = 120
 QUALITATIVE_NORMALIZATION_CONCURRENCY = 1
 MARKER_GROUP_CLASSIFICATION_BATCH_SIZE = 200
@@ -130,6 +132,26 @@ class UnitConversionRequest:
     reference_low: float | None = None
     reference_high: float | None = None
     guide_examples: list[UnitConversionGuideExample] = field(default_factory=list)
+
+
+@dataclass
+class AnomalousRescalingRequest:
+    id: str
+    marker_name: str
+    original_unit: str | None
+    canonical_unit: str | None
+    provisional_value: int | float
+    provisional_reference_low: float | None = None
+    provisional_reference_high: float | None = None
+    historical_value_min: float | None = None
+    historical_value_max: float | None = None
+    historical_reference_low_min: float | None = None
+    historical_reference_low_max: float | None = None
+    historical_reference_high_min: float | None = None
+    historical_reference_high_max: float | None = None
+    history_sample_count: int = 0
+    history_range_count: int = 0
+    candidate_factors: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -267,6 +289,41 @@ def _build_conversion_request_user_text(batch_requests: list[UnitConversionReque
     return user_text
 
 
+def _build_anomalous_rescaling_request_user_text(
+    batch_requests: list[AnomalousRescalingRequest],
+) -> str:
+    user_text = "Anomalous rescaling review requests:\n"
+    for request in batch_requests:
+        user_text += (
+            f"\n- id={request.id}; "
+            f"marker={request.marker_name or '(unknown)'}; "
+            f"original_unit={request.original_unit or '(none)'}; "
+            f"canonical_unit={request.canonical_unit or '(none)'}; "
+            f"provisional_value={request.provisional_value}; "
+            f"provisional_reference_low={request.provisional_reference_low}; "
+            f"provisional_reference_high={request.provisional_reference_high}; "
+            f"history_sample_count={request.history_sample_count}; "
+            f"history_range_count={request.history_range_count}\n"
+        )
+        user_text += (
+            "  Historical value envelope: "
+            f"min={request.historical_value_min}; max={request.historical_value_max}\n"
+        )
+        user_text += (
+            "  Historical reference envelopes: "
+            f"low_min={request.historical_reference_low_min}; "
+            f"low_max={request.historical_reference_low_max}; "
+            f"high_min={request.historical_reference_high_min}; "
+            f"high_max={request.historical_reference_high_max}\n"
+        )
+        candidate_text = ", ".join(f"{candidate:g}" for candidate in request.candidate_factors)
+        user_text += (
+            "  Suggested candidate factors (common powers of ten; you may choose another "
+            f"factor if strongly justified): {candidate_text or '(none)'}\n"
+        )
+    return user_text
+
+
 def _build_qualitative_request_user_text(
     batch_requests: list[QualitativeNormalizationRequest],
     existing_canonical: list[str],
@@ -337,6 +394,20 @@ def _parse_canonical_unit_response(payload: dict, batch_groups: list[MarkerUnitG
 
 
 def _parse_scale_factor_response(payload: dict, batch_requests: list[UnitConversionRequest]) -> dict[str, float | None]:
+    result: dict[str, float | None] = {}
+    for request in batch_requests:
+        request_payload = payload.get(request.id) if isinstance(payload, dict) else None
+        if not isinstance(request_payload, dict):
+            result[request.id] = None
+            continue
+        result[request.id] = _coerce_normalized_number(request_payload.get("scale_factor"))
+    return result
+
+
+def _parse_anomalous_rescaling_response(
+    payload: dict,
+    batch_requests: list[AnomalousRescalingRequest],
+) -> dict[str, float | None]:
     result: dict[str, float | None] = {}
     for request in batch_requests:
         request_payload = payload.get(request.id) if isinstance(payload, dict) else None
@@ -507,6 +578,39 @@ For each request:
     and 1 % = 10 mL/L.
 - Be careful with count units. For example, converting /µL to 10^9/L uses a factor of 0.001,
     and converting 10^9/L to /µL uses a factor of 1000.
+
+Return ONLY valid JSON as an object keyed by request id. Each value must be an object with:
+- "scale_factor": number or null
+
+Do not include commentary outside the JSON.\
+"""
+
+
+ANOMALOUS_RESCALING_SYSTEM_PROMPT = """\
+You are a medical lab anomaly rescaling assistant. The user will give you one or more
+review requests for measurements that already have a provisional numeric value expressed
+in the marker's canonical unit.
+
+Each request contains:
+1. A request id.
+2. A marker name for clinical context.
+3. The originally reported unit and the canonical unit, if known.
+4. A provisional canonical value and optional provisional canonical reference bounds.
+5. Historical envelopes for that marker's prior canonical values and reference bounds.
+6. A list of candidate_factors. These are suggested factors, usually common powers of ten.
+   Each factor is multiplied onto the provisional value and its provisional reference bounds.
+
+For each request:
+- Prefer one of the provided candidate_factors when it is a good fit, because they are the
+  most common explanations for OCR or unit-scale mistakes.
+- The factor must satisfy: corrected_value = provisional_value * scale_factor.
+- Prefer the factor that makes both the value and the reference range align with the
+  marker's prior canonical history.
+- If none of the provided candidate_factors fit well, you may return a different
+  multiplicative factor, but only when it is clearly better supported by the value and
+  reference-range alignment.
+- If the value could legitimately vary this widely, the history looks too broad, or no
+  factor is clearly justified, return null.
 
 Return ONLY valid JSON as an object keyed by request id. Each value must be an object with:
 - "scale_factor": number or null
@@ -929,6 +1033,42 @@ async def infer_rescaling_factors(conversion_requests: list[UnitConversionReques
         len(conversion_requests),
         len(conversion_requests) - len(unresolved_requests),
         len(unresolved_requests),
+        len(merged_mapping),
+        time.perf_counter() - started_at,
+    )
+    return merged_mapping
+
+
+async def review_anomalous_rescaling(
+    requests: list[AnomalousRescalingRequest],
+) -> dict[str, float | None]:
+    """Review suspicious provisional canonical values for extra scale adjustment."""
+    if not requests:
+        return {}
+
+    started_at = time.perf_counter()
+    logger.info(
+        "Review anomalous rescaling start requests=%s batch_size=%s concurrency=%s",
+        len(requests),
+        ANOMALOUS_RESCALING_BATCH_SIZE,
+        ANOMALOUS_RESCALING_CONCURRENCY,
+    )
+
+    merged_mapping: dict[str, float | None] = {}
+    for batch_mapping in await _run_json_batches(
+        requests,
+        batch_size=ANOMALOUS_RESCALING_BATCH_SIZE,
+        concurrency=ANOMALOUS_RESCALING_CONCURRENCY,
+        request_name="review_anomalous_rescaling",
+        system_prompt=ANOMALOUS_RESCALING_SYSTEM_PROMPT,
+        build_user_text=_build_anomalous_rescaling_request_user_text,
+        parse_payload=_parse_anomalous_rescaling_response,
+    ):
+        merged_mapping.update(batch_mapping)
+
+    logger.info(
+        "Review anomalous rescaling finished requests=%s resolved=%s duration=%.2fs",
+        len(requests),
         len(merged_mapping),
         time.perf_counter() - started_at,
     )

@@ -778,7 +778,9 @@ async def test_qualitative_canonization_reuses_symbolic_rule_keys(session_factor
 
 
 @pytest.mark.asyncio
-async def test_apply_known_measurement_rules_resolves_threshold_qualitative_values_from_reference_bounds(session_factory):
+async def test_apply_known_measurement_rules_resolves_threshold_qualitative_values(
+    session_factory,
+):
     async with session_factory() as session:
         lab_file = LabFile(
             filename="qual-threshold.png",
@@ -876,3 +878,223 @@ async def test_request_job_rejects_blank_task_keys(session_factory):
                 task_key="   ",
                 priority=pipeline.PRIORITY_CANONIZE,
             )
+
+
+@pytest.mark.asyncio
+async def test_apply_known_measurement_rules_deterministically_rescales_same_unit_outlier(
+    session_factory,
+):
+    async with session_factory() as session:
+        group = MarkerGroup(name="Immune Test", display_order=10)
+        measurement_type = MeasurementType(
+            name="Lymphocytes (%)",
+            normalized_key="lymphocytes-percent",
+            group_name=group.name,
+            group=group,
+            canonical_unit="1",
+        )
+        alias = MeasurementAlias(
+            alias_name="Lymphocytes (%)",
+            normalized_key=normalize_marker_alias_key("Lymphocytes (%)"),
+            measurement_type=measurement_type,
+        )
+        historical_file_one = LabFile(
+            filename="history-one.pdf",
+            filepath="/tmp/history-one.pdf",
+            mime_type="application/pdf",
+        )
+        historical_file_two = LabFile(
+            filename="history-two.pdf",
+            filepath="/tmp/history-two.pdf",
+            mime_type="application/pdf",
+        )
+        current_file = LabFile(
+            filename="current.pdf",
+            filepath="/tmp/current.pdf",
+            mime_type="application/pdf",
+        )
+        current_measurement = Measurement(
+            lab_file=current_file,
+            raw_marker_name="Lymphocytes (%)",
+            normalized_marker_key=normalize_marker_alias_key("Lymphocytes (%)"),
+            original_value=29.2,
+            original_unit="1",
+            original_reference_low=25.0,
+            original_reference_high=50.0,
+        )
+        session.add_all(
+            [
+                group,
+                measurement_type,
+                alias,
+                historical_file_one,
+                historical_file_two,
+                current_file,
+                Measurement(
+                    lab_file=historical_file_one,
+                    measurement_type=measurement_type,
+                    raw_marker_name="Lymphocytes (%)",
+                    normalized_marker_key=normalize_marker_alias_key("Lymphocytes (%)"),
+                    original_value=0.27,
+                    original_unit="1",
+                    canonical_unit="1",
+                    canonical_value=0.27,
+                    canonical_reference_low=0.20,
+                    canonical_reference_high=0.45,
+                    normalization_status=pipeline.MEASUREMENT_STATE_RESOLVED,
+                ),
+                Measurement(
+                    lab_file=historical_file_two,
+                    measurement_type=measurement_type,
+                    raw_marker_name="Lymphocytes (%)",
+                    normalized_marker_key=normalize_marker_alias_key("Lymphocytes (%)"),
+                    original_value=0.29,
+                    original_unit="1",
+                    canonical_unit="1",
+                    canonical_value=0.29,
+                    canonical_reference_low=0.25,
+                    canonical_reference_high=0.50,
+                    normalization_status=pipeline.MEASUREMENT_STATE_RESOLVED,
+                ),
+                current_measurement,
+            ]
+        )
+        await session.commit()
+
+        requested_new_work = await pipeline._apply_known_measurement_rules(session, [current_measurement])
+        await session.commit()
+        await session.refresh(current_measurement)
+        rules = list((await session.execute(select(RescalingRule))).scalars())
+        jobs = list(
+            (
+                await session.execute(
+                    select(Job).where(Job.task_type == pipeline.TASK_REVIEW_ANOMALOUS_RESCALING)
+                )
+            ).scalars()
+        )
+
+    assert requested_new_work is False
+    assert current_measurement.normalization_status == pipeline.MEASUREMENT_STATE_RESOLVED
+    assert current_measurement.canonical_unit == "1"
+    assert current_measurement.canonical_value == pytest.approx(0.292)
+    assert current_measurement.canonical_reference_low == pytest.approx(0.25)
+    assert current_measurement.canonical_reference_high == pytest.approx(0.50)
+    assert jobs == []
+    assert rules == []
+
+
+@pytest.mark.asyncio
+async def test_apply_known_measurement_rules_applies_resolved_anomalous_review_job(
+    session_factory,
+):
+    async with session_factory() as session:
+        group = MarkerGroup(name="Immune Review Test", display_order=10)
+        measurement_type = MeasurementType(
+            name="Lymphocytes (%)",
+            normalized_key="lymphocytes-percent",
+            group_name=group.name,
+            group=group,
+            canonical_unit="1",
+        )
+        alias = MeasurementAlias(
+            alias_name="Lymphocytes (%)",
+            normalized_key=normalize_marker_alias_key("Lymphocytes (%)"),
+            measurement_type=measurement_type,
+        )
+        historical_file_one = LabFile(
+            filename="history-three.pdf",
+            filepath="/tmp/history-three.pdf",
+            mime_type="application/pdf",
+        )
+        historical_file_two = LabFile(
+            filename="history-four.pdf",
+            filepath="/tmp/history-four.pdf",
+            mime_type="application/pdf",
+        )
+        current_file = LabFile(
+            filename="review-current.pdf",
+            filepath="/tmp/review-current.pdf",
+            mime_type="application/pdf",
+        )
+        current_measurement = Measurement(
+            lab_file=current_file,
+            raw_marker_name="Lymphocytes (%)",
+            normalized_marker_key=normalize_marker_alias_key("Lymphocytes (%)"),
+            original_value=29.2,
+            original_unit="1",
+        )
+        session.add_all(
+            [
+                group,
+                measurement_type,
+                alias,
+                historical_file_one,
+                historical_file_two,
+                current_file,
+                Measurement(
+                    lab_file=historical_file_one,
+                    measurement_type=measurement_type,
+                    raw_marker_name="Lymphocytes (%)",
+                    normalized_marker_key=normalize_marker_alias_key("Lymphocytes (%)"),
+                    original_value=0.27,
+                    original_unit="1",
+                    canonical_unit="1",
+                    canonical_value=0.27,
+                    normalization_status=pipeline.MEASUREMENT_STATE_RESOLVED,
+                ),
+                Measurement(
+                    lab_file=historical_file_two,
+                    measurement_type=measurement_type,
+                    raw_marker_name="Lymphocytes (%)",
+                    normalized_marker_key=normalize_marker_alias_key("Lymphocytes (%)"),
+                    original_value=0.29,
+                    original_unit="1",
+                    canonical_unit="1",
+                    canonical_value=0.29,
+                    normalization_status=pipeline.MEASUREMENT_STATE_RESOLVED,
+                ),
+                current_measurement,
+            ]
+        )
+        await session.commit()
+
+        requested_new_work = await pipeline._apply_known_measurement_rules(session, [current_measurement])
+        await session.commit()
+        await session.refresh(current_measurement)
+        review_job = (
+            await session.execute(
+                select(Job).where(Job.task_type == pipeline.TASK_REVIEW_ANOMALOUS_RESCALING)
+            )
+        ).scalar_one()
+
+        assert requested_new_work is True
+        assert current_measurement.normalization_status == pipeline.MEASUREMENT_STATE_PENDING
+        assert job_service.json_loads(review_job.payload_json)["candidate_factors"] == [0.01]
+
+        review_job.status = job_service.JOB_STATUS_LEASED
+        review_job.lease_owner = "test-runtime"
+        review_job.lease_until = utc_now()
+        await session.flush()
+
+        with patch(
+            "illdashboard.services.pipeline.copilot_normalization.review_anomalous_rescaling",
+            new=AsyncMock(return_value={review_job.task_key: 0.01}),
+        ) as review_mock:
+            await pipeline._review_anomalous_rescaling_jobs(session, [review_job])
+            await session.commit()
+
+        await session.refresh(current_measurement)
+        requested_new_work = await pipeline._apply_known_measurement_rules(session, [current_measurement])
+        await session.commit()
+        await session.refresh(current_measurement)
+        rules = list((await session.execute(select(RescalingRule))).scalars())
+        resolved_job = await session.get(Job, review_job.id)
+
+    review_mock.assert_awaited_once()
+    assert requested_new_work is False
+    assert resolved_job is not None
+    assert resolved_job.status == job_service.JOB_STATUS_RESOLVED
+    assert job_service.json_loads(resolved_job.resolved_json)["scale_factor"] == pytest.approx(0.01)
+    assert current_measurement.normalization_status == pipeline.MEASUREMENT_STATE_RESOLVED
+    assert current_measurement.canonical_value == pytest.approx(0.292)
+    assert rules == []

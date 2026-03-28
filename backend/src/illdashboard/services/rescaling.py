@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,6 +38,194 @@ def apply_scale_factor(value: float | None, scale_factor: float | None) -> float
     if value is None or scale_factor is None:
         return value
     return value * scale_factor
+
+
+@dataclass(frozen=True)
+class MeasurementHistoryEnvelope:
+    measurement_type_id: int
+    value_count: int
+    file_count: int
+    value_min: float | None
+    value_max: float | None
+    reference_low_count: int
+    reference_low_min: float | None
+    reference_low_max: float | None
+    reference_high_count: int
+    reference_high_min: float | None
+    reference_high_max: float | None
+
+
+def _finite_number(value: float | None) -> float | None:
+    if value is None or not math.isfinite(value):
+        return None
+    return value
+
+
+def positive_ratio(min_value: float | None, max_value: float | None) -> float | None:
+    left = _finite_number(min_value)
+    right = _finite_number(max_value)
+    if left is None or right is None or left <= 0 or right <= 0:
+        return None
+    return max(left, right) / min(left, right)
+
+
+def value_outside_order_of_magnitude(
+    value: float | None,
+    min_value: float | None,
+    max_value: float | None,
+    *,
+    factor: float = 10.0,
+) -> bool:
+    numeric_value = _finite_number(value)
+    envelope_min = _finite_number(min_value)
+    envelope_max = _finite_number(max_value)
+    if (
+        numeric_value is None
+        or envelope_min is None
+        or envelope_max is None
+        or numeric_value <= 0
+        or envelope_min <= 0
+        or envelope_max <= 0
+    ):
+        return False
+    return numeric_value < envelope_min / factor or numeric_value > envelope_max * factor
+
+
+def value_within_envelope(
+    value: float | None,
+    min_value: float | None,
+    max_value: float | None,
+    *,
+    margin_ratio: float = 0.1,
+    absolute_margin: float = 1e-9,
+) -> bool:
+    numeric_value = _finite_number(value)
+    envelope_min = _finite_number(min_value)
+    envelope_max = _finite_number(max_value)
+    if numeric_value is None or envelope_min is None or envelope_max is None:
+        return False
+
+    lower_bound = min(envelope_min, envelope_max)
+    upper_bound = max(envelope_min, envelope_max)
+    lower_bound -= max(abs(lower_bound) * margin_ratio, absolute_margin)
+    upper_bound += max(abs(upper_bound) * margin_ratio, absolute_margin)
+    return lower_bound <= numeric_value <= upper_bound
+
+
+async def load_measurement_history_envelopes(
+    db: AsyncSession,
+    measurement_type_ids: Sequence[int],
+    *,
+    exclude_file_id: int | None = None,
+) -> dict[int, MeasurementHistoryEnvelope]:
+    # The anomaly gate reasons over already-normalized history so it can compare a
+    # new provisional canonical value/range against the stable marker envelope.
+    type_ids = [
+        measurement_type_id
+        for measurement_type_id in dict.fromkeys(measurement_type_ids)
+        if measurement_type_id
+    ]
+    if not type_ids:
+        return {}
+
+    query = (
+        select(
+            Measurement.measurement_type_id,
+            Measurement.lab_file_id,
+            Measurement.canonical_value,
+            Measurement.canonical_reference_low,
+            Measurement.canonical_reference_high,
+        )
+        .where(
+            Measurement.measurement_type_id.in_(type_ids),
+            Measurement.normalization_status == "resolved",
+            Measurement.canonical_value.is_not(None),
+        )
+        .order_by(Measurement.measurement_type_id.asc(), Measurement.id.asc())
+    )
+    if exclude_file_id is not None:
+        query = query.where(Measurement.lab_file_id != exclude_file_id)
+
+    result = await db.execute(query)
+    envelope_data: dict[int, dict[str, object]] = {
+        measurement_type_id: {
+            "file_ids": set(),
+            "value_count": 0,
+            "value_min": None,
+            "value_max": None,
+            "reference_low_count": 0,
+            "reference_low_min": None,
+            "reference_low_max": None,
+            "reference_high_count": 0,
+            "reference_high_min": None,
+            "reference_high_max": None,
+        }
+        for measurement_type_id in type_ids
+    }
+
+    for measurement_type_id, file_id, canonical_value, reference_low, reference_high in result.all():
+        if measurement_type_id is None:
+            continue
+        entry = envelope_data.setdefault(
+            measurement_type_id,
+            {
+                "file_ids": set(),
+                "value_count": 0,
+                "value_min": None,
+                "value_max": None,
+                "reference_low_count": 0,
+                "reference_low_min": None,
+                "reference_low_max": None,
+                "reference_high_count": 0,
+                "reference_high_min": None,
+                "reference_high_max": None,
+            },
+        )
+        file_ids = entry["file_ids"]
+        if isinstance(file_ids, set):
+            file_ids.add(file_id)
+
+        numeric_value = _finite_number(canonical_value)
+        if numeric_value is not None:
+            entry["value_count"] = int(entry["value_count"]) + 1
+            current_min = _finite_number(entry["value_min"])  # type: ignore[arg-type]
+            current_max = _finite_number(entry["value_max"])  # type: ignore[arg-type]
+            entry["value_min"] = numeric_value if current_min is None else min(current_min, numeric_value)
+            entry["value_max"] = numeric_value if current_max is None else max(current_max, numeric_value)
+
+        numeric_low = _finite_number(reference_low)
+        if numeric_low is not None:
+            entry["reference_low_count"] = int(entry["reference_low_count"]) + 1
+            current_min = _finite_number(entry["reference_low_min"])  # type: ignore[arg-type]
+            current_max = _finite_number(entry["reference_low_max"])  # type: ignore[arg-type]
+            entry["reference_low_min"] = numeric_low if current_min is None else min(current_min, numeric_low)
+            entry["reference_low_max"] = numeric_low if current_max is None else max(current_max, numeric_low)
+
+        numeric_high = _finite_number(reference_high)
+        if numeric_high is not None:
+            entry["reference_high_count"] = int(entry["reference_high_count"]) + 1
+            current_min = _finite_number(entry["reference_high_min"])  # type: ignore[arg-type]
+            current_max = _finite_number(entry["reference_high_max"])  # type: ignore[arg-type]
+            entry["reference_high_min"] = numeric_high if current_min is None else min(current_min, numeric_high)
+            entry["reference_high_max"] = numeric_high if current_max is None else max(current_max, numeric_high)
+
+    return {
+        measurement_type_id: MeasurementHistoryEnvelope(
+            measurement_type_id=measurement_type_id,
+            value_count=int(entry["value_count"]),
+            file_count=len(entry["file_ids"]) if isinstance(entry["file_ids"], set) else 0,
+            value_min=_finite_number(entry["value_min"]),  # type: ignore[arg-type]
+            value_max=_finite_number(entry["value_max"]),  # type: ignore[arg-type]
+            reference_low_count=int(entry["reference_low_count"]),
+            reference_low_min=_finite_number(entry["reference_low_min"]),  # type: ignore[arg-type]
+            reference_low_max=_finite_number(entry["reference_low_max"]),  # type: ignore[arg-type]
+            reference_high_count=int(entry["reference_high_count"]),
+            reference_high_min=_finite_number(entry["reference_high_min"]),  # type: ignore[arg-type]
+            reference_high_max=_finite_number(entry["reference_high_max"]),  # type: ignore[arg-type]
+        )
+        for measurement_type_id, entry in envelope_data.items()
+        if int(entry["value_count"]) > 0
+    }
 
 
 async def load_rescaling_rules(
@@ -101,7 +291,12 @@ async def load_rescaling_rule_guides(
     if not normalized_requests:
         return {}
 
-    unit_pairs = list(dict.fromkeys((original_key, canonical_key) for _, original_key, canonical_key in normalized_requests))
+    unit_pairs = list(
+        dict.fromkeys(
+            (original_key, canonical_key)
+            for _, original_key, canonical_key in normalized_requests
+        )
+    )
     filters = [
         and_(
             RescalingRule.normalized_original_unit == original_key,
