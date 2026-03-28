@@ -25,6 +25,23 @@ const DATE_INPUT_PATTERN = "^\\d{4}-\\d{2}(-\\d{2})?$";
 const DATE_INPUT_HINT = "Use YYYY-MM or YYYY-MM-DD.";
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
+function formatBarDuration(startTimestamp: number, endTimestamp: number) {
+  const diffMs = Math.abs(endTimestamp - startTimestamp);
+  const totalDays = Math.round(diffMs / ONE_DAY_MS);
+  if (totalDays < 1) {
+    return "<1 day";
+  }
+  if (totalDays < 14) {
+    return `${totalDays} day${totalDays === 1 ? "" : "s"}`;
+  }
+  const totalWeeks = Math.round(totalDays / 7);
+  if (totalDays < 60) {
+    return `${totalWeeks} week${totalWeeks === 1 ? "" : "s"}`;
+  }
+  const totalMonths = Math.round(totalDays / 30.44);
+  return `${totalMonths} month${totalMonths === 1 ? "" : "s"}`;
+}
+
 let draftRowCounter = 0;
 
 type TimelineRowKind = "medication" | "event";
@@ -1157,7 +1174,7 @@ export default function Medications() {
           <div>
             <h3>Shared timeline</h3>
             <div className="meds-card-meta">
-              Medications and events share one time axis so you can compare them directly.
+              Shared time axis for direct comparison.
             </div>
           </div>
         </div>
@@ -1192,7 +1209,7 @@ export default function Medications() {
                       row.kind === "event" ? "meds-timeline-kind-event" : "meds-timeline-kind-medication",
                     ].join(" ")}
                   >
-                    {row.kind === "event" ? "Event" : "Med"}
+                    {row.kind === "event" ? "Evt" : "Med"}
                   </span>
                   <strong>{row.name}</strong>
                 </div>
@@ -1215,7 +1232,7 @@ export default function Medications() {
                         <button
                           type="button"
                           key={bar.id}
-                          title={bar.rangeLabel}
+                          title={`${bar.rangeLabel}\n${formatBarDuration(bar.startTimestamp, bar.endTimestamp)}`}
                           className={[
                             "meds-timeline-bar",
                             bar.kind === "event" ? "meds-timeline-bar-event" : "",
@@ -1240,9 +1257,7 @@ export default function Medications() {
             ))}
 
             <p className="meds-timeline-caption">
-              Month-precision and day-precision dates can mix, same-month handoffs stay packed onto
-              one lane, point events are rendered by leaving the end blank, and ongoing events run
-              through the current day.
+              Dates can mix month and day precision. Same-month handoffs pack onto one lane.
             </p>
           </div>
         )}
