@@ -14,7 +14,9 @@ from illdashboard.services.markers import (
     SOME_OUT_OF_RANGE_TAG,
     combine_marker_tags,
     derived_range_tags,
+    latest_reference_range_for_history,
     marker_group_tag,
+    measurement_status_for_range,
 )
 
 
@@ -23,6 +25,9 @@ def _measurement(
     value: float | None = None,
     reference_low: float | None = None,
     reference_high: float | None = None,
+    original_reference_low: float | None = None,
+    original_reference_high: float | None = None,
+    qualitative_value: str | None = None,
     qualitative_bool: bool | None = None,
     unit_conversion_missing: bool = False,
 ) -> Measurement:
@@ -34,6 +39,9 @@ def _measurement(
         canonical_value=value,
         canonical_reference_low=reference_low,
         canonical_reference_high=reference_high,
+        original_reference_low=original_reference_low,
+        original_reference_high=original_reference_high,
+        qualitative_value=qualitative_value,
         qualitative_bool=qualitative_bool,
         measured_at=datetime(2026, 3, 15, tzinfo=UTC),
     )
@@ -121,6 +129,38 @@ def test_derived_range_tags_some_out_of_range_is_superset_of_other_out_of_range_
     assert SOME_OUT_OF_RANGE_TAG in all_out_of_range
     assert SOME_OUT_OF_RANGE_TAG in mostly_out_of_range
     assert MOSTLY_OUT_OF_RANGE_TAG in all_out_of_range
+
+
+def test_measurement_status_for_range_projects_unambiguous_threshold_values_into_numeric_buckets():
+    assert measurement_status_for_range(
+        _measurement(qualitative_value="<5", qualitative_bool=False),
+        0.0,
+        5.0,
+    ) == "in_range"
+    assert measurement_status_for_range(
+        _measurement(qualitative_value=">5", qualitative_bool=True),
+        0.0,
+        5.0,
+    ) == "high"
+    assert measurement_status_for_range(
+        _measurement(qualitative_value="<1", qualitative_bool=False),
+        None,
+        None,
+    ) == "in_range"
+
+
+def test_latest_reference_range_for_history_uses_latest_canonical_threshold_bounds():
+    measurements = [
+        _measurement(value=4.0, reference_low=0.0, reference_high=5.0),
+        _measurement(
+            qualitative_value="<5",
+            qualitative_bool=False,
+            reference_low=0.0,
+            reference_high=5.0,
+        ),
+    ]
+
+    assert latest_reference_range_for_history(measurements) == (0.0, 5.0)
 
 
 def test_combine_marker_tags_keeps_norange_when_history_still_has_unclassifiable_rows():

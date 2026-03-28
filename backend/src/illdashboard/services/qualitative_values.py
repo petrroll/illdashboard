@@ -45,17 +45,12 @@ def normalize_qualitative_key(value: str | None) -> str | None:
     return normalized or None
 
 
-def infer_threshold_qualitative_result(
-    value: str | None,
-    *,
-    reference_low: float | None,
-    reference_high: float | None,
-) -> tuple[str, bool] | None:
-    normalized = clean_qualitative_value(value)
-    if normalized is None:
+def _parse_threshold_qualitative_value(value: str | None) -> tuple[str, float, str] | None:
+    cleaned_value = clean_qualitative_value(value)
+    if cleaned_value is None:
         return None
 
-    normalized = normalized.replace("≤", "<=").replace("≥", ">=")
+    normalized = cleaned_value.replace("≤", "<=").replace("≥", ">=")
     match = _THRESHOLD_QUALITATIVE_VALUE_RE.fullmatch(normalized)
     if match is None:
         return None
@@ -68,6 +63,60 @@ def infer_threshold_qualitative_result(
     if not math.isfinite(threshold):
         return None
 
+    return operator, threshold, cleaned_value
+
+
+def infer_threshold_range_status(
+    value: str | None,
+    *,
+    reference_low: float | None,
+    reference_high: float | None,
+) -> str | None:
+    parsed = _parse_threshold_qualitative_value(value)
+    if parsed is None:
+        return None
+
+    operator, threshold, _cleaned_value = parsed
+    if operator in {"<", "<="}:
+        if reference_low is not None and threshold <= reference_low:
+            return "low"
+        if reference_high is not None and threshold <= reference_high and (reference_low is None or reference_low <= 0):
+            return "in_range"
+        if reference_low is None and reference_high is None:
+            return "in_range"
+        return None
+
+    if reference_high is not None and threshold >= reference_high:
+        return "high"
+    if reference_low is not None and threshold >= reference_low and reference_high is None:
+        return "in_range"
+    if reference_low is None and reference_high is None:
+        return "high"
+    return None
+
+
+def infer_threshold_qualitative_result(
+    value: str | None,
+    *,
+    reference_low: float | None,
+    reference_high: float | None,
+) -> tuple[str, bool] | None:
+    parsed = _parse_threshold_qualitative_value(value)
+    if parsed is None:
+        return None
+
+    operator, threshold, cleaned_value = parsed
+
+    if reference_low is not None and reference_high is not None:
+        range_status = infer_threshold_range_status(
+            cleaned_value,
+            reference_low=reference_low,
+            reference_high=reference_high,
+        )
+        if range_status is None:
+            return None
+        return cleaned_value, range_status in {"low", "high"}
+
     if reference_high is not None and math.isclose(threshold, reference_high, rel_tol=1e-6, abs_tol=1e-9):
         if operator in {"<", "<="}:
             return "negative", False
@@ -77,6 +126,16 @@ def infer_threshold_qualitative_result(
         if operator in {">", ">="}:
             return "negative", False
         return "positive", True
+
+    range_status = infer_threshold_range_status(
+        cleaned_value,
+        reference_low=reference_low,
+        reference_high=reference_high,
+    )
+    if range_status is not None:
+        # Preserve comparator text for display while projecting clearly one-
+        # sided thresholds into in-range versus out-of-range semantics.
+        return cleaned_value, range_status in {"low", "high"}
 
     return None
 

@@ -701,6 +701,37 @@ def test_infer_threshold_qualitative_result_uses_matching_reference_cutoffs():
     ) == ("positive", True)
 
 
+def test_infer_threshold_qualitative_result_uses_operator_direction_without_reference_bounds():
+    assert qualitative_values.infer_threshold_qualitative_result(
+        "<1.5",
+        reference_low=None,
+        reference_high=None,
+    ) == ("<1.5", False)
+    assert qualitative_values.infer_threshold_qualitative_result(
+        ">1.5",
+        reference_low=None,
+        reference_high=None,
+    ) == (">1.5", True)
+
+
+def test_infer_threshold_qualitative_result_uses_unambiguous_numeric_range_direction():
+    assert qualitative_values.infer_threshold_qualitative_result(
+        "<5",
+        reference_low=0.0,
+        reference_high=5.0,
+    ) == ("<5", False)
+    assert qualitative_values.infer_threshold_qualitative_result(
+        ">5",
+        reference_low=0.0,
+        reference_high=5.0,
+    ) == (">5", True)
+    assert qualitative_values.infer_threshold_qualitative_result(
+        ">1",
+        reference_low=0.0,
+        reference_high=5.0,
+    ) is None
+
+
 @pytest.mark.asyncio
 async def test_qualitative_rule_upsert_deduplicates_equivalent_values(session_factory):
     async with session_factory() as session:
@@ -818,6 +849,96 @@ async def test_apply_known_measurement_rules_resolves_threshold_qualitative_valu
     assert measurement.normalization_status == pipeline.MEASUREMENT_STATE_RESOLVED
     assert measurement.qualitative_value == "positive"
     assert measurement.qualitative_bool is True
+    assert jobs == []
+
+
+@pytest.mark.asyncio
+async def test_apply_known_measurement_rules_resolves_threshold_qualitative_values_without_reference_bounds(
+    session_factory,
+):
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="qual-threshold-no-range.png",
+            filepath="/tmp/qual-threshold-no-range.png",
+            mime_type="image/png",
+        )
+        group = MarkerGroup(name="Inflammation Threshold Test", display_order=10)
+        measurement_type = MeasurementType(
+            name="CRP",
+            normalized_key="crp",
+            group_name=group.name,
+            group=group,
+        )
+        alias = MeasurementAlias(
+            alias_name="CRP",
+            normalized_key=normalize_marker_alias_key("CRP"),
+            measurement_type=measurement_type,
+        )
+        measurement = Measurement(
+            lab_file=lab_file,
+            raw_marker_name="CRP",
+            normalized_marker_key=normalize_marker_alias_key("CRP"),
+            original_qualitative_value="<1.5",
+        )
+        session.add_all([lab_file, group, measurement_type, alias, measurement])
+        await session.commit()
+
+        requested_new_work = await pipeline._apply_known_measurement_rules(session, [measurement])
+        await session.commit()
+        await session.refresh(measurement)
+        jobs = list((await session.execute(select(Job).order_by(Job.id.asc()))).scalars())
+
+    assert requested_new_work is False
+    assert measurement.normalization_status == pipeline.MEASUREMENT_STATE_RESOLVED
+    assert measurement.qualitative_value == "<1.5"
+    assert measurement.qualitative_bool is False
+    assert jobs == []
+
+
+@pytest.mark.asyncio
+async def test_apply_known_measurement_rules_resolves_threshold_qualitative_values_with_unambiguous_numeric_range(
+    session_factory,
+):
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="qual-threshold-range.png",
+            filepath="/tmp/qual-threshold-range.png",
+            mime_type="image/png",
+        )
+        group = MarkerGroup(name="Inflammation Threshold Test", display_order=10)
+        measurement_type = MeasurementType(
+            name="CRP",
+            normalized_key="crp",
+            group_name=group.name,
+            group=group,
+        )
+        alias = MeasurementAlias(
+            alias_name="CRP",
+            normalized_key=normalize_marker_alias_key("CRP"),
+            measurement_type=measurement_type,
+        )
+        measurement = Measurement(
+            lab_file=lab_file,
+            raw_marker_name="CRP",
+            normalized_marker_key=normalize_marker_alias_key("CRP"),
+            original_qualitative_value="<5",
+            original_reference_low=0.0,
+            original_reference_high=5.0,
+        )
+        session.add_all([lab_file, group, measurement_type, alias, measurement])
+        await session.commit()
+
+        requested_new_work = await pipeline._apply_known_measurement_rules(session, [measurement])
+        await session.commit()
+        await session.refresh(measurement)
+        jobs = list((await session.execute(select(Job).order_by(Job.id.asc()))).scalars())
+
+    assert requested_new_work is False
+    assert measurement.normalization_status == pipeline.MEASUREMENT_STATE_RESOLVED
+    assert measurement.qualitative_value == "<5"
+    assert measurement.qualitative_bool is False
+    assert measurement.canonical_reference_low == pytest.approx(0.0)
+    assert measurement.canonical_reference_high == pytest.approx(5.0)
     assert jobs == []
 
 

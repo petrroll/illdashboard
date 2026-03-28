@@ -20,6 +20,7 @@ from illdashboard.models import (
     MeasurementAlias,
     MeasurementType,
 )
+from illdashboard.services import qualitative_values
 
 logger = logging.getLogger(__name__)
 
@@ -551,6 +552,14 @@ def measurement_status_for_range(
     reference_low: float | None,
     reference_high: float | None,
 ) -> str:
+    comparator_status = qualitative_values.infer_threshold_range_status(
+        measurement.qualitative_value,
+        reference_low=reference_low,
+        reference_high=reference_high,
+    )
+    if comparator_status is not None:
+        return comparator_status
+
     if measurement.qualitative_bool is True:
         return "positive"
     if measurement.qualitative_bool is False:
@@ -600,7 +609,13 @@ def latest_reference_range_for_history(measurements: list[Measurement]) -> tuple
         return None, None
 
     latest = measurements[-1]
-    if latest.canonical_value is None or getattr(latest, "unit_conversion_missing", False):
+    if getattr(latest, "unit_conversion_missing", False):
+        return None, None
+
+    if latest.canonical_reference_low is not None or latest.canonical_reference_high is not None:
+        return latest.canonical_reference_low, latest.canonical_reference_high
+
+    if latest.canonical_value is None:
         return None, None
 
     # Follow-up reports often omit the range even though the biomarker still has a

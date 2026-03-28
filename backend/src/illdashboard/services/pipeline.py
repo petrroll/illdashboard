@@ -2443,10 +2443,12 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
                                 rule.scale_factor,
                             )
         elif measurement.original_qualitative_value:
-            # Comparator cutoffs such as ">1.5" are only meaningful alongside
-            # the measurement's own reference bounds, so resolve those directly
-            # here instead of persisting a global raw-value rule that could be
-            # wrong for a different assay.
+            # Comparator cutoffs such as ">1.5" are safest to interpret next
+            # to the measurement's own bounds. Reprocessed two-sided intervals
+            # stay range-shaped (for example "<5" against "0-5" remains a
+            # comparator that lands in-range), while one-sided assay cutoffs can
+            # still collapse to qualitative positive/negative when the boundary
+            # itself is the meaning.
             threshold_result = qualitative_values.infer_threshold_qualitative_result(
                 measurement.original_qualitative_value,
                 reference_low=measurement.original_reference_low,
@@ -2454,6 +2456,8 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
             )
             if threshold_result is not None:
                 measurement.qualitative_value, measurement.qualitative_bool = threshold_result
+                measurement.canonical_reference_low = measurement.original_reference_low
+                measurement.canonical_reference_high = measurement.original_reference_high
             else:
                 qualitative_key = qualitative_values.normalize_qualitative_key(measurement.original_qualitative_value)
                 if qualitative_key is None:
