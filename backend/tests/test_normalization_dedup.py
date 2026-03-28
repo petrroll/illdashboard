@@ -232,6 +232,93 @@ async def test_source_canonization_rolls_back_cleanly_when_copilot_call_fails(se
 
 
 @pytest.mark.asyncio
+async def test_conversion_canonization_passes_cross_marker_guides_to_llm(session_factory):
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="conversion-guides.png",
+            filepath="/tmp/conversion-guides.png",
+            mime_type="image/png",
+        )
+        glucose = MeasurementType(
+            name="Glucose",
+            normalized_key="glucose",
+            group_name="Metabolic",
+            canonical_unit="mmol/L",
+        )
+        cholesterol = MeasurementType(
+            name="Cholesterol",
+            normalized_key="cholesterol",
+            group_name="Lipids",
+            canonical_unit="mmol/L",
+        )
+        session.add_all([lab_file, glucose, cholesterol])
+        await session.flush()
+
+        session.add(
+            Measurement(
+                lab_file=lab_file,
+                measurement_type=glucose,
+                raw_marker_name="Glucose",
+                normalized_marker_key=normalize_marker_alias_key("Glucose"),
+                original_value=90,
+                original_unit="mg/dL",
+                normalized_original_unit=rescaling.normalize_unit_key("mg/dL"),
+                original_reference_low=70,
+                original_reference_high=99,
+            )
+        )
+        await rescaling.upsert_rescaling_rules(
+            session,
+            [
+                {
+                    "measurement_type": cholesterol,
+                    "original_unit": "mg/dL",
+                    "canonical_unit": "mmol/L",
+                    "scale_factor": 0.0259,
+                }
+            ],
+        )
+        glucose_original_key = rescaling.normalize_unit_key("mg/dL")
+        glucose_canonical_key = rescaling.normalize_unit_key("mmol/L")
+        assert glucose_original_key is not None
+        assert glucose_canonical_key is not None
+        job = Job(
+            task_type=pipeline.TASK_CANONIZE_CONVERSION,
+            task_key=pipeline._conversion_task_key(glucose.normalized_key, glucose_original_key, glucose_canonical_key),
+            status=job_service.JOB_STATUS_LEASED,
+            lease_owner="test-runtime",
+            lease_until=utc_now(),
+            payload_json=job_service.json_dumps(
+                {
+                    "measurement_type_id": glucose.id,
+                    "original_unit": "mg/dL",
+                    "canonical_unit": "mmol/L",
+                }
+            ),
+        )
+        session.add(job)
+        await session.commit()
+
+        with patch(
+            "illdashboard.services.pipeline.copilot_normalization.infer_rescaling_factors",
+            new=AsyncMock(return_value={job.task_key: 0.0555}),
+        ) as infer_mock:
+            await pipeline._canonize_conversion_jobs(session, [job])
+            await session.commit()
+
+        request = infer_mock.await_args.args[0][0]
+        rules = await rescaling.load_rescaling_rules(session, [(glucose.id, "mg/dL", "mmol/L")])
+
+    assert request.marker_name == "Glucose"
+    assert request.original_unit == "mg/dL"
+    assert request.canonical_unit == "mmol/L"
+    assert [(example.marker_name, example.scale_factor) for example in request.guide_examples] == [
+        ("Cholesterol", pytest.approx(0.0259))
+    ]
+    assert rules[(glucose.id, "mg/dl", "mmol/l")].scale_factor == pytest.approx(0.0555)
+
+
+@pytest.mark.asyncio
 async def test_common_canonize_handlers_use_fresh_job_session(session_factory):
     runtime = pipeline.PipelineRuntime(session_factory)
 

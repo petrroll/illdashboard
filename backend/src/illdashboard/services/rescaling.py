@@ -79,6 +79,62 @@ async def load_rescaling_rules(
     }
 
 
+async def load_rescaling_rule_guides(
+    db: AsyncSession,
+    requests: list[tuple[int, str, str]],
+    *,
+    limit_per_request: int = 3,
+) -> dict[tuple[int, str, str], list[RescalingRule]]:
+    normalized_requests = list(
+        dict.fromkeys(
+            (
+                measurement_type_id,
+                original_key,
+                canonical_key,
+            )
+            for measurement_type_id, original_unit, canonical_unit in requests
+            if measurement_type_id is not None
+            if (original_key := normalize_unit_key(original_unit)) is not None
+            if (canonical_key := normalize_unit_key(canonical_unit)) is not None
+        )
+    )
+    if not normalized_requests:
+        return {}
+
+    unit_pairs = list(dict.fromkeys((original_key, canonical_key) for _, original_key, canonical_key in normalized_requests))
+    filters = [
+        and_(
+            RescalingRule.normalized_original_unit == original_key,
+            RescalingRule.normalized_canonical_unit == canonical_key,
+        )
+        for original_key, canonical_key in unit_pairs
+    ]
+    result = await db.execute(
+        select(RescalingRule)
+        .options(selectinload(RescalingRule.measurement_type))
+        .where(or_(*filters))
+        .order_by(RescalingRule.id.asc())
+    )
+
+    rules_by_pair: dict[tuple[str, str], list[RescalingRule]] = {}
+    for rule in result.scalars().all():
+        if rule.scale_factor is None:
+            continue
+        rules_by_pair.setdefault(
+            (rule.normalized_original_unit, rule.normalized_canonical_unit),
+            [],
+        ).append(rule)
+
+    return {
+        (measurement_type_id, original_key, canonical_key): [
+            rule
+            for rule in rules_by_pair.get((original_key, canonical_key), [])
+            if rule.measurement_type_id != measurement_type_id
+        ][:limit_per_request]
+        for measurement_type_id, original_key, canonical_key in normalized_requests
+    }
+
+
 async def upsert_rescaling_rules(
     db: AsyncSession,
     entries: list[dict],

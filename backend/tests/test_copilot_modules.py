@@ -1356,6 +1356,34 @@ def test_qualitative_normalization_prompt_includes_threshold_cutoff_guidance():
     assert 'means positive' in prompt
 
 
+def test_conversion_prompt_marks_cross_marker_guides_as_non_authoritative():
+    request = copilot_normalization.UnitConversionRequest(
+        id="glucose",
+        marker_name="Glucose",
+        original_unit="mg/dL",
+        canonical_unit="mmol/L",
+        example_value=90,
+        reference_low=70,
+        reference_high=99,
+        guide_examples=[
+            copilot_normalization.UnitConversionGuideExample(
+                marker_name="Cholesterol",
+                original_unit="mg/dL",
+                canonical_unit="mmol/L",
+                scale_factor=0.0259,
+            )
+        ],
+    )
+
+    prompt = copilot_normalization.UNIT_SCALE_SYSTEM_PROMPT
+    user_prompt = copilot_normalization._build_conversion_request_user_text([request])
+
+    assert "Guide examples from other markers are only hints" in prompt
+    assert "glucose and cholesterol" in prompt
+    assert "Guide examples from other markers (hints only; may be wrong for this marker):" in user_prompt
+    assert "marker=Cholesterol; original_unit=mg/dL; canonical_unit=mmol/L; scale_factor=0.0259" in user_prompt
+
+
 @pytest.mark.asyncio
 async def test_infer_rescaling_factors_splits_large_batches():
     responses = [

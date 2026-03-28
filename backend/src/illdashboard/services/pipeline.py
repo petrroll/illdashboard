@@ -1456,6 +1456,13 @@ async def _canonize_conversion_jobs(session: AsyncSession, jobs: list[Job]) -> N
             for _, measurement_type, original_unit, canonical_unit in conversion_jobs
         ],
     )
+    guide_rule_map = await rescaling.load_rescaling_rule_guides(
+        session,
+        [
+            (measurement_type.id, original_unit, canonical_unit)
+            for _, measurement_type, original_unit, canonical_unit in conversion_jobs
+        ],
+    )
     llm_requests: list[copilot_normalization.UnitConversionRequest] = []
     upsert_entries: list[dict] = []
     for job, measurement_type, original_unit, canonical_unit in conversion_jobs:
@@ -1480,6 +1487,18 @@ async def _canonize_conversion_jobs(session: AsyncSession, jobs: list[Job]) -> N
         sample = result.scalars().first()
         if sample is None or sample.original_value is None:
             continue
+        # Same unit pairs can still require different analyte-specific factors,
+        # so nearby examples only give the model context rather than a rule to copy.
+        guide_examples = [
+            copilot_normalization.UnitConversionGuideExample(
+                marker_name=guide_rule.measurement_type.name,
+                original_unit=guide_rule.original_unit,
+                canonical_unit=guide_rule.canonical_unit,
+                scale_factor=guide_rule.scale_factor,
+            )
+            for guide_rule in guide_rule_map.get((measurement_type.id, original_key, canonical_key), [])
+            if guide_rule.measurement_type is not None and guide_rule.scale_factor is not None
+        ]
         llm_requests.append(
             copilot_normalization.UnitConversionRequest(
                 id=job.task_key,
@@ -1489,6 +1508,7 @@ async def _canonize_conversion_jobs(session: AsyncSession, jobs: list[Job]) -> N
                 example_value=sample.original_value,
                 reference_low=sample.original_reference_low,
                 reference_high=sample.original_reference_high,
+                guide_examples=guide_examples,
             )
         )
         upsert_entries.append(

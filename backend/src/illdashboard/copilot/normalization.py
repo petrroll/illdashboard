@@ -113,6 +113,14 @@ class MarkerUnitGroup:
 
 
 @dataclass
+class UnitConversionGuideExample:
+    marker_name: str
+    original_unit: str
+    canonical_unit: str
+    scale_factor: float
+
+
+@dataclass
 class UnitConversionRequest:
     id: str
     marker_name: str
@@ -121,6 +129,7 @@ class UnitConversionRequest:
     example_value: int | float
     reference_low: float | None = None
     reference_high: float | None = None
+    guide_examples: list[UnitConversionGuideExample] = field(default_factory=list)
 
 
 @dataclass
@@ -244,6 +253,17 @@ def _build_conversion_request_user_text(batch_requests: list[UnitConversionReque
             f"reference_low={request.reference_low}; "
             f"reference_high={request.reference_high}\n"
         )
+        user_text += "  Guide examples from other markers (hints only; may be wrong for this marker):\n"
+        if request.guide_examples:
+            for guide_example in request.guide_examples:
+                user_text += (
+                    f"  - marker={guide_example.marker_name or '(unknown)'}; "
+                    f"original_unit={guide_example.original_unit or '(none)'}; "
+                    f"canonical_unit={guide_example.canonical_unit or '(none)'}; "
+                    f"scale_factor={guide_example.scale_factor}\n"
+                )
+        else:
+            user_text += "  - (none)\n"
     return user_text
 
 
@@ -470,6 +490,7 @@ conversion requests. Each request contains:
 3. An original unit.
 4. A canonical target unit.
 5. One or more example numeric values and optional reference bounds.
+6. Optional guide examples from other markers that use the same unit pair.
 
 For each request:
 - Return a multiplicative scale factor that converts numbers in the original unit into the
@@ -478,6 +499,10 @@ For each request:
 - Use a factor of 1 when the units are equivalent formatting variants.
 - If the conversion is unclear or not safely inferable as a simple multiplicative conversion,
     return null.
+- Guide examples from other markers are only hints, not authoritative rules.
+- Do not blindly copy a guide example. Some analytes share the same unit pair but still need
+    different factors because they convert different substances.
+- For example, mg/dL -> mmol/L uses different factors for glucose and cholesterol.
 - For dimensionless fraction units, remember that 1 L/L = 100%, 1 mL/L = 0.1%,
     and 1 % = 10 mL/L.
 - Be careful with count units. For example, converting /µL to 10^9/L uses a factor of 0.001,
