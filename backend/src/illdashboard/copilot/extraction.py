@@ -196,7 +196,34 @@ def _retryable_pdf_error_reason(exc: Exception) -> str:
     return exc.__class__.__name__
 
 
-MEDICAL_OCR_SYSTEM_PROMPT = """\
+# Keep the schema-critical extraction guidance in one place so both structured
+# extraction backends apply the same value and bound semantics.
+MEASUREMENT_VALUE_RULES = """\
+- Numeric results -> JSON number.
+- Qualitative results -> short string such as "positive", "negative", "reactive", "detected", or "not detected".
+- "reference_low" and "reference_high" -> JSON number or null.\
+"""
+
+
+MEASUREMENT_REFERENCE_BOUND_RULES = """\
+Reference bounds:
+- Two-sided interval a-b -> reference_low=a, reference_high=b.
+- One-sided cutoff: store the threshold on the abnormal side.
+- >= X means positive/high/reactive -> reference_low=null, reference_high=X.
+- <= X means positive/low/deficient -> reference_low=X, reference_high=null.
+- Example: "negative <33.8 BAU/ml, positive >=33.8 BAU/ml" -> reference_low=null, reference_high=33.8.\
+"""
+
+
+MEASUREMENT_EXTRACTION_RULES = f"""\
+- Include every measured marker, including qualitative serology and immunology results.
+- Keep marker names specific, including organism and antibody class when shown.
+- Do not skip dense semicolon-separated or comma-separated sections; split each assay/result into its own measurement object.
+{MEASUREMENT_REFERENCE_BOUND_RULES}\
+"""
+
+
+MEDICAL_OCR_SYSTEM_PROMPT = f"""\
 You are a medical lab report extraction assistant. The user will provide an image or \
 PDF of a document. Your job is to:
 
@@ -214,24 +241,15 @@ PDF of a document. Your job is to:
 If the document is not a lab report, return an empty "measurements" array instead of inventing measurements.
 
 CRITICAL rules for values:
-- Use a JSON number in "value" when the report shows a numeric result.
- - Use a short JSON string in "value" when the report shows a qualitative
-   result such as "positive", "negative", "reactive", "non-reactive",
-   "detected", or "not detected".
+{MEASUREMENT_VALUE_RULES}
 - Do NOT omit a marker just because its value is qualitative.
-- "reference_low" and "reference_high" MUST be JSON numbers or null.
 - Use a dot (.) as the decimal separator, never a comma or space. E.g. 0.1, not "0,1" or "0 1".
 - Do NOT insert spaces into numbers. E.g. 1500, not "1 500".
 - If a value is less than 1, include the leading zero: 0.1, not .1.
 - Read decimal points carefully – "0.1" (zero point one) is very different from "1".
 
 CRITICAL extraction rules:
- - Do not skip dense semicolon-separated or comma-separated sections. Split
-   every assay/result pair into its own measurement object.
- - Serology and immunology pages often list many markers inline on one line.
-   Extract every marker, even when many share the same sentence.
- - Keep marker names specific. For example, include the organism plus antibody
-   class such as "Chlamydia psittaci IgG" rather than only "IgG".
+{MEASUREMENT_EXTRACTION_RULES}
 
 When multiple pages/images are attached, number them starting from 1 in the \
 order they are provided and set "page_number" accordingly for every measurement.
@@ -239,7 +257,7 @@ If there is only one page/image, set "page_number" to 1 for all measurements.
 
 Use the provided original filename as an additional hint for the source only when it helps.
 
-Return ONLY valid JSON: {"lab_date": "...", "source": "...", "measurements": [...]}.
+Return ONLY valid JSON: {{"lab_date": "...", "source": "...", "measurements": [...]}}.
 Do not include any commentary outside the JSON.\
 """
 
@@ -342,13 +360,12 @@ MISTRAL_MEDICAL_ANNOTATION_FORMAT = {
 }
 
 
-MISTRAL_MEDICAL_ANNOTATION_PROMPT = """\
+MISTRAL_MEDICAL_ANNOTATION_PROMPT = f"""\
 Extract all lab values from this lab report.
 
-Requirements:
-- Include every measured marker, including qualitative serology and immunology results.
-- Keep marker names specific.
-- Use a JSON number for numeric values and a short string for qualitative values.
+Rules:
+{MEASUREMENT_EXTRACTION_RULES}
+{MEASUREMENT_VALUE_RULES}
 - Set page_number relative to the attached batch, starting from 1.
 - Return an empty measurements array when the document is not a lab report.\
 """

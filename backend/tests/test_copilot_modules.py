@@ -713,6 +713,15 @@ def test_medical_summary_prompts_prefer_document_level_dates():
     assert "document as a whole" in text_prompt
 
 
+def test_medical_extraction_prompts_share_reference_bound_guidance():
+    shared_rules = copilot_ocr.MEASUREMENT_REFERENCE_BOUND_RULES.strip()
+
+    assert "positive >=33.8 BAU/ml" in shared_rules
+    assert "reference_low=null, reference_high=33.8" in shared_rules
+    assert shared_rules in copilot_ocr.MEDICAL_OCR_SYSTEM_PROMPT
+    assert shared_rules in copilot_ocr.MISTRAL_MEDICAL_ANNOTATION_PROMPT
+
+
 @pytest.mark.asyncio
 async def test_generate_summary_uses_a_single_prompt_pass_for_lab_date():
     raw_text = (
