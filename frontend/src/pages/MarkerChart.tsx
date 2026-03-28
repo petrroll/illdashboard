@@ -58,6 +58,7 @@ import {
 
 const LIST_PANE_STORAGE_KEY = "illdashboard.markerListWidth";
 const TIME_WEIGHTED_AXIS_STORAGE_KEY = "illdashboard.markerDetail.timeWeightedAxis";
+const COLLAPSED_GROUPS_STORAGE_KEY = "illdashboard.collapsedGroups";
 const MIN_LIST_PANE_WIDTH = 300;
 const DEFAULT_LIST_PANE_WIDTH = 680;
 const MAX_LIST_PANE_WIDTH = 680;
@@ -123,6 +124,19 @@ function getStoredTimeWeightedAxis() {
   }
 
   return window.localStorage.getItem(TIME_WEIGHTED_AXIS_STORAGE_KEY) === "true";
+}
+
+function getStoredCollapsedGroups(): Set<string> {
+  if (typeof window === "undefined") {
+    return new Set();
+  }
+
+  try {
+    const raw = window.localStorage.getItem(COLLAPSED_GROUPS_STORAGE_KEY);
+    return raw ? new Set(JSON.parse(raw) as string[]) : new Set();
+  } catch {
+    return new Set();
+  }
 }
 
 function formatQualitativeStatusLabel(item: MarkerOverviewItem) {
@@ -223,6 +237,7 @@ export default function MarkerChart() {
   const [allMarkerTags, setAllMarkerTags] = useState<string[]>([]);
   const [filterTags, setFilterTags] = useState<string[]>([]);
   const [timeWeightedAxis, setTimeWeightedAxis] = useState(getStoredTimeWeightedAxis);
+  const [collapsedGroups, setCollapsedGroups] = useState(getStoredCollapsedGroups);
 
   const clampListPaneWidth = (nextWidth: number) => {
     const browserWidth = markerBrowserRef.current?.clientWidth ?? window.innerWidth;
@@ -287,6 +302,13 @@ export default function MarkerChart() {
   useEffect(() => {
     window.localStorage.setItem(TIME_WEIGHTED_AXIS_STORAGE_KEY, String(timeWeightedAxis));
   }, [timeWeightedAxis]);
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      COLLAPSED_GROUPS_STORAGE_KEY,
+      JSON.stringify([...collapsedGroups]),
+    );
+  }, [collapsedGroups]);
 
   useEffect(() => {
     if (!selectedMarker) return;
@@ -480,6 +502,18 @@ export default function MarkerChart() {
     });
   }, [chartMeasurements, refLow, refHigh]);
 
+  const toggleGroupCollapsed = (groupName: string) => {
+    setCollapsedGroups((previous) => {
+      const next = new Set(previous);
+      if (next.has(groupName)) {
+        next.delete(groupName);
+      } else {
+        next.add(groupName);
+      }
+      return next;
+    });
+  };
+
   const selectMarker = (markerName: string) => {
     startTransition(() => {
       setSelectedMarker(markerName);
@@ -658,13 +692,22 @@ export default function MarkerChart() {
         ) : (
           <div className="marker-groups">
             {filteredOverview.map((group) => (
-              <section key={group.group_name} className="marker-group">
-                <header className="marker-group-header">
-                  <h3>{group.group_name}</h3>
+              <section key={group.group_name} className={`marker-group ${collapsedGroups.has(group.group_name) ? "marker-group-collapsed" : ""}`}>
+                <header
+                  className="marker-group-header"
+                  onClick={() => toggleGroupCollapsed(group.group_name)}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleGroupCollapsed(group.group_name); } }}
+                >
+                  <h3>
+                    <span className="marker-group-toggle">{collapsedGroups.has(group.group_name) ? "▶" : "▼"}</span>
+                    {group.group_name}
+                  </h3>
                   <span>{group.markers.length}</span>
                 </header>
 
-                <div className="marker-group-table" role="list">
+                {!collapsedGroups.has(group.group_name) && <div className="marker-group-table" role="list">
                   <div className="marker-row marker-row-legend" aria-hidden="true">
                     <div className="marker-row-name"><strong>Marker</strong></div>
                     <div className="marker-row-value"><strong>Last result</strong></div>
@@ -740,7 +783,7 @@ export default function MarkerChart() {
                       </button>
                     );
                   })}
-                </div>
+                </div>}
               </section>
             ))}
           </div>
