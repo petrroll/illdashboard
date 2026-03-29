@@ -19,6 +19,7 @@ import type {
   MedicationEpisode,
   MedicationWrite,
 } from "../types";
+import { formatYearMonthFromTimestamp } from "../utils/measurements";
 import "./Medications.css";
 
 const DATE_INPUT_PATTERN = "^\\d{4}-\\d{2}(-\\d{2})?$";
@@ -322,11 +323,7 @@ function parseEpisodeTimestamp(value: string | null, boundary: "start" | "end") 
 }
 
 function formatTimelineTick(timestamp: number) {
-  return new Date(timestamp).toLocaleDateString(undefined, {
-    month: "short",
-    year: "numeric",
-    timeZone: "UTC",
-  });
+  return formatYearMonthFromTimestamp(timestamp);
 }
 
 function sortMedicationEpisodesByStart(left: MedicationEpisode, right: MedicationEpisode) {

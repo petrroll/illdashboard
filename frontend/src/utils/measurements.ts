@@ -5,6 +5,28 @@ const SIGNIFICANT_VALUE_FORMATTER = new Intl.NumberFormat(undefined, {
   maximumSignificantDigits: 6,
   useGrouping: false,
 });
+const ISO_DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const ISO_YEAR_MONTH_PATTERN = /^\d{4}-\d{2}$/;
+// Use an explicit ISO-like locale so UI dates stay stable regardless of the
+// browser language list or OS regional defaults.
+const ISO_DATE_FORMATTER = new Intl.DateTimeFormat("sv-SE", {
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+const ISO_DATE_TIME_FORMATTER = new Intl.DateTimeFormat("sv-SE", {
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+const ISO_YEAR_MONTH_FORMATTER = new Intl.DateTimeFormat("sv-SE", {
+  year: "numeric",
+  month: "2-digit",
+  timeZone: "UTC",
+});
 const DEFAULT_NUMERIC_AXIS_DOMAIN: [number, number] = [0, 1];
 const DEFAULT_NUMERIC_AXIS_TICKS = [0, 0.5, 1];
 const NICE_AXIS_STEP_FACTORS = [1, 2, 2.5, 5, 10] as const;
@@ -560,12 +582,26 @@ export function getEffectiveMeasuredAt(
   return measurement.effective_measured_at ?? measurement.measured_at ?? null;
 }
 
-export function formatDate(value: string | null, options?: Intl.DateTimeFormatOptions) {
+function parseDateValue(value: string) {
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime()) ? parsed : null;
+}
+
+export function formatDate(value: string | null) {
   if (!value) {
     return "—";
   }
 
-  return new Date(value).toLocaleDateString(undefined, options);
+  const normalized = value.trim();
+  if (!normalized) {
+    return "—";
+  }
+  if (ISO_DATE_ONLY_PATTERN.test(normalized) || ISO_YEAR_MONTH_PATTERN.test(normalized)) {
+    return normalized;
+  }
+
+  const parsed = parseDateValue(normalized);
+  return parsed ? ISO_DATE_FORMATTER.format(parsed) : normalized;
 }
 
 export function formatDateTime(value: string | null) {
@@ -573,7 +609,51 @@ export function formatDateTime(value: string | null) {
     return "—";
   }
 
-  return new Date(value).toLocaleString();
+  const normalized = value.trim();
+  if (!normalized) {
+    return "—";
+  }
+  if (ISO_DATE_ONLY_PATTERN.test(normalized) || ISO_YEAR_MONTH_PATTERN.test(normalized)) {
+    return normalized;
+  }
+
+  const parsed = parseDateValue(normalized);
+  return parsed ? ISO_DATE_TIME_FORMATTER.format(parsed) : normalized;
+}
+
+export function formatDateFromTimestamp(value: number | null) {
+  if (value == null || !Number.isFinite(value)) {
+    return "—";
+  }
+
+  return ISO_DATE_FORMATTER.format(new Date(value));
+}
+
+export function formatYearMonthFromTimestamp(value: number | null) {
+  if (value == null || !Number.isFinite(value)) {
+    return "—";
+  }
+
+  return ISO_YEAR_MONTH_FORMATTER.format(new Date(value));
+}
+
+export function formatEditableDateInputValue(value: string | null | undefined) {
+  return value ? value.slice(0, 10) : "";
+}
+
+export function normalizeEditableIsoDate(value: string) {
+  const normalized = value.trim();
+  if (!normalized) {
+    return "";
+  }
+  if (!ISO_DATE_ONLY_PATTERN.test(normalized)) {
+    throw new Error("Use YYYY-MM-DD.");
+  }
+  return normalized;
+}
+
+export function toUtcNoonIsoDate(value: string) {
+  return `${value}T12:00:00Z`;
 }
 
 export function getMeasurementValueClass(measurement: {

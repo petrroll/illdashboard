@@ -22,6 +22,7 @@ import type { ExplainRequest, LabFile, Measurement } from "../types";
 import {
   areUnitsEquivalent,
   formatEditableMeasurementReferenceRange,
+  formatEditableDateInputValue,
   formatEditableMeasurementUnits,
   formatEditableMeasurementValue,
   formatDate,
@@ -46,7 +47,9 @@ import {
   hasRescaledMeasurementValue,
   isUnitConversionMissing,
   looksLikeQualitativeExpression,
+  normalizeEditableIsoDate,
   parseEditableReferenceRange,
+  toUtcNoonIsoDate,
 } from "../utils/measurements";
 import {
   getShareExportFileTextPreview,
@@ -101,14 +104,6 @@ function isTextPreviewMime(mimeType: string | null | undefined) {
 
 function isMarkdownPreviewMime(mimeType: string | null | undefined) {
   return mimeType === "text/markdown";
-}
-
-function toDateInputValue(value: string | null | undefined) {
-  return value ? value.slice(0, 10) : "";
-}
-
-function toUtcNoonIso(dateValue: string) {
-  return `${dateValue}T12:00:00Z`;
 }
 
 function getProgressSummary(file: LabFile) {
@@ -363,9 +358,11 @@ export default function FileDetail() {
       return;
     }
 
+    const normalizedDate = normalizeEditableIsoDate(nextLabDate);
+
     setFile(
       await patchFile(fileId, {
-        lab_date: nextLabDate ? toUtcNoonIso(nextLabDate) : null,
+        lab_date: normalizedDate ? toUtcNoonIsoDate(normalizedDate) : null,
       }),
     );
     await refreshMeasurements();
@@ -439,8 +436,10 @@ export default function FileDetail() {
   };
 
   const saveMeasurementDate = async (measurement: Measurement, nextMeasuredAt: string) => {
+    const normalizedDate = normalizeEditableIsoDate(nextMeasuredAt);
+
     await patchMeasurement(measurement.id, {
-      measured_at: nextMeasuredAt ? toUtcNoonIso(nextMeasuredAt) : null,
+      measured_at: normalizedDate ? toUtcNoonIsoDate(normalizedDate) : null,
     });
     await refreshMeasurements();
   };
@@ -512,15 +511,16 @@ export default function FileDetail() {
           <span>Uploaded {formatDateTime(file.uploaded_at)}</span>
           <InlineEditableValue
             display={<span>· Lab date: {formatDate(file.lab_date)}</span>}
-            editValue={toDateInputValue(file.lab_date)}
+            editValue={formatEditableDateInputValue(file.lab_date)}
             onSave={saveFileLabDate}
             onReset={resetFileLabDate}
             edited={file.user_edited_fields?.includes("lab_date")}
             readOnly={shareExportMode}
-            inputType="date"
+            placeholder="YYYY-MM-DD"
             ariaLabel={`Edit lab date for ${file.filename}`}
             title="Double-click to override the file lab date"
-            hint="Used as the fallback date when a measurement does not include its own timestamp."
+            monospace
+            hint="Use YYYY-MM-DD. This stays ISO so the browser cannot reorder it by locale."
           />
         </div>
       </div>
@@ -914,15 +914,16 @@ export default function FileDetail() {
                         <td>
                           <InlineEditableValue
                             display={<span>{formatDate(getEffectiveMeasuredAt(measurement))}</span>}
-                            editValue={toDateInputValue(getEffectiveMeasuredAt(measurement))}
+                            editValue={formatEditableDateInputValue(getEffectiveMeasuredAt(measurement))}
                             onSave={(nextValue) => saveMeasurementDate(measurement, nextValue)}
                             onReset={() => resetMeasurementDate(measurement)}
                             edited={hasEditedMeasurementField(measurement, "measured_at")}
                             readOnly={shareExportMode}
-                            inputType="date"
+                            placeholder="YYYY-MM-DD"
                             ariaLabel={`Edit measurement date for ${measurement.marker_name}`}
                             title="Double-click to override the measurement date"
-                            hint="Overrides the explicit measurement date used for chronology and chart ordering."
+                            monospace
+                            hint="Use YYYY-MM-DD. This overrides the explicit measurement date used for chronology and chart ordering."
                           />
                         </td>
                         {hasPages && showPageColumn && (

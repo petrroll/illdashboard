@@ -9,6 +9,7 @@ import MarkerChart from "./pages/MarkerChart";
 import Medications from "./pages/Medications";
 import Search from "./pages/Search";
 import Exports from "./pages/Exports";
+import { formatDateTime } from "./utils/measurements";
 import "./App.css";
 
 const navigationItems = [
@@ -58,7 +59,7 @@ function App() {
             <div className="card" style={{ marginBottom: "1rem", padding: "0.9rem 1rem" }}>
               <strong>Shareable snapshot.</strong>{" "}
               Opened from a single exported HTML file created{" "}
-              {new Date(shareExport.exported_at).toLocaleString()}. Browsing and search work locally,
+              {formatDateTime(shareExport.exported_at)}. Browsing and search work locally,
               but uploads, reprocessing, and summaries are disabled.
             </div>
           )}

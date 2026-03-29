@@ -36,10 +36,12 @@ import type {
 import {
   areUnitsEquivalent,
   buildNiceNumericAxis,
+  formatEditableDateInputValue,
   formatEditableMeasurementReferenceRange,
   formatEditableMeasurementUnits,
   formatEditableMeasurementValue,
   formatDate,
+  formatDateFromTimestamp,
   formatMeasurementScalarValue,
   formatMeasurementValue,
   formatPreferredMeasurementScalarValue,
@@ -62,7 +64,9 @@ import {
   hasRescaledMeasurementValue,
   isUnitConversionMissing,
   looksLikeQualitativeExpression,
+  normalizeEditableIsoDate,
   parseEditableReferenceRange,
+  toUtcNoonIsoDate,
 } from "../utils/measurements";
 import {
   getShareExportMarkerSparklineUrl,
@@ -119,15 +123,7 @@ function formatTimestampLabel(timestamp: number | null) {
     return "—";
   }
 
-  return new Date(timestamp).toLocaleDateString(undefined);
-}
-
-function toDateInputValue(value: string | null | undefined) {
-  return value ? value.slice(0, 10) : "";
-}
-
-function toUtcNoonIso(dateValue: string) {
-  return `${dateValue}T12:00:00Z`;
+  return formatDateFromTimestamp(timestamp);
 }
 
 function getMonthStartTimestamp(timestamp: number) {
@@ -743,8 +739,9 @@ export default function MarkerChart() {
     if (!detail) {
       throw new Error("Biomarker detail is still loading.");
     }
+    const normalizedDate = normalizeEditableIsoDate(nextMeasuredAt);
     await patchMeasurement(measurement.id, {
-      measured_at: nextMeasuredAt ? toUtcNoonIso(nextMeasuredAt) : null,
+      measured_at: normalizedDate ? toUtcNoonIsoDate(normalizedDate) : null,
     });
     await refreshMarkerDetail(detail.marker_name);
   };
@@ -1349,15 +1346,16 @@ export default function MarkerChart() {
                               <td>
                                 <InlineEditableValue
                                   display={<span>{formatDate(getEffectiveMeasuredAt(measurement))}</span>}
-                                  editValue={toDateInputValue(getEffectiveMeasuredAt(measurement))}
+                                  editValue={formatEditableDateInputValue(getEffectiveMeasuredAt(measurement))}
                                   onSave={(nextValue) => saveMeasurementDate(measurement, nextValue)}
                                   onReset={() => resetMeasurementDate(measurement)}
                                   edited={hasEditedMeasurementField(measurement, "measured_at")}
                                   readOnly={shareExportMode}
-                                  inputType="date"
+                                  placeholder="YYYY-MM-DD"
                                   ariaLabel={`Edit measurement date for ${detail.marker_name}`}
                                   title="Double-click to override the measurement date"
-                                  hint="Overrides the explicit measurement date used for chronology and chart ordering."
+                                  monospace
+                                  hint="Use YYYY-MM-DD. This overrides the explicit measurement date used for chronology and chart ordering."
                                 />
                               </td>
                               <td className={measurementValueClassName}>
