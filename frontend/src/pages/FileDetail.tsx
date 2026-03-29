@@ -2,8 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import {
-  explainMeasurement,
-  explainMeasurements,
   fetchFile,
   fetchFileMeasurements,
   fetchFilePageInfo,
@@ -18,7 +16,7 @@ import {
 import InlineEditableValue from "../components/InlineEditableValue";
 import StackedMeasurementValue from "../components/StackedMeasurementValue";
 import TagInput from "../components/TagInput";
-import type { ExplainRequest, LabFile, Measurement } from "../types";
+import type { LabFile, Measurement } from "../types";
 import {
   areUnitsEquivalent,
   formatEditableMeasurementReferenceRange,
@@ -33,9 +31,6 @@ import {
   formatPreferredReferenceRange,
   formatReferenceRange,
   getDisplayUnit,
-  getDisplayedMeasurementReferenceHigh,
-  getDisplayedMeasurementReferenceLow,
-  getDisplayedMeasurementValue,
   getEffectiveMeasuredAt,
   getMeasurementStatusClassName,
   getOriginalMeasurementReferenceHigh,
@@ -141,9 +136,6 @@ export default function FileDetail() {
   const [file, setFile] = useState<LabFile | null>(null);
   const [measurements, setMeasurements] = useState<Measurement[]>([]);
   const [ocrRunning, setOcrRunning] = useState(false);
-  const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [explanation, setExplanation] = useState<string | null>(null);
-  const [explaining, setExplaining] = useState(false);
   const [pageInfo, setPageInfo] = useState<PageInfo | null>(null);
   const [allFileTags, setAllFileTags] = useState<string[]>([]);
   const [highlightedPage, setHighlightedPage] = useState<number | null>(null);
@@ -268,17 +260,6 @@ export default function FileDetail() {
     };
   }, [fileId, pageInfo?.mime_type, shareExportMode]);
 
-  const requestExplanation = async (request: () => Promise<{ explanation: string }>) => {
-    setExplaining(true);
-    setExplanation(null);
-    try {
-      const response = await request();
-      setExplanation(response.explanation);
-    } finally {
-      setExplaining(false);
-    }
-  };
-
   const runOcr = async () => {
     if (!fileId) {
       return;
@@ -316,41 +297,6 @@ export default function FileDetail() {
     } finally {
       setExporting(null);
     }
-  };
-
-  const toggleSelect = (measurementId: number) => {
-    setSelected((previous) => {
-      const next = new Set(previous);
-      if (next.has(measurementId)) next.delete(measurementId);
-      else next.add(measurementId);
-      return next;
-    });
-  };
-
-  const explainSelected = async () => {
-    const items: ExplainRequest[] = measurements
-      .filter((measurement) => selected.has(measurement.id))
-      .map((measurement) => ({
-        marker_name: measurement.marker_name,
-        value: getDisplayedMeasurementValue(measurement),
-        qualitative_value: measurement.qualitative_value,
-        unit: getOriginalMeasurementUnit(measurement),
-        reference_low: getDisplayedMeasurementReferenceLow(measurement),
-        reference_high: getDisplayedMeasurementReferenceHigh(measurement),
-      }));
-    if (items.length === 0) return;
-    await requestExplanation(() => explainMeasurements(items));
-  };
-
-  const explainSingle = async (measurement: Measurement) => {
-    await requestExplanation(() => explainMeasurement({
-      marker_name: measurement.marker_name,
-      value: getDisplayedMeasurementValue(measurement),
-      qualitative_value: measurement.qualitative_value,
-      unit: getOriginalMeasurementUnit(measurement),
-      reference_low: getDisplayedMeasurementReferenceLow(measurement),
-      reference_high: getDisplayedMeasurementReferenceHigh(measurement),
-    }));
   };
 
   const saveFileLabDate = async (nextLabDate: string) => {
@@ -477,7 +423,6 @@ export default function FileDetail() {
   if (!fileId) return <p>File not found.</p>;
   if (!file) return <p>Loading…</p>;
 
-  const canExplain = !shareExportMode;
   const hasPages = pageInfo && pageInfo.page_count > 0;
   const isTextPreview = isTextPreviewMime(pageInfo?.mime_type);
   const shareExportTextPreview = shareExportMode
@@ -603,17 +548,6 @@ export default function FileDetail() {
               "Re-run processing"
             ) : (
               "Start processing"
-            )}
-          </button>
-        )}
-        {canExplain && selected.size > 0 && measurements.length > 0 && (
-          <button className="btn btn-outline" onClick={explainSelected} disabled={explaining}>
-            {explaining ? (
-              <>
-                <span className="spinner" /> Explaining…
-              </>
-            ) : (
-              `Explain ${selected.size} selected`
             )}
           </button>
         )}
@@ -779,14 +713,12 @@ export default function FileDetail() {
               <table>
                 <thead>
                   <tr>
-                    {canExplain && <th></th>}
                     <th>Marker</th>
                     <th>Value</th>
                     <th>Unit</th>
                     <th>Reference</th>
                     <th>Date</th>
                     {hasPages && showPageColumn && <th>Page</th>}
-                    {canExplain && <th></th>}
                   </tr>
                 </thead>
                 <tbody>
@@ -810,17 +742,6 @@ export default function FileDetail() {
 
                     return (
                       <tr key={measurement.id}>
-                        {canExplain && (
-                          <td>
-                            <label className="checkbox-row">
-                              <input
-                                type="checkbox"
-                                checked={selected.has(measurement.id)}
-                                onChange={() => toggleSelect(measurement.id)}
-                              />
-                            </label>
-                          </td>
-                        )}
                         <td style={{ fontWeight: 500 }}>
                           <Link
                             to={`/charts?marker=${encodeURIComponent(measurement.marker_name)}`}
@@ -940,28 +861,12 @@ export default function FileDetail() {
                             )}
                           </td>
                         )}
-                        {canExplain && (
-                          <td>
-                            <button className="btn btn-outline btn-sm" onClick={() => void explainSingle(measurement)}>
-                              Explain
-                            </button>
-                          </td>
-                        )}
                       </tr>
                     );
                   })}
                 </tbody>
               </table>
             </div>
-          )}
-
-          {!shareExportMode && explanation && (
-            <section className="card" style={{ marginTop: "1rem" }}>
-              <div style={{ color: "var(--text-muted)", fontSize: "0.8rem", marginBottom: "0.5rem" }}>
-                AI explanation
-              </div>
-              <ReactMarkdown>{explanation}</ReactMarkdown>
-            </section>
           )}
         </div>
       </div>
