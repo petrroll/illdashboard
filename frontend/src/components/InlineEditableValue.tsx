@@ -9,6 +9,9 @@ import {
   useState,
 } from "react";
 
+const EDITED_VALUE_TOOLTIP = "Value has been changed. Click to reset to original value.";
+const EDITED_VALUE_READONLY_TOOLTIP = "Value has been changed.";
+
 function getErrorMessage(error: unknown) {
   if (isAxiosError(error)) {
     const detail = error.response?.data?.detail;
@@ -267,13 +270,15 @@ export default function InlineEditableValue({
           role={readOnly ? undefined : "button"}
           title={readOnly ? undefined : title ?? "Double-click to edit"}
         >
-          <div className="inline-edit-display">{display}</div>
-          <div className="inline-edit-view-actions">
+          <div className="inline-edit-display-group">
+            <div className="inline-edit-display">{display}</div>
             {edited && onReset && !readOnly ? (
               <button
                 type="button"
                 className="inline-edit-badge inline-edit-badge--resettable"
-                title="Click to reset to original value"
+                title={resetting ? "Resetting original value..." : EDITED_VALUE_TOOLTIP}
+                aria-label={resetting ? "Resetting original value" : EDITED_VALUE_TOOLTIP}
+                aria-busy={resetting}
                 onClick={(event) => {
                   event.preventDefault();
                   event.stopPropagation();
@@ -281,10 +286,12 @@ export default function InlineEditableValue({
                 }}
                 disabled={resetting}
               >
-                {resetting ? "Resetting…" : "Edited"}
+                *
               </button>
             ) : edited ? (
-              <span className="inline-edit-badge">Edited</span>
+              <span className="inline-edit-badge" title={EDITED_VALUE_READONLY_TOOLTIP}>
+                *
+              </span>
             ) : null}
           </div>
         </div>
