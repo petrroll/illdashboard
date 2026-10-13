@@ -17,13 +17,8 @@ import fitz
 
 from illdashboard.config import settings
 from illdashboard.copilot import mistral_client
-from illdashboard.copilot.client import (
-    COPILOT_REQUEST_TIMEOUT,
-    get_copilot_request_load,
-)
-from illdashboard.copilot.client import (
-    _ask_json as copilot_ask_json,
-)
+from illdashboard.copilot.client import COPILOT_REQUEST_TIMEOUT, get_copilot_request_load
+from illdashboard.copilot.client import _ask_json as copilot_ask_json
 from illdashboard.services import file_types
 
 logger = logging.getLogger(__name__)
@@ -218,7 +213,8 @@ Reference bounds:
 MEASUREMENT_EXTRACTION_RULES = f"""\
 - Include every measured marker, including qualitative serology and immunology results.
 - Keep marker names specific, including organism and antibody class when shown.
-- Do not skip dense semicolon-separated or comma-separated sections; split each assay/result into its own measurement object.
+- Do not skip dense semicolon-separated or comma-separated sections; split each
+    assay/result into its own measurement object.
 {MEASUREMENT_REFERENCE_BOUND_RULES}\
 """
 

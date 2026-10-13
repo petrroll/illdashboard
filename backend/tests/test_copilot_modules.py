@@ -4,10 +4,12 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, create_autospec, patch
 
 import fitz
 import pytest
+from copilot import CopilotClient, CopilotSession
+from copilot.generated.rpc import PermissionDecisionReject
 
 from illdashboard.copilot import client as copilot_client
 from illdashboard.copilot import explanations as copilot_explanations
@@ -24,6 +26,8 @@ class DummySession:
         self._send_error = send_error
         self._usage_cost = usage_cost
         self.disconnect = AsyncMock()
+        self.abort = AsyncMock()
+        self.session_id = "test-session"
 
     def on(self, handler: Callable):
         self._handler = handler
@@ -1520,7 +1524,10 @@ async def test_ask_adds_observed_premium_usage_cost():
         response=SimpleNamespace(data=SimpleNamespace(content="ok")),
         usage_cost=1.0,
     )
-    client = SimpleNamespace(create_session=AsyncMock(return_value=session))
+    client = SimpleNamespace(
+        create_session=AsyncMock(return_value=session),
+        delete_session=AsyncMock(),
+    )
 
     with (
         patch("illdashboard.copilot.client._get_client", new=AsyncMock(return_value=client)),
@@ -1531,6 +1538,120 @@ async def test_ask_adds_observed_premium_usage_cost():
     assert result == "ok"
     add_mock.assert_called_once_with(1.0)
     session.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_client_uses_empty_sdk_mode(monkeypatch):
+    monkeypatch.setattr(copilot_client, "_client", None)
+    monkeypatch.setattr(copilot_client, "_client_storage", None)
+    with (
+        patch.object(CopilotClient, "start", new_callable=AsyncMock) as start,
+        patch.object(CopilotClient, "stop", new_callable=AsyncMock) as stop,
+    ):
+        try:
+            client = await copilot_client._get_client()
+            assert isinstance(client, CopilotClient)
+            assert await copilot_client._get_client() is client
+            storage_path = Path(copilot_client._client_storage.name)
+            assert storage_path.is_dir()
+            assert storage_path.stat().st_mode & 0o077 == 0
+        finally:
+            await copilot_client.shutdown_client()
+
+    start.assert_awaited_once()
+    stop.assert_awaited_once()
+    assert not storage_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_client_start_cleans_private_storage(monkeypatch):
+    monkeypatch.setattr(copilot_client, "_client", None)
+    monkeypatch.setattr(copilot_client, "_client_storage", None)
+    with (
+        patch.object(CopilotClient, "start", new=AsyncMock(side_effect=RuntimeError("startup failed"))),
+        patch.object(CopilotClient, "stop", new_callable=AsyncMock) as stop,
+        patch("illdashboard.copilot.client.TemporaryDirectory", wraps=copilot_client.TemporaryDirectory) as storage,
+    ):
+        with pytest.raises(RuntimeError, match="startup failed"):
+            await copilot_client._get_client()
+    stop.assert_awaited_once()
+    storage.assert_called_once()
+    assert copilot_client._client is None
+    assert copilot_client._client_storage is None
+
+
+@pytest.mark.asyncio
+async def test_ask_uses_sdk_contract_and_deletes_ephemeral_session():
+    session = create_autospec(CopilotSession, instance=True)
+    session.session_id = "ephemeral-session"
+    session.on.return_value = lambda: None
+    session.send_and_wait.return_value = SimpleNamespace(data=SimpleNamespace(content="ok"))
+    client = create_autospec(CopilotClient, instance=True)
+    client.create_session.return_value = session
+
+    with patch("illdashboard.copilot.client._get_client", new=AsyncMock(return_value=client)):
+        result = await copilot_client._ask(
+            "system",
+            "user",
+            attachments=[{"type": "file", "path": "/tmp/report.png"}],
+        )
+
+    assert result == "ok"
+    session_config = client.create_session.await_args.kwargs
+    assert session_config["available_tools"] == []
+    assert session_config["enable_skills"] is False
+    assert session_config["enable_session_store"] is False
+    denied = session_config["on_permission_request"](None, None)
+    assert isinstance(denied, PermissionDecisionReject)
+    assert denied.kind == "reject"
+    session.send_and_wait.assert_awaited_once_with(
+        "user",
+        attachments=[{"type": "file", "path": "/tmp/report.png"}],
+        timeout=copilot_client.COPILOT_REQUEST_TIMEOUT,
+    )
+    session.abort.assert_not_awaited()
+    client.delete_session.assert_awaited_once_with("ephemeral-session")
+    session.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ask_aborts_before_deleting_cancelled_session():
+    session = create_autospec(CopilotSession, instance=True)
+    session.session_id = "cancelled-session"
+    session.on.return_value = lambda: None
+    session.send_and_wait.side_effect = asyncio.CancelledError()
+    client = create_autospec(CopilotClient, instance=True)
+    client.create_session.return_value = session
+
+    with patch("illdashboard.copilot.client._get_client", new=AsyncMock(return_value=client)):
+        with pytest.raises(asyncio.CancelledError):
+            await copilot_client._ask("system", "user")
+
+    session.abort.assert_awaited_once()
+    client.delete_session.assert_awaited_once_with("cancelled-session")
+    session.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ask_aborts_before_deleting_session_when_waiting_task_is_cancelled():
+    release_event = asyncio.Event()
+    session = BlockingSession(release_event)
+    client = SimpleNamespace(
+        create_session=AsyncMock(return_value=session),
+        delete_session=AsyncMock(),
+    )
+
+    with patch("illdashboard.copilot.client._get_client", new=AsyncMock(return_value=client)):
+        task = asyncio.create_task(copilot_client._ask("system", "user"))
+        await _wait_for(lambda: client.create_session.await_count == 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    session.abort.assert_awaited_once()
+    session.disconnect.assert_awaited_once()
+    client.delete_session.assert_awaited_once_with(session.session_id)
+    client.delete_session.assert_awaited_once_with(session.session_id)
 
 
 @pytest.mark.asyncio
@@ -1556,9 +1677,7 @@ async def test_ask_uses_request_specific_session_settings(
             return_value=[
                 SimpleNamespace(
                     id="normalization-model",
-                    capabilities=SimpleNamespace(
-                        supports=SimpleNamespace(reasoning_effort=supports_reasoning_effort)
-                    ),
+                    supported_reasoning_efforts=["high"] if supports_reasoning_effort else [],
                 )
             ]
         ),
@@ -1577,7 +1696,7 @@ async def test_ask_uses_request_specific_session_settings(
         result = await copilot_client._ask("system", "user", request_name=request_name)
 
     assert result == "ok"
-    session_config = client.create_session.await_args.args[0]
+    session_config = client.create_session.await_args.kwargs
     assert session_config["model"] == expected_model
     assert session_config.get("reasoning_effort") == expected_reasoning_effort
     if expected_reasoning_effort is None:
@@ -1595,9 +1714,7 @@ async def test_ask_omits_reasoning_effort_for_models_without_support():
             return_value=[
                 SimpleNamespace(
                     id="normalization-model",
-                    capabilities=SimpleNamespace(
-                        supports=SimpleNamespace(reasoning_effort=False)
-                    ),
+                    supported_reasoning_efforts=[],
                 )
             ]
         ),
@@ -1611,7 +1728,7 @@ async def test_ask_omits_reasoning_effort_for_models_without_support():
         result = await copilot_client._ask("system", "user", request_name="normalize_marker_names")
 
     assert result == "ok"
-    session_config = client.create_session.await_args.args[0]
+    session_config = client.create_session.await_args.kwargs
     assert session_config["model"] == "normalization-model"
     assert "reasoning_effort" not in session_config
     client.list_models.assert_awaited_once()
@@ -1634,9 +1751,7 @@ async def test_ask_retries_session_create_without_reasoning_when_model_rejects_i
             return_value=[
                 SimpleNamespace(
                     id="normalization-model",
-                    capabilities=SimpleNamespace(
-                        supports=SimpleNamespace(reasoning_effort=True)
-                    ),
+                    supported_reasoning_efforts=["high"],
                 )
             ]
         ),
@@ -1651,8 +1766,8 @@ async def test_ask_retries_session_create_without_reasoning_when_model_rejects_i
 
     assert result == "ok"
     assert client.create_session.await_count == 2
-    first_config = client.create_session.await_args_list[0].args[0]
-    second_config = client.create_session.await_args_list[1].args[0]
+    first_config = client.create_session.await_args_list[0].kwargs
+    second_config = client.create_session.await_args_list[1].kwargs
     assert first_config["reasoning_effort"] == "high"
     assert "reasoning_effort" not in second_config
     session.disconnect.assert_awaited_once()
@@ -1721,6 +1836,7 @@ async def test_ask_adds_observed_usage_even_when_send_fails():
             await copilot_client._ask("system", "user")
 
     add_mock.assert_called_once_with(1.0)
+    session.abort.assert_awaited_once()
     session.disconnect.assert_awaited_once()
 
 
@@ -1741,7 +1857,7 @@ async def test_ask_retries_failed_to_list_models_with_fresh_client():
 
     assert result == "ok"
     assert client.create_session.await_count == 2
-    shutdown_mock.assert_awaited_once()
+    shutdown_mock.assert_not_awaited()
     failing_session.disconnect.assert_awaited_once()
     success_session.disconnect.assert_awaited_once()
 

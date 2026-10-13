@@ -58,9 +58,9 @@ build: build-backend build-frontend
 test-backend:
     cd backend && uv run pytest -v
 
-# Type-check frontend
+# Build and run frontend regression tests, including the standalone export shell
 test-frontend:
-    cd frontend && if [ ! -d node_modules ]; then npm ci; fi && npx tsc --noEmit
+    cd frontend && if [ ! -d node_modules ]; then npm ci; fi && npm run build && npm test
 
 # Run all tests
 test: test-backend test-frontend
@@ -69,9 +69,9 @@ test: test-backend test-frontend
 lint-backend:
     cd backend && uv run ruff check src/ tests/
 
-# Lint frontend with tsc
+# Lint frontend source with ESLint
 lint-frontend:
-    cd frontend && if [ ! -d node_modules ]; then npm ci; fi && npx tsc --noEmit
+    cd frontend && if [ ! -d node_modules ]; then npm ci; fi && npm run lint
 
 # Lint everything
 lint: lint-backend lint-frontend

@@ -181,6 +181,9 @@ Linux. A container cannot repair an incorrectly owned host checkout automaticall
 
 Use private forwarded ports, not Docker host port publishing or public Codespaces
 ports. The application handles personal health data and is not a public service.
+Browser-origin checks reject cross-site mutations, but they are not authentication
+or DNS-rebinding protection. Any non-browser client that can reach the backend can
+still access its data. Keep both forwarded ports private.
 
 Uploaded files, SQLite databases, and `backend/.env` remain in the mounted
 workspace across container rebuilds. Back them up before deleting a checkout,
@@ -234,10 +237,10 @@ Then open:
 | `just build-frontend` | Build the frontend bundle and share-export shell |
 | `just build` | Build both backend and frontend artifacts |
 | `just test-backend` | Run the backend pytest suite |
-| `just test-frontend` | Type-check the frontend with `tsc --noEmit` |
-| `just test` | Run backend tests and frontend type-checks |
+| `just test-frontend` | Type-check, build, and run frontend regression tests |
+| `just test` | Run backend tests and the frontend validation suite |
 | `just lint-backend` | Run `ruff check` on backend code |
-| `just lint-frontend` | Type-check the frontend with `tsc --noEmit` |
+| `just lint-frontend` | Run ESLint on frontend code |
 | `just lint` | Run backend and frontend validation |
 | `just fmt` | Format backend code and apply safe Ruff fixes |
 | `just run-log-viewer` | Serve the standalone `run.log` viewer on port `4173` |
@@ -285,12 +288,12 @@ Environment variables can come from the shell or from `backend/.env`.
 | `FRONTEND_DIST_DIR` | `frontend/dist` | Built frontend assets, including the share-export shell |
 | `EXTRACTION_PROVIDER` | `copilot` | Measurement/text extraction provider: `copilot` or `mistral` |
 | `NORMALIZATION_PROVIDER` | `copilot` | Normalization provider: `copilot` or `mistral` |
-| `COPILOT_DEFAULT_MODEL` | `gpt-5.4` | Default Copilot model for summary/general requests |
-| `COPILOT_MEASUREMENT_EXTRACTION_MODEL` | `gpt-5.4-mini` | Copilot model for measurement extraction |
+| `COPILOT_DEFAULT_MODEL` | `gpt-5.6-terra` | Default Copilot model for summary/general requests |
+| `COPILOT_MEASUREMENT_EXTRACTION_MODEL` | `gpt-6-luna` | Copilot model for measurement extraction |
 | `COPILOT_MEASUREMENT_EXTRACTION_REASONING_EFFORT` | unset | Optional `low` / `medium` / `high` / `xhigh` reasoning effort when the chosen model supports it |
-| `COPILOT_TEXT_EXTRACTION_MODEL` | `gpt-5.4-mini` | Copilot model for OCR text extraction and translation |
+| `COPILOT_TEXT_EXTRACTION_MODEL` | `gpt-6-luna` | Copilot model for OCR text extraction and translation |
 | `COPILOT_TEXT_EXTRACTION_REASONING_EFFORT` | unset | Optional reasoning effort for text extraction when supported |
-| `COPILOT_NORMALIZATION_MODEL` | `gpt-5.4-mini` | Copilot model for normalization jobs |
+| `COPILOT_NORMALIZATION_MODEL` | `gpt-6-luna` | Copilot model for normalization jobs |
 | `COPILOT_NORMALIZATION_REASONING_EFFORT` | unset | Optional reasoning effort for normalization when supported |
 | `MISTRAL_API_KEY` | optional | Mistral API key for local Mistral-backed runs |
 | `MISTRAL_API_BASE_URL` | `https://api.mistral.ai` | Base URL for the Mistral API |
@@ -299,8 +302,21 @@ Environment variables can come from the shell or from `backend/.env`.
 
 If you switch `EXTRACTION_PROVIDER=mistral`, structured extraction uses Mistral document annotations and text OCR adds an English translation pass through the configured Mistral chat model.
 
+Copilot SDK 1.0.21 requests use `empty` client mode with a private temporary storage directory, disabled skills and cross-session indexing, and denied tool permissions. Requests abort unfinished generation and delete ephemeral transcripts during cleanup; client shutdown removes its temporary directory. Configure an explicit `GITHUB_TOKEN`: an existing CLI login in another Copilot home is not a dependable fallback. Model IDs are passed through from these settings; there is no application-level model substitution. The application does not generate content during model discovery.
+
+### Copilot model policy
+
+Bulk measurement OCR, text extraction/translation, and normalization default to GPT-6 Luna (`gpt-6-luna`). Summary/general requests use GPT-5.6 Terra (`gpt-5.6-terra`). GitHub's [model comparison](https://docs.github.com/en/copilot/reference/ai-models/model-comparison) describes both GPT-5.6 Luna and GPT-6 Luna as fast, cost-efficient options for small or repetitive tasks, and Terra as a balanced general-purpose choice. This keeps repeated batches on Luna while reserving Terra's general-purpose profile for summaries. It is a pragmatic quality/cost starting point, not evidence that a higher version is more accurate, nor a live healthcare/OCR benchmark.
+
+Canonical literals were verified on 2026-10-13 in the official SDK CLI 1.0.97 software cache, `~/.cache/github-copilot-sdk/cli/1.0.97/prebuilds/linux-x64/runtime.node`: `gpt-6-luna`, `gpt-5.6-luna`, and `gpt-5.6-terra`. GitHub's [supported models reference](https://docs.github.com/en/copilot/reference/ai-models/supported-models) lists these models as GA with Copilot CLI support. GPT-5.6 Luna (`gpt-5.6-luna`) is an explicit alternative for the bulk settings; GitHub calls it the lowest-cost model in the GPT-5.6 family, not necessarily cheaper than GPT-6 Luna.
+
+Supported/configured does not mean available to this account: the SDK `list_models` check returned `Not authenticated`, so subscription/policy availability and live OCR quality remain unverified. No paid/live AI requests were made for this migration. Verify account access with an authenticated catalog check before processing documents, then evaluate accuracy on representative documents. Existing shell or `backend/.env` model overrides still take precedence; update or remove old overrides to adopt these defaults.
+
+Unset reasoning-effort overrides (`None`) preserve the selected model's default reasoning; they do not disable reasoning. Explicit effort settings are forwarded only when the model advertises support. Keep overrides unset unless measured quality gains justify the added batch latency/cost.
+
 ## Docs and developer tools
 
+- [2026-10-13 review and validation](docs/validation-review-2026-10-13.md) records fixes, checks, and remaining limitations.
 - [`docs/README.md`](docs/README.md) maps the current documentation set.
 - [`docs/artifact-first-pipeline.md`](docs/artifact-first-pipeline.md) describes the live runtime and worker topology.
 - [`docs/legacy-queue-backed-ocr-request-flow.md`](docs/legacy-queue-backed-ocr-request-flow.md) describes the pre-artifact-first design and is historical only.

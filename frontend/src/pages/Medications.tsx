@@ -338,17 +338,18 @@ function sortTimelineEventOccurrencesByStart(left: TimelineEventOccurrence, righ
   return leftTimestamp - rightTimestamp;
 }
 
-function getMonthKey(value: string | null) {
+function getMonthOnlyKey(value: string | null) {
   if (!value) {
     return "";
   }
   const normalized = value.trim();
-  return /^\d{4}-\d{2}(-\d{2})?$/.test(normalized) ? normalized.slice(0, 7) : "";
+  return /^\d{4}-\d{2}$/.test(normalized) ? normalized : "";
 }
 
 function canShareTimelineLane(previousBar: TimelineBar, nextBar: TimelineBar) {
+  // Only imprecise month boundaries may be coalesced; exact overlapping days need separate lanes.
   return (
-    nextBar.startTimestamp >= previousBar.endTimestamp
+    nextBar.startTimestamp > previousBar.endTimestamp
     || (previousBar.endMonthKey.length > 0 && previousBar.endMonthKey === nextBar.startMonthKey)
   );
 }
@@ -377,9 +378,12 @@ export default function Medications() {
   const shareExportMode = isShareExportMode();
   const [medications, setMedications] = useState<Medication[]>([]);
   const [events, setEvents] = useState<TimelineEvent[]>([]);
+  const [nowTimestamp, setNowTimestamp] = useState(() => Date.now());
   const [loading, setLoading] = useState(true);
   const [savingMedication, setSavingMedication] = useState(false);
   const [savingEvent, setSavingEvent] = useState(false);
+  // Saving resets the draft, so forms and timeline edit actions share the same lock.
+  const isSaving = savingMedication || savingEvent;
   const [deletingMedicationId, setDeletingMedicationId] = useState<number | null>(null);
   const [deletingEventId, setDeletingEventId] = useState<number | null>(null);
   const [editingMedicationId, setEditingMedicationId] = useState<number | null>(null);
@@ -393,20 +397,18 @@ export default function Medications() {
   const medicationNameInputRef = useRef<HTMLInputElement | null>(null);
   const eventEditorSectionRef = useRef<HTMLDivElement | null>(null);
   const eventNameInputRef = useRef<HTMLInputElement | null>(null);
+  const timelineLoadRevisionRef = useRef(0);
 
-  const loadTimelineData = useCallback(async () => {
+  const loadTimelineData = useCallback(() => {
     if (shareExportMode) {
       return;
     }
 
-    setLoading(true);
-    setErrorMessage(null);
-    try {
-      const [medicationsResponse, eventsResponse] = await Promise.all([
-        fetchMedications(),
-        fetchEvents(),
-      ]);
-
+    const revision = ++timelineLoadRevisionRef.current;
+    return Promise.all([fetchMedications(), fetchEvents()]).then(([medicationsResponse, eventsResponse]) => {
+      if (revision !== timelineLoadRevisionRef.current) return;
+      // Ongoing bars share the data snapshot's clock, not the time of an unrelated render.
+      setNowTimestamp(Date.now());
       setMedications(
         medicationsResponse.map((medication) => ({
           ...medication,
@@ -419,21 +421,23 @@ export default function Medications() {
           occurrences: event.occurrences.slice().sort(sortTimelineEventOccurrencesByStart),
         })),
       );
-    } catch (error) {
-      setErrorMessage(getErrorMessage(error));
-    } finally {
-      setLoading(false);
-    }
+    }).catch((error) => {
+      if (revision === timelineLoadRevisionRef.current) setErrorMessage(getErrorMessage(error));
+    }).finally(() => {
+      if (revision === timelineLoadRevisionRef.current) setLoading(false);
+    });
   }, [shareExportMode]);
 
   useEffect(() => {
     void loadTimelineData();
+    return () => { timelineLoadRevisionRef.current += 1; };
   }, [loadTimelineData]);
 
-  const timelineRows = useMemo<SharedTimelineRow[]>(() => {
-    const nowTimestamp = Date.now();
-    const currentMonthKey = new Date(nowTimestamp).toISOString().slice(0, 7);
+  useEffect(() => {
+    lastUsedTimelineEditorKind = activeEditorKind;
+  }, [activeEditorKind]);
 
+  const timelineRows = useMemo<SharedTimelineRow[]>(() => {
     const medicationRows = medications
       .map((medication) => {
         const bars = medication.episodes
@@ -456,10 +460,8 @@ export default function Medications() {
               startTimestamp,
               endTimestamp: Math.max(endTimestamp, startTimestamp),
               displayEndTimestamp: Math.max(endTimestamp, startTimestamp),
-              startMonthKey: getMonthKey(episode.start_on),
-              endMonthKey: getMonthKey(
-                episode.still_taking ? currentMonthKey : episode.end_on ?? episode.start_on,
-              ),
+              startMonthKey: getMonthOnlyKey(episode.start_on),
+              endMonthKey: episode.still_taking ? "" : getMonthOnlyKey(episode.end_on ?? episode.start_on),
               isOngoing: episode.still_taking,
             } satisfies TimelineBar;
           })
@@ -495,10 +497,8 @@ export default function Medications() {
               startTimestamp,
               endTimestamp: Math.max(endTimestamp, startTimestamp),
               displayEndTimestamp: Math.max(endTimestamp, startTimestamp),
-              startMonthKey: getMonthKey(occurrence.start_on),
-              endMonthKey: getMonthKey(
-                occurrence.is_ongoing ? currentMonthKey : occurrence.end_on ?? occurrence.start_on,
-              ),
+              startMonthKey: getMonthOnlyKey(occurrence.start_on),
+              endMonthKey: occurrence.is_ongoing ? "" : getMonthOnlyKey(occurrence.end_on ?? occurrence.start_on),
               isOngoing: occurrence.is_ongoing,
             } satisfies TimelineBar;
           })
@@ -520,7 +520,7 @@ export default function Medications() {
       }
       return left.name.localeCompare(right.name, undefined, { sensitivity: "base" });
     });
-  }, [events, medications]);
+  }, [events, medications, nowTimestamp]);
 
   const timelineRange = useMemo<TimelineRange | null>(() => {
     const allBars = timelineRows.flatMap((row) => row.lanes.flat());
@@ -564,11 +564,6 @@ export default function Medications() {
     setEventDraft(createEmptyTimelineEventDraft());
   }, []);
 
-  const setActiveTimelineEditor = (kind: TimelineRowKind) => {
-    lastUsedTimelineEditorKind = kind;
-    setActiveEditorKind(kind);
-  };
-
   const focusMedicationEditor = () => {
     window.requestAnimationFrame(() => {
       medicationEditorSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -584,12 +579,14 @@ export default function Medications() {
   };
 
   const showMedicationEditor = () => {
-    setActiveTimelineEditor("medication");
+    if (isSaving) return;
+    setActiveEditorKind("medication");
     focusMedicationEditor();
   };
 
   const showEventEditor = () => {
-    setActiveTimelineEditor("event");
+    if (isSaving) return;
+    setActiveEditorKind("event");
     focusEventEditor();
   };
 
@@ -682,6 +679,7 @@ export default function Medications() {
   };
 
   const handleEditMedication = (medication: Medication) => {
+    if (isSaving) return;
     setEditingMedicationId(medication.id);
     setMedicationDraft(createMedicationDraft(medication));
     setErrorMessage(null);
@@ -690,6 +688,7 @@ export default function Medications() {
   };
 
   const handleEditEvent = (event: TimelineEvent) => {
+    if (isSaving) return;
     setEditingEventId(event.id);
     setEventDraft(createTimelineEventDraft(event));
     setErrorMessage(null);
@@ -712,6 +711,7 @@ export default function Medications() {
   };
 
   const handleDeleteMedication = async (medication: Medication) => {
+    if (isSaving) return;
     if (!window.confirm(`Delete ${medication.name} and all of its episodes?`)) {
       return;
     }
@@ -721,6 +721,7 @@ export default function Medications() {
     setStatusMessage(null);
     try {
       await deleteMedication(medication.id);
+      setLoading(true);
       await loadTimelineData();
       if (editingMedicationId === medication.id) {
         resetMedicationEditor();
@@ -734,6 +735,7 @@ export default function Medications() {
   };
 
   const handleDeleteEvent = async (event: TimelineEvent) => {
+    if (isSaving) return;
     if (!window.confirm(`Delete ${event.name} and all of its occurrences?`)) {
       return;
     }
@@ -743,6 +745,7 @@ export default function Medications() {
     setStatusMessage(null);
     try {
       await deleteEvent(event.id);
+      setLoading(true);
       await loadTimelineData();
       if (editingEventId === event.id) {
         resetEventEditor();
@@ -757,6 +760,7 @@ export default function Medications() {
 
   const handleMedicationSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (isSaving) return;
 
     const validationError = validateMedicationDraft(medicationDraft);
     if (validationError) {
@@ -772,6 +776,7 @@ export default function Medications() {
       const medication = editingMedicationId == null
         ? await createMedication(buildMedicationPayload(medicationDraft))
         : await updateMedication(editingMedicationId, buildMedicationPayload(medicationDraft));
+      setLoading(true);
       await loadTimelineData();
       resetMedicationEditor();
       setStatusMessage(
@@ -788,6 +793,7 @@ export default function Medications() {
 
   const handleEventSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (isSaving) return;
 
     const validationError = validateTimelineEventDraft(eventDraft);
     if (validationError) {
@@ -803,6 +809,7 @@ export default function Medications() {
       const savedEvent = editingEventId == null
         ? await createEvent(buildTimelineEventPayload(eventDraft))
         : await updateEvent(editingEventId, buildTimelineEventPayload(eventDraft));
+      setLoading(true);
       await loadTimelineData();
       resetEventEditor();
       setStatusMessage(
@@ -897,6 +904,7 @@ export default function Medications() {
                 isMedicationEditorActive ? "meds-editor-switch-button-active" : "",
               ].join(" ").trim()}
               aria-pressed={isMedicationEditorActive}
+              disabled={isSaving}
               onClick={showMedicationEditor}
             >
               <span className="meds-editor-switch-label">Medication</span>
@@ -913,6 +921,7 @@ export default function Medications() {
                 !isMedicationEditorActive ? "meds-editor-switch-button-active" : "",
               ].join(" ").trim()}
               aria-pressed={!isMedicationEditorActive}
+              disabled={isSaving}
               onClick={showEventEditor}
             >
               <span className="meds-editor-switch-label">Event</span>
@@ -925,7 +934,7 @@ export default function Medications() {
 
         {isMedicationEditorActive ? (
           <div ref={medicationEditorSectionRef} className="meds-editor-panel">
-            <form className="meds-editor-form" onSubmit={handleMedicationSubmit}>
+            <form className="meds-editor-form" onSubmit={handleMedicationSubmit} inert={isSaving} aria-busy={isSaving}>
               <div className="meds-field-grid">
                 <div className="meds-full-width">
                   <label htmlFor="medication-name">Medication name</label>
@@ -1049,7 +1058,7 @@ export default function Medications() {
           </div>
         ) : (
           <div ref={eventEditorSectionRef} className="meds-editor-panel">
-            <form className="meds-editor-form" onSubmit={handleEventSubmit}>
+            <form className="meds-editor-form" onSubmit={handleEventSubmit} inert={isSaving} aria-busy={isSaving}>
               <div className="meds-field-grid">
                 <div className="meds-full-width">
                   <label htmlFor="event-name">Event name</label>

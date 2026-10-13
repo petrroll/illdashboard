@@ -86,7 +86,7 @@ export async function fetchMarkerInsight(markerName: string) {
   if (isShareExportMode()) {
     throwUnavailableInShareExport("Generating biomarker interpretations");
   }
-  const response = await apiClient.get<MarkerInsightResponse>("/measurements/insight", {
+  const response = await apiClient.post<MarkerInsightResponse>("/measurements/insight", undefined, {
     params: { marker_name: markerName },
   });
   return response.data;

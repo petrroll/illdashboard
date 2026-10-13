@@ -470,7 +470,8 @@ async def measurement_detail(
     )
 
 
-@router.get("/measurements/insight", response_model=MarkerInsightResponse, tags=["measurements"])
+# POST because this may run paid AI generation and write the cache; cached reads come from GET /measurements/detail.
+@router.post("/measurements/insight", response_model=MarkerInsightResponse, tags=["measurements"])
 async def measurement_insight(
     marker_name: str = Query(...),
     db: AsyncSession = Depends(get_db),

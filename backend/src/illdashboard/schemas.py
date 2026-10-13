@@ -237,6 +237,7 @@ class MultiExplainRequest(BaseModel):
 
 class BatchOcrRequest(BaseModel):
     file_ids: list[int]
+    discard_user_edits: bool = False
 
 
 class QueueFilesResponse(BaseModel):

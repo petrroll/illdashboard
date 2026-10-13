@@ -249,14 +249,7 @@ export function formatMeasurementScalarValue(
     return qualitativeValue;
   }
 
-  if (value == null) {
-    return "—";
-  }
-
-  const renderedValue = Number.isInteger(value)
-    ? value.toString()
-    : value.toFixed(2).replace(/\.00$/, "");
-  return renderedValue;
+  return formatSignificantValue(value);
 }
 
 export function formatReferenceRange(

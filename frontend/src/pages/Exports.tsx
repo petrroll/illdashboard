@@ -111,6 +111,13 @@ export default function Exports() {
     }
     return stored;
   });
+  const seededMarkerKey = JSON.stringify(seededMarkers);
+  const [previousSeededMarkerKey, setPreviousSeededMarkerKey] = useState(seededMarkerKey);
+  // Merge new URL seeds before rendering, while allowing users to deselect them afterward.
+  if (previousSeededMarkerKey !== seededMarkerKey) {
+    setPreviousSeededMarkerKey(seededMarkerKey);
+    setSelectedMarkers((previousSelected) => new Set([...previousSelected, ...seededMarkers]));
+  }
   const [loadingOverview, setLoadingOverview] = useState(true);
   const [downloading, setDownloading] = useState<ExportFormat | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
@@ -132,20 +139,6 @@ export default function Exports() {
       JSON.stringify([...collapsedGroups]),
     );
   }, [collapsedGroups]);
-
-  useEffect(() => {
-    setSelectedMarkers((previousSelected) => {
-      if (seededMarkers.length === 0) {
-        return previousSelected;
-      }
-
-      const nextSelected = new Set(previousSelected);
-      for (const markerName of seededMarkers) {
-        nextSelected.add(markerName);
-      }
-      return nextSelected;
-    });
-  }, [seededMarkers]);
 
   useEffect(() => {
     let cancelled = false;

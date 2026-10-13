@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   fetchFiles,
@@ -159,25 +159,29 @@ function OnlineSettings() {
   const [actionResult, setActionResult] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
   const [loading, setLoading] = useState<string | null>(null);
+  const settingsLoadRevisionRef = useRef(0);
 
-  const loadSettingsData = useCallback(async () => {
-    const [filesResponse, markersResponse, measurementsResponse, statsResponse, rescalingRulesResponse] = await Promise.all([
+  const loadSettingsData = useCallback(() => {
+    const revision = ++settingsLoadRevisionRef.current;
+    return Promise.all([
       fetchFiles(),
       fetchMarkerNames(),
       fetchMeasurements(),
       fetchAdminStats(),
       fetchRescalingRules(),
-    ]);
-
-    setFiles(filesResponse);
-    setMarkers(markersResponse);
-    setRecentMeasurements(measurementsResponse.slice(-10));
-    setCopilotRequestCount(statsResponse.premium_requests_used);
-    setRescalingRules(rescalingRulesResponse);
+    ]).then(([filesResponse, markersResponse, measurementsResponse, statsResponse, rescalingRulesResponse]) => {
+      if (revision !== settingsLoadRevisionRef.current) return;
+      setFiles(filesResponse);
+      setMarkers(markersResponse);
+      setRecentMeasurements(measurementsResponse.slice(-10));
+      setCopilotRequestCount(statsResponse.premium_requests_used);
+      setRescalingRules(rescalingRulesResponse);
+    });
   }, []);
 
   useEffect(() => {
     void loadSettingsData();
+    return () => { settingsLoadRevisionRef.current += 1; };
   }, [loadSettingsData]);
 
   const handleAction = async (action: SettingsAction) => {

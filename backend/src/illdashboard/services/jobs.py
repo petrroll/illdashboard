@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
-from sqlalchemy import and_, case, delete, or_, select, update
+from sqlalchemy import and_, case, delete, null, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +16,10 @@ JOB_STATUS_FAILED = "failed"
 JOB_STATUS_CANCELLED = "cancelled"
 
 TERMINAL_JOB_STATUSES = {JOB_STATUS_RESOLVED, JOB_STATUS_FAILED, JOB_STATUS_CANCELLED}
+
+
+class JobLeaseLostError(RuntimeError):
+    """Raised when a worker tries to finish a job whose lease it no longer holds."""
 
 
 def json_dumps(payload: dict | list | None) -> str:
@@ -130,42 +134,84 @@ async def claim_jobs(
     return list(claimed.scalars().all())
 
 
+async def _finish_leased_job(session: AsyncSession, job: Job, values: dict) -> None:
+    # Transitions are conditional SQL on the claimed lease so a worker whose
+    # lease expired or was reassigned cannot overwrite the new owner's state,
+    # and so rerun_requested is read from the row instead of a stale ORM copy
+    # (enqueue_job sets it from other sessions while the job is leased).
+    result = await session.execute(
+        update(Job)
+        .where(Job.id == job.id, Job.status == JOB_STATUS_LEASED, Job.lease_owner == job.lease_owner)
+        .values(**values, lease_owner=None, lease_until=None, updated_at=utc_now())
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        # Raising makes the worker roll back every output written for this job.
+        raise JobLeaseLostError(f"Lease lost for job id={job.id} owner={job.lease_owner}")
+    await session.refresh(job)
+
+
 async def mark_job_resolved(session: AsyncSession, job: Job, payload: dict | None = None) -> None:
-    now = utc_now()
-    if job.rerun_requested:
-        job.status = JOB_STATUS_PENDING
-        job.resolved_json = None
-        job.available_at = now
-        job.rerun_requested = False
-    else:
-        job.status = JOB_STATUS_RESOLVED
-        job.resolved_json = json_dumps(payload)
-    job.error_text = None
-    job.lease_owner = None
-    job.lease_until = None
-    job.updated_at = now
-    await session.flush()
+    rerun = Job.rerun_requested.is_(True)
+    await _finish_leased_job(
+        session,
+        job,
+        {
+            "status": case((rerun, JOB_STATUS_PENDING), else_=JOB_STATUS_RESOLVED),
+            "resolved_json": case((rerun, null()), else_=json_dumps(payload)),
+            "available_at": case((rerun, utc_now()), else_=Job.available_at),
+            "rerun_requested": False,
+            "error_text": None,
+        },
+    )
 
 
 async def release_job(session: AsyncSession, job: Job, *, delay_seconds: int, error_text: str | None = None) -> None:
-    job.status = JOB_STATUS_PENDING
-    job.error_text = error_text
-    job.rerun_requested = False
-    job.lease_owner = None
-    job.lease_until = None
-    job.available_at = utc_now() + timedelta(seconds=delay_seconds)
-    job.updated_at = utc_now()
-    await session.flush()
+    await _finish_leased_job(
+        session,
+        job,
+        {
+            "status": JOB_STATUS_PENDING,
+            "error_text": error_text,
+            "rerun_requested": False,
+            "available_at": utc_now() + timedelta(seconds=delay_seconds),
+        },
+    )
 
 
 async def mark_job_failed(session: AsyncSession, job: Job, *, error_text: str) -> None:
-    job.status = JOB_STATUS_FAILED
-    job.error_text = error_text
-    job.rerun_requested = False
-    job.lease_owner = None
-    job.lease_until = None
-    job.updated_at = utc_now()
-    await session.flush()
+    await _finish_leased_job(
+        session,
+        job,
+        {"status": JOB_STATUS_FAILED, "error_text": error_text, "rerun_requested": False},
+    )
+
+
+async def renew_job_leases(
+    session: AsyncSession,
+    *,
+    job_ids: list[int],
+    lease_owner: str,
+    lease_seconds: int,
+) -> list[int]:
+    """Extend leases still held by lease_owner and return ids now leased by someone else."""
+    if not job_ids:
+        return []
+    now = utc_now()
+    await session.execute(
+        update(Job)
+        .where(Job.id.in_(job_ids), Job.status == JOB_STATUS_LEASED, Job.lease_owner == lease_owner)
+        .values(lease_until=now + timedelta(seconds=lease_seconds), updated_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    # Jobs this worker already resolved or released are no longer its concern;
+    # only a lease reassigned to another owner means the work must be abandoned.
+    stolen = await session.execute(
+        select(Job.id).where(Job.id.in_(job_ids), Job.status == JOB_STATUS_LEASED, Job.lease_owner != lease_owner)
+    )
+    stolen_ids = list(stolen.scalars().all())
+    await session.commit()
+    return stolen_ids
 
 
 async def delete_job(session: AsyncSession, job: Job) -> None:

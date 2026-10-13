@@ -96,27 +96,34 @@ export async function fetchFileTextPreview(fileId: string | number) {
   return response.data;
 }
 
-export async function runFileOcr(fileId: string | number) {
+export async function runFileOcr(fileId: string | number, discardUserEdits = false) {
   if (isShareExportMode()) {
     throwUnavailableInShareExport("Reprocessing files");
   }
-  const response = await apiClient.post<QueueFilesResponse>(`/files/${fileId}/ocr`);
+  const response = await apiClient.post<QueueFilesResponse>(`/files/${fileId}/ocr`, undefined, {
+    params: { discard_user_edits: discardUserEdits },
+  });
   return response.data;
 }
 
-export async function processUnprocessedFiles() {
+export async function processUnprocessedFiles(discardUserEdits = false) {
   if (isShareExportMode()) {
     throwUnavailableInShareExport("Processing files");
   }
-  const response = await apiClient.post<QueueFilesResponse>("/files/ocr/unprocessed");
+  const response = await apiClient.post<QueueFilesResponse>("/files/ocr/unprocessed", undefined, {
+    params: { discard_user_edits: discardUserEdits },
+  });
   return response.data;
 }
 
-export async function batchProcessFiles(fileIds: number[]) {
+export async function batchProcessFiles(fileIds: number[], discardUserEdits = false) {
   if (isShareExportMode()) {
     throwUnavailableInShareExport("Reprocessing files");
   }
-  const response = await apiClient.post<QueueFilesResponse>("/files/ocr/batch", { file_ids: fileIds });
+  const response = await apiClient.post<QueueFilesResponse>("/files/ocr/batch", {
+    file_ids: fileIds,
+    discard_user_edits: discardUserEdits,
+  });
   return response.data;
 }
 

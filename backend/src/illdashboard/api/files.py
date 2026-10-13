@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import os
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +22,17 @@ from illdashboard.services import file_types, pipeline, upload_metadata
 from illdashboard.services import search as search_service
 
 router = APIRouter(prefix="")
+
+_MEASUREMENT_EDITS = or_(
+    Measurement.user_canonical_value_override,
+    Measurement.user_canonical_unit_override,
+    Measurement.user_original_unit_override,
+    Measurement.user_qualitative_value_override,
+    Measurement.user_qualitative_bool_override,
+    Measurement.user_canonical_reference_low_override,
+    Measurement.user_canonical_reference_high_override,
+    Measurement.user_measured_at_override,
+)
 
 
 async def get_lab_file_or_404(file_id: int, db: AsyncSession) -> LabFile:
@@ -53,16 +63,7 @@ async def serialize_lab_file(lab: LabFile, db: AsyncSession) -> LabFileOut:
         select(Measurement.id)
         .where(
             Measurement.lab_file_id == lab.id,
-            or_(
-                Measurement.user_canonical_value_override,
-                Measurement.user_canonical_unit_override,
-                Measurement.user_original_unit_override,
-                Measurement.user_qualitative_value_override,
-                Measurement.user_qualitative_bool_override,
-                Measurement.user_canonical_reference_low_override,
-                Measurement.user_canonical_reference_high_override,
-                Measurement.user_measured_at_override,
-            ),
+            _MEASUREMENT_EDITS,
         )
         .limit(1)
     )
@@ -148,21 +149,30 @@ async def upload_file(
     content = await file.read()
     destination.write_bytes(content)
     try:
+        try:
+            page_count = get_page_count(destination, mime_type)
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(400, "Invalid or unreadable document") from exc
+        if page_count < 1:
+            raise HTTPException(400, "Document has no pages")
         upload_metadata.write_original_name_sidecar(destination, file.filename)
-    except (OSError, UnicodeError):
+        lab = LabFile(
+            filename=file.filename or safe_name,
+            filepath=str(destination),
+            mime_type=mime_type,
+            page_count=page_count,
+            lab_date=lab_date,
+            user_lab_date=lab_date,
+            user_lab_date_override=lab_date is not None,
+        )
+        db.add(lab)
+        await db.commit()
+    except Exception:
+        await db.rollback()
         upload_metadata.delete_original_name_sidecar(destination)
         destination.unlink(missing_ok=True)
         raise
 
-    lab = LabFile(
-        filename=file.filename or safe_name,
-        filepath=str(destination),
-        mime_type=mime_type,
-        page_count=get_page_count(destination, mime_type),
-        lab_date=lab_date,
-    )
-    db.add(lab)
-    await db.commit()
     await db.refresh(lab)
     return await serialize_lab_file(lab, db)
 
@@ -212,12 +222,13 @@ async def update_file(file_id: int, body: FilePatchRequest, db: AsyncSession = D
 async def delete_file(file_id: int, db: AsyncSession = Depends(get_db)):
     lab = await get_lab_file_or_404(file_id, db)
     file_path = Path(lab.filepath)
-    if file_path.exists():
-        os.remove(file_path)
-    upload_metadata.delete_original_name_sidecar(file_path)
     await search_service.remove_lab_search_document(lab.id, db)
     await db.delete(lab)
+    # A failed database transaction must not leave a live record pointing to a
+    # deleted original. Remove the disk artifacts only after the row is gone.
     await db.commit()
+    file_path.unlink(missing_ok=True)
+    upload_metadata.delete_original_name_sidecar(file_path)
     return {"ok": True}
 
 
@@ -242,8 +253,27 @@ async def get_file_page_image(file_id: int, page_num: int, db: AsyncSession = De
     return Response(content=file_path.read_bytes(), media_type=lab.mime_type)
 
 
+async def validate_reprocessing(file_ids: list[int], discard_user_edits: bool, db: AsyncSession) -> None:
+    existing_ids = set((await db.scalars(select(LabFile.id).where(LabFile.id.in_(file_ids)))).all())
+    if set(file_ids) - existing_ids:
+        raise HTTPException(404, "File not found")
+    if not discard_user_edits:
+        edited_id = await db.scalar(
+            select(Measurement.id)
+            .where(Measurement.lab_file_id.in_(file_ids), _MEASUREMENT_EDITS)
+            .limit(1)
+        )
+        if edited_id is not None:
+            raise HTTPException(409, "Reprocessing would discard manual measurement edits. Confirm before retrying.")
+
+
 @router.post("/files/{file_id}/ocr", response_model=QueueFilesResponse, tags=["ocr"])
-async def run_ocr(file_id: int, db: AsyncSession = Depends(get_db)):
+async def run_ocr(
+    file_id: int,
+    discard_user_edits: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+):
+    await validate_reprocessing([file_id], discard_user_edits, db)
     file = await pipeline.queue_file(db, file_id)
     await db.commit()
     return QueueFilesResponse(queued_file_ids=[file.id])
@@ -251,12 +281,17 @@ async def run_ocr(file_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.post("/files/ocr/batch", response_model=QueueFilesResponse, tags=["ocr"])
 async def batch_ocr(req: BatchOcrRequest, db: AsyncSession = Depends(get_db)):
+    # Validate the entire selection before stopping workers or deleting data,
+    # including files hidden by the browser's current filter.
+    await validate_reprocessing(req.file_ids, req.discard_user_edits, db)
     queued_file_ids = await pipeline.queue_files_from_clean_runtime(db, req.file_ids)
     return QueueFilesResponse(queued_file_ids=queued_file_ids)
 
 
 @router.post("/files/ocr/unprocessed", response_model=QueueFilesResponse, tags=["ocr"])
-async def ocr_unprocessed(db: AsyncSession = Depends(get_db)):
+async def ocr_unprocessed(discard_user_edits: bool = Query(False), db: AsyncSession = Depends(get_db)):
+    file_ids = list((await db.scalars(select(LabFile.id).where(LabFile.status != pipeline.FILE_STATUS_COMPLETE))).all())
+    await validate_reprocessing(file_ids, discard_user_edits, db)
     queued_file_ids = await pipeline.queue_unprocessed_files_from_clean_runtime(db)
     return QueueFilesResponse(queued_file_ids=queued_file_ids)
 

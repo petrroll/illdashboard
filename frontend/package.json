@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build && node scripts/build-share-export-shell.mjs",
     "lint": "eslint .",
+    "test": "node --test scripts/frontend-regressions.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -1,5 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { isAxiosError } from "axios";
 import {
   batchProcessFiles,
   cancelProcessing,
@@ -97,6 +98,7 @@ export default function Files() {
   const [files, setFiles] = useState<LabFile[]>([]);
   const [uploading, setUploading] = useState(false);
   const [pendingProcessAction, setPendingProcessAction] = useState<PendingProcessAction>(null);
+  const [processingError, setProcessingError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [allFileTags, setAllFileTags] = useState<string[]>([]);
   const [filterTags, setFilterTags] = useState<string[]>([]);
@@ -104,22 +106,32 @@ export default function Files() {
   const [sortField, setSortField] = useState<SortField>("lab_date");
   const [searchQuery, setSearchQuery] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  const filesLoadRevisionRef = useRef(0);
+  const tagsLoadRevisionRef = useRef(0);
 
-  const loadFiles = useCallback(async () => {
-    setFiles(await fetchFiles(filterTags));
+  const loadFiles = useCallback(() => {
+    const revision = ++filesLoadRevisionRef.current;
+    return fetchFiles(filterTags).then((response) => {
+      if (revision === filesLoadRevisionRef.current) setFiles(response);
+    });
   }, [filterTags]);
 
-  const loadAllTags = useCallback(async () => {
-    const tags = await fetchFileTags();
-    setAllFileTags(tags);
+  const loadAllTags = useCallback(() => {
+    const revision = ++tagsLoadRevisionRef.current;
+    return fetchFileTags().then((tags) => {
+      if (revision === tagsLoadRevisionRef.current) setAllFileTags(tags);
+    });
   }, []);
 
   useEffect(() => {
     void loadFiles();
+    // Invalidate pending results when filters change or this page is left.
+    return () => { filesLoadRevisionRef.current += 1; };
   }, [loadFiles]);
 
   useEffect(() => {
     void loadAllTags();
+    return () => { tagsLoadRevisionRef.current += 1; };
   }, [loadAllTags]);
 
   // File rows are the UI source of truth for queued/running work because the
@@ -217,18 +229,30 @@ export default function Files() {
   };
 
   const runPrimaryAction = async (action: Exclude<PendingProcessAction, null>, run: () => Promise<void>) => {
+    if (pendingProcessAction !== null) return;
     setPendingProcessAction(action);
+    setProcessingError(null);
     try {
       await run();
       await loadFiles();
+    } catch (error) {
+      setProcessingError(isAxiosError(error) && error.response?.status === 409
+        ? "Manual edits have changed. Review the refreshed files and try again to confirm discarding them."
+        : error instanceof Error ? error.message : "Processing could not be updated.");
+      await loadFiles().catch(() => {});
     } finally {
       setPendingProcessAction(null);
     }
   };
 
-  const handleProcessUnprocessed = () => {
-    void runPrimaryAction("queue", async () => {
-      await processUnprocessedFiles();
+  const handleProcessUnprocessed = async () => {
+    await runPrimaryAction("queue", async () => {
+      const pendingFiles = (await fetchFiles()).filter((file) => file.status !== "complete");
+      const discardUserEdits = pendingFiles.some((file) => file.has_measurement_edits);
+      if (discardUserEdits && !window.confirm("Processing will discard manual measurement edits for incomplete files, including hidden files. Continue?")) {
+        return;
+      }
+      await processUnprocessedFiles(discardUserEdits);
     });
   };
 
@@ -237,17 +261,18 @@ export default function Files() {
       return;
     }
 
-    const selectedFiles = files.filter((file) => selected.has(file.id));
-    if (
-      selectedFiles.some((file) => file.has_measurement_edits)
-      && !confirm("Reprocessing will discard manual measurement edits for the selected files. Continue?")
-    ) {
-      return;
-    }
-
     const fileIds = Array.from(selected);
     await runPrimaryAction("reprocess", async () => {
-      await batchProcessFiles(fileIds);
+      // Selection survives filters, so consent must cover the full request, not just visible rows.
+      const selectedFiles = (await fetchFiles()).filter((file) => fileIds.includes(file.id));
+      if (selectedFiles.length !== fileIds.length) {
+        throw new Error("Some selected files no longer exist. Review your selection and try again.");
+      }
+      const discardUserEdits = selectedFiles.some((file) => file.has_measurement_edits);
+      if (discardUserEdits && !window.confirm("Reprocessing will discard manual measurement edits for the selected files, including hidden files. Continue?")) {
+        return;
+      }
+      await batchProcessFiles(fileIds, discardUserEdits);
     });
   };
 
@@ -349,6 +374,8 @@ export default function Files() {
           )}
         </div>
       )}
+
+      {processingError && <p role="alert" className="export-error-note">{processingError}</p>}
 
       <div className="file-toolbar">
         <div className="file-toolbar-search">

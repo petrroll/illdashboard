@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
+import { isAxiosError } from "axios";
 import {
   fetchFile,
   fetchFileMeasurements,
@@ -130,57 +131,85 @@ function renderStatusBadge(file: LabFile) {
 }
 
 export default function FileDetail() {
-  const shareExportMode = isShareExportMode();
   const { id } = useParams<{ id: string }>();
-  const fileId = id ?? null;
+  // A route change must discard drafts as well as responses from the previous file.
+  return <FileDetailContent key={id} fileId={id ?? null} />;
+}
+
+function FileDetailContent({ fileId }: { fileId: string | null }) {
+  const shareExportMode = isShareExportMode();
   const [file, setFile] = useState<LabFile | null>(null);
   const [measurements, setMeasurements] = useState<Measurement[]>([]);
   const [ocrRunning, setOcrRunning] = useState(false);
+  const [processingError, setProcessingError] = useState<string | null>(null);
   const [pageInfo, setPageInfo] = useState<PageInfo | null>(null);
+  const pageMimeType = pageInfo?.mime_type;
   const [allFileTags, setAllFileTags] = useState<string[]>([]);
   const [highlightedPage, setHighlightedPage] = useState<number | null>(null);
   const [search, setSearch] = useState("");
-  const [textPreview, setTextPreview] = useState<string | null>(null);
-  const [textPreviewError, setTextPreviewError] = useState<string | null>(null);
-  const [textPreviewLoading, setTextPreviewLoading] = useState(false);
+  const [textPreviewResult, setTextPreviewResult] = useState<{
+    mimeType: string | null | undefined;
+    text: string | null;
+    error: string | null;
+  } | null>(null);
+  const needsTextPreview = !shareExportMode && !!fileId && isTextPreviewMime(pageMimeType);
+  const currentTextPreview = needsTextPreview && textPreviewResult?.mimeType === pageMimeType
+    ? textPreviewResult
+    : null;
+  const textPreview = currentTextPreview?.text ?? null;
+  const textPreviewError = currentTextPreview?.error ?? null;
+  const textPreviewLoading = needsTextPreview && !currentTextPreview;
   const [exporting, setExporting] = useState<string | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportFormat, setExportFormat] = useState<"markdown" | "pdf">("pdf");
   const [exportHistory, setExportHistory] = useState(false);
   const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const highlightTimeoutRef = useRef<number | null>(null);
+  const mountedRef = useRef(false);
+  const loadRevisionRef = useRef(0);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      loadRevisionRef.current += 1;
+    };
+  }, []);
 
   const load = useCallback(async () => {
-    if (!fileId) {
+    if (!fileId || !mountedRef.current) {
       return;
     }
 
+    const revision = ++loadRevisionRef.current;
     const [fileResponse, measurementsResponse, allTagsResponse] = await Promise.all([
       fetchFile(fileId),
       fetchFileMeasurements(fileId),
       fetchFileTags(),
     ]);
 
+    if (!mountedRef.current || revision !== loadRevisionRef.current) return;
     setFile(fileResponse);
     setMeasurements(measurementsResponse);
     setAllFileTags(allTagsResponse);
 
     try {
-      setPageInfo(await fetchFilePageInfo(fileId));
+      const nextPageInfo = await fetchFilePageInfo(fileId);
+      if (mountedRef.current && revision === loadRevisionRef.current) setPageInfo(nextPageInfo);
     } catch {
-      setPageInfo(null);
+      if (mountedRef.current && revision === loadRevisionRef.current) setPageInfo(null);
     }
   }, [fileId]);
 
-  const refreshMeasurements = useCallback(async () => {
-    if (!fileId) {
-      return;
+  const assertEditingTarget = (measurement?: Measurement) => {
+    if (!mountedRef.current || !file || String(file.id) !== fileId
+      || (measurement && measurement.lab_file_id !== file.id)) {
+      throw new Error("This file is no longer open. Reload it before editing.");
     }
-
-    setMeasurements(await fetchFileMeasurements(fileId));
-  }, [fileId]);
+  };
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- load writes only after awaited requests and rejects unmounted or superseded responses.
     void load();
   }, [load]);
 
@@ -225,56 +254,59 @@ export default function FileDetail() {
   }, []);
 
   useEffect(() => {
-    if (shareExportMode || !fileId || !pageInfo || !isTextPreviewMime(pageInfo.mime_type)) {
-      setTextPreview(null);
-      setTextPreviewError(null);
-      setTextPreviewLoading(false);
+    if (shareExportMode || !fileId || !isTextPreviewMime(pageMimeType)) {
       return;
     }
 
     let cancelled = false;
-    setTextPreview(null);
-    setTextPreviewError(null);
-    setTextPreviewLoading(true);
 
     void fetchFileTextPreview(fileId)
       .then((preview) => {
         if (!cancelled) {
-          setTextPreview(preview);
+          setTextPreviewResult({ mimeType: pageMimeType, text: preview, error: null });
         }
       })
       .catch(() => {
         if (!cancelled) {
-          setTextPreview(null);
-          setTextPreviewError("Preview unavailable.");
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setTextPreviewLoading(false);
+          setTextPreviewResult({ mimeType: pageMimeType, text: null, error: "Preview unavailable." });
         }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [fileId, pageInfo?.mime_type, shareExportMode]);
+  }, [fileId, pageMimeType, shareExportMode]);
 
   const runOcr = async () => {
-    if (!fileId) {
+    if (!fileId || ocrRunning) {
       return;
     }
 
     setOcrRunning(true);
+    setProcessingError(null);
     try {
-      await runFileOcr(fileId);
+      assertEditingTarget();
+      const latestFile = await fetchFile(fileId);
+      assertEditingTarget();
+      setFile(latestFile);
+      const discardUserEdits = latestFile.has_measurement_edits === true;
+      if (discardUserEdits && !window.confirm("Reprocessing will discard manual measurement edits. Continue?")) {
+        return;
+      }
+      await runFileOcr(fileId, discardUserEdits);
       await load();
+    } catch (error) {
+      setProcessingError(isAxiosError(error) && error.response?.status === 409
+        ? "Manual edits have changed. Review the refreshed file and try again to confirm discarding them."
+        : error instanceof Error ? error.message : "Processing could not be started.");
+      await load().catch(() => {});
     } finally {
       setOcrRunning(false);
     }
   };
 
   const saveFileName = async (nextFilename: string) => {
+    assertEditingTarget();
     if (!file) {
       return;
     }
@@ -300,6 +332,7 @@ export default function FileDetail() {
   };
 
   const saveFileLabDate = async (nextLabDate: string) => {
+    assertEditingTarget();
     if (!fileId) {
       return;
     }
@@ -311,19 +344,21 @@ export default function FileDetail() {
         lab_date: normalizedDate ? toUtcNoonIsoDate(normalizedDate) : null,
       }),
     );
-    await refreshMeasurements();
+    await load();
   };
 
   const resetFileLabDate = async () => {
+    assertEditingTarget();
     if (!fileId) {
       return;
     }
 
     setFile(await patchFile(fileId, { reset_fields: ["lab_date"] }));
-    await refreshMeasurements();
+    await load();
   };
 
   const saveMeasurementValue = async (measurement: Measurement, nextValue: string) => {
+    assertEditingTarget(measurement);
     const trimmedValue = nextValue.trim();
     if (!trimmedValue) {
       throw new Error("Enter a value or use Reset.");
@@ -332,7 +367,7 @@ export default function FileDetail() {
     const shouldTreatAsQualitative = measurement.qualitative_value != null || looksLikeQualitativeExpression(trimmedValue);
     if (shouldTreatAsQualitative) {
       await patchMeasurement(measurement.id, { qualitative_expression: trimmedValue });
-      await refreshMeasurements();
+      await load();
       return;
     }
 
@@ -342,15 +377,17 @@ export default function FileDetail() {
     }
 
     await patchMeasurement(measurement.id, { canonical_value: numericValue });
-    await refreshMeasurements();
+    await load();
   };
 
   const resetMeasurementValue = async (measurement: Measurement) => {
+    assertEditingTarget(measurement);
     await patchMeasurement(measurement.id, { reset_fields: ["canonical_value", "qualitative"] });
-    await refreshMeasurements();
+    await load();
   };
 
   const saveMeasurementUnits = async (measurement: Measurement, nextValue: string) => {
+    assertEditingTarget(measurement);
     const separatorIndex = nextValue.indexOf("|");
     const canonicalUnit = (
       separatorIndex === -1 ? nextValue : nextValue.slice(0, separatorIndex)
@@ -361,38 +398,43 @@ export default function FileDetail() {
         ? {}
         : { original_unit: nextValue.slice(separatorIndex + 1).trim() || null }),
     });
-    await refreshMeasurements();
+    await load();
   };
 
   const resetMeasurementUnits = async (measurement: Measurement) => {
+    assertEditingTarget(measurement);
     await patchMeasurement(measurement.id, { reset_fields: ["canonical_unit", "original_unit"] });
-    await refreshMeasurements();
+    await load();
   };
 
   const saveMeasurementReferenceRange = async (measurement: Measurement, nextValue: string) => {
+    assertEditingTarget(measurement);
     await patchMeasurement(measurement.id, parseEditableReferenceRange(nextValue));
-    await refreshMeasurements();
+    await load();
   };
 
   const resetMeasurementReferenceRange = async (measurement: Measurement) => {
+    assertEditingTarget(measurement);
     await patchMeasurement(measurement.id, {
       reset_fields: ["canonical_reference_low", "canonical_reference_high"],
     });
-    await refreshMeasurements();
+    await load();
   };
 
   const saveMeasurementDate = async (measurement: Measurement, nextMeasuredAt: string) => {
+    assertEditingTarget(measurement);
     const normalizedDate = normalizeEditableIsoDate(nextMeasuredAt);
 
     await patchMeasurement(measurement.id, {
       measured_at: normalizedDate ? toUtcNoonIsoDate(normalizedDate) : null,
     });
-    await refreshMeasurements();
+    await load();
   };
 
   const resetMeasurementDate = async (measurement: Measurement) => {
+    assertEditingTarget(measurement);
     await patchMeasurement(measurement.id, { reset_fields: ["measured_at"] });
-    await refreshMeasurements();
+    await load();
   };
 
   const scrollToPage = useCallback((pageNum: number) => {
@@ -421,7 +463,7 @@ export default function FileDetail() {
   }, []);
 
   if (!fileId) return <p>File not found.</p>;
-  if (!file) return <p>Loading…</p>;
+  if (!file || String(file.id) !== fileId) return <p>Loading…</p>;
 
   const hasPages = pageInfo && pageInfo.page_count > 0;
   const isTextPreview = isTextPreviewMime(pageInfo?.mime_type);
@@ -525,6 +567,7 @@ export default function FileDetail() {
               tags={file.tags}
               allTags={allFileTags}
               onChange={async (newTags) => {
+                assertEditingTarget();
                 const savedTags = await setFileTags(file.id, newTags);
                 setFile((previousFile) =>
                   previousFile ? { ...previousFile, tags: savedTags } : previousFile,
@@ -590,6 +633,9 @@ export default function FileDetail() {
         {exportError && (
           <span className="export-error-note">{exportError}</span>
         )}
+        {processingError && (
+          <span role="alert" className="export-error-note">{processingError}</span>
+        )}
       </div>
 
       {shareExportMode && (
@@ -649,7 +695,7 @@ export default function FileDetail() {
                 <p style={{ color: "var(--text-muted)" }}>This document is empty.</p>
               ) : isMarkdownPreviewMime(pageInfo?.mime_type) ? (
                 <div style={{ overflow: "auto", lineHeight: 1.6 }}>
-                  <ReactMarkdown>{resolvedTextPreview}</ReactMarkdown>
+                  <ReactMarkdown disallowedElements={["img"]}>{resolvedTextPreview}</ReactMarkdown>
                 </div>
               ) : (
                 <pre

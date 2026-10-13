@@ -1,43 +1,39 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { build } from "vite";
 
-const DIST_DIR = path.resolve("dist");
-const INDEX_HTML_PATH = path.join(DIST_DIR, "index.html");
+const FRONTEND_DIR = fileURLToPath(new URL("..", import.meta.url));
+const DIST_DIR = path.join(FRONTEND_DIR, "dist");
 const OUTPUT_HTML_PATH = path.join(DIST_DIR, "share-export-shell.html");
 const BUNDLE_PLACEHOLDER = "__ILLDASHBOARD_EXPORT_BASE64__";
-
-function requireAssetPath(html, pattern, label) {
-  const match = html.match(pattern);
-  if (!match?.[1]) {
-    throw new Error(`Could not find the ${label} asset in dist/index.html.`);
-  }
-  return match[1];
-}
-
-function toDistAssetPath(assetHref) {
-  return path.join(DIST_DIR, assetHref.replace(/^\//, ""));
-}
 
 function escapeInlineModuleScript(source) {
   return source.replace(/<\/script/gi, "<\\/script");
 }
 
-const indexHtml = await readFile(INDEX_HTML_PATH, "utf8");
-const scriptPath = requireAssetPath(
-  indexHtml,
-  /<script[^>]+type="module"[^>]+src="([^"]+)"[^>]*><\/script>/i,
-  "JavaScript",
-);
-const stylesheetPath = requireAssetPath(
-  indexHtml,
-  /<link[^>]+rel="stylesheet"[^>]+href="([^"]+)"[^>]*>/i,
-  "stylesheet",
-);
-
-const [appScript, appStyles] = await Promise.all([
-  readFile(toDistAssetPath(scriptPath), "utf8"),
-  readFile(toDistAssetPath(stylesheetPath), "utf8"),
-]);
+// The normal app stays code-split; a downloaded HTML file cannot fetch its lazy PDF chunks.
+const result = await build({
+  root: FRONTEND_DIR,
+  build: {
+    write: false,
+    cssCodeSplit: false,
+    assetsInlineLimit: Number.MAX_SAFE_INTEGER,
+    modulePreload: false,
+    rolldownOptions: { output: { codeSplitting: false } },
+  },
+});
+const outputs = (Array.isArray(result) ? result : [result]).flatMap((buildResult) => buildResult.output);
+const chunks = outputs.filter((output) => output.type === "chunk");
+if (chunks.length !== 1 || chunks[0].imports.length
+  || chunks[0].dynamicImports.some((dependency) => dependency !== chunks[0].fileName)) {
+  throw new Error("The share export shell must contain all JavaScript, including lazy PDF dependencies.");
+}
+const appScript = chunks[0].code;
+const appStyles = outputs
+  .filter((output) => output.type === "asset" && output.fileName.endsWith(".css"))
+  .map((output) => output.source)
+  .join("\n");
 
 const shareExportShell = `<!doctype html>
 <html lang="en">
@@ -69,5 +65,6 @@ const shareExportShell = `<!doctype html>
 </html>
 `;
 
+await mkdir(DIST_DIR, { recursive: true });
 await writeFile(OUTPUT_HTML_PATH, shareExportShell, "utf8");
 console.log(`Wrote ${path.relative(process.cwd(), OUTPUT_HTML_PATH)}`);

@@ -10,10 +10,12 @@ import time
 import uuid
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
+from tempfile import TemporaryDirectory
 
-from copilot import CopilotClient, PermissionHandler
-from copilot.generated.session_events import SessionEventType
-from copilot.types import Attachment, CopilotClientOptions, MessageOptions, ReasoningEffort, SessionConfig
+from copilot import CopilotClient, PermissionRequest, PermissionRequestResult
+from copilot.generated.rpc import PermissionDecisionReject
+from copilot.session import Attachment, PermissionInvocation, ReasoningEffort
+from copilot.session_events import SessionEventType
 
 from illdashboard.config import settings
 from illdashboard.metrics import add_premium_requests
@@ -59,6 +61,7 @@ _NORMALIZATION_LANE_LIMITS = {
 }
 
 _client: CopilotClient | None = None
+_client_storage: TemporaryDirectory[str] | None = None
 _client_start_lock = asyncio.Lock()
 _request_semaphore: asyncio.Semaphore | None = None
 _request_semaphore_limit = 0
@@ -87,7 +90,7 @@ async def _model_supports_reasoning_effort(client: CopilotClient, model: str) ->
 
     for model_info in models:
         if model_info.id == model:
-            return bool(model_info.capabilities.supports.reasoning_effort)
+            return bool(model_info.supported_reasoning_efforts)
 
     logger.warning("Copilot model capability lookup did not include configured model=%s", model)
     return None
@@ -185,7 +188,7 @@ Rules:
 
 async def _get_client() -> CopilotClient:
     """Return a shared CopilotClient, starting it on first use."""
-    global _client
+    global _client, _client_storage
 
     if _client is not None:
         return _client
@@ -196,16 +199,29 @@ async def _get_client() -> CopilotClient:
 
         started_at = time.perf_counter()
         token = settings.GITHUB_TOKEN or os.environ.get("GITHUB_TOKEN", "")
-        options: CopilotClientOptions | None = {"github_token": token} if token else None
-        client = CopilotClient(options)
+        # Empty mode requires explicit storage. Keep medical transcripts and
+        # runtime state private to this process, outside the user's Copilot home.
+        storage = TemporaryDirectory(prefix="illdashboard-copilot-")
+        client = None
         logger.info(
             "Copilot client starting models=%s token_configured=%s",
             _configured_model_summary(),
             bool(token),
         )
         try:
+            client = CopilotClient(
+                github_token=token or None,
+                mode="empty",
+                base_directory=storage.name,
+                working_directory=storage.name,
+            )
             await client.start()
-        except Exception:
+        except BaseException:
+            try:
+                if client is not None:
+                    await client.stop()
+            finally:
+                storage.cleanup()
             logger.exception(
                 "Copilot client start failed models=%s duration=%.2fs",
                 _configured_model_summary(),
@@ -214,6 +230,7 @@ async def _get_client() -> CopilotClient:
             raise
 
         _client = client
+        _client_storage = storage
         logger.info(
             "Copilot client ready models=%s token_configured=%s duration=%.2fs",
             _configured_model_summary(),
@@ -278,14 +295,19 @@ def _is_unsupported_reasoning_effort_error(exc: Exception) -> bool:
 
 async def shutdown_client() -> None:
     """Stop the shared Copilot client."""
-    global _client
+    global _client, _client_storage
 
-    if _client is not None:
+    async with _client_start_lock:
         try:
-            await _client.stop()
+            if _client is not None:
+                await _client.stop()
         except Exception as exc:
             logger.warning("Copilot client shutdown had errors: %s", exc)
-        _client = None
+        finally:
+            _client = None
+            if _client_storage is not None:
+                _client_storage.cleanup()
+                _client_storage = None
 
 
 async def prewarm_client() -> bool:
@@ -361,6 +383,7 @@ async def _ask(
                     session = None
                     unsubscribe = None
                     progress_task: asyncio.Task[None] | None = None
+                    session_completed = False
                     try:
                         client_wait_started_at = time.perf_counter()
                         client = await _get_client()
@@ -372,17 +395,27 @@ async def _ask(
                             request_id=request_id,
                         )
                         session_create_started_at = time.perf_counter()
-                        session_config: SessionConfig = {
+                        def deny_permission(
+                            _request: PermissionRequest,
+                            _invocation: PermissionInvocation,
+                        ) -> PermissionRequestResult:
+                            return PermissionDecisionReject(feedback="illdashboard does not permit tools")
+
+                        session_options = {
                             "model": request_settings.model,
                             "system_message": {"mode": "replace", "content": system_prompt},
                             "available_tools": [],
-                            "on_permission_request": PermissionHandler.approve_all,
+                            "on_permission_request": deny_permission,
+                            "enable_skills": False,
+                            "enable_session_store": False,
+                            "skill_directories": [],
+                            "disabled_skills": ["*"],
                         }
                         if effective_reasoning_effort is not None:
-                            session_config["reasoning_effort"] = effective_reasoning_effort
+                            session_options["reasoning_effort"] = effective_reasoning_effort
                         applied_reasoning_effort = effective_reasoning_effort
                         try:
-                            session = await client.create_session(session_config)
+                            session = await client.create_session(**session_options)
                         except Exception as exc:
                             # Some SDK model listings still claim reasoning support for mini
                             # models that reject it at session.create time, so fall back to
@@ -398,10 +431,10 @@ async def _ask(
                                 request_settings.reasoning_effort,
                                 exc,
                             )
-                            retry_session_config = dict(session_config)
-                            retry_session_config.pop("reasoning_effort", None)
+                            retry_session_options = dict(session_options)
+                            retry_session_options.pop("reasoning_effort", None)
                             applied_reasoning_effort = None
-                            session = await client.create_session(retry_session_config)
+                            session = await client.create_session(**retry_session_options)
 
                         session_create_ms = (time.perf_counter() - session_create_started_at) * 1000
                         logger.info(
@@ -505,13 +538,15 @@ async def _ask(
 
                         if COPILOT_REQUEST_PROGRESS_INTERVAL > 0:
                             progress_task = asyncio.create_task(_log_request_progress())
-                        message_options: MessageOptions = {"prompt": user_prompt}
-                        if attachments:
-                            message_options["attachments"] = attachments
-                        response = await session.send_and_wait(message_options, timeout=timeout)
+                        response = await session.send_and_wait(
+                            user_prompt,
+                            attachments=attachments,
+                            timeout=timeout,
+                        )
                         content = getattr(response.data, "content", "") if response else ""
                         if content is None:
                             content = ""
+                        session_completed = True
                     except Exception as exc:
                         request_error = exc
                     finally:
@@ -524,6 +559,17 @@ async def _ask(
                         if unsubscribe is not None:
                             unsubscribe()
                         if session is not None:
+                            if not session_completed:
+                                try:
+                                    await session.abort()
+                                except Exception as exc:
+                                    logger.warning("Copilot session abort had errors: %s", exc)
+                            session_id = getattr(session, "session_id", None)
+                            if session_id is not None:
+                                try:
+                                    await client.delete_session(session_id)
+                                except Exception as exc:
+                                    logger.warning("Copilot session delete had errors: %s", exc)
                             try:
                                 await session.disconnect()
                             except Exception as exc:
@@ -577,7 +623,6 @@ async def _ask(
                 COPILOT_TRANSIENT_RETRY_DELAY,
                 request_error,
             )
-            await shutdown_client()
             await asyncio.sleep(COPILOT_TRANSIENT_RETRY_DELAY)
             continue
 

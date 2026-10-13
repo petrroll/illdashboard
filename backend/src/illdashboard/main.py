@@ -7,9 +7,11 @@ import logging
 from contextlib import asynccontextmanager
 from logging.config import dictConfig
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from illdashboard.api import router
@@ -94,9 +96,56 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+TRUSTED_BROWSER_ORIGINS = frozenset({"http://localhost:5173", "http://localhost:3000"})
+SAFE_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
+
+
+def is_untrusted_browser_request(request: Request) -> bool:
+    # CORS alone does not stop "simple" cross-site requests (e.g. bodyless POST): the browser sends them
+    # without a preflight and only hides the response, so the side effect still happens. This rejects
+    # unsafe requests that a browser marks as coming from another origin. It is not authentication.
+    if request.method in SAFE_HTTP_METHODS:
+        return False
+
+    # Sec-Fetch-Site is set by the browser and cannot be forged by page scripts. "same-origin" also covers
+    # the Vite proxy and private Codespaces forwarding, where changeOrigin rewrites Host but the page and
+    # the /api request share one origin.
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site in {"same-origin", "none"}:
+        return False
+
+    origin = request.headers.get("origin")
+    if origin is None:
+        # Browsers send Origin on cross-origin unsafe requests, so a missing Origin on a cross-site fetch
+        # is suspicious; with no fetch metadata at all this is a non-browser client (CLI, tests).
+        return fetch_site is not None
+    if origin in TRUSTED_BROWSER_ORIGINS:
+        return False
+    # Direct (non-proxied) access: the page origin matches the host it is talking to. Scheme is ignored
+    # because TLS-terminating port forwarding presents https to the browser but http to uvicorn.
+    origin_host = urlsplit(origin).netloc.lower()
+    request_host = request.headers.get("host", "").lower()
+    return not origin_host or origin_host != request_host
+
+
+@app.middleware("http")
+async def reject_cross_site_unsafe_requests(request: Request, call_next):
+    if is_untrusted_browser_request(request):
+        logger.warning(
+            "Rejected cross-site %s %s (origin=%r, sec-fetch-site=%r)",
+            request.method,
+            request.url.path,
+            request.headers.get("origin"),
+            request.headers.get("sec-fetch-site"),
+        )
+        return JSONResponse({"detail": "Cross-site request rejected"}, status_code=403)
+    return await call_next(request)
+
+
+# Added after the cross-site middleware so CORS stays outermost and still answers preflights itself.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=sorted(TRUSTED_BROWSER_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TypeVar
 
 import fitz
-from sqlalchemy import delete, func, inspect, select
+from sqlalchemy import delete, func, inspect, or_, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
@@ -92,6 +92,9 @@ DEFAULT_OCR_DPI = 144
 MIN_OCR_DPI = 96
 MAX_JOB_ATTEMPTS = 3
 JOB_LEASE_SECONDS = COPILOT_REQUEST_TIMEOUT
+# One handler can wait on several queued/retried Copilot calls, so a single
+# timeout-sized lease is not enough; workers renew it well before it expires.
+JOB_LEASE_HEARTBEAT_SECONDS = 60.0
 # Keep polling latency low enough that controller->worker handoffs do not add
 # noticeable lag or cause clean-runtime restart tests to become timing-sensitive.
 WORKER_IDLE_SECONDS = 0.2
@@ -348,14 +351,14 @@ class PipelineRuntime:
                         continue
 
                     try:
-                        await handler(session, jobs)
+                        await self._run_handler_with_lease_heartbeat(session, jobs, lease_owner, handler)
                         await session.commit()
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
                         logger.exception("Worker failed worker=%s task_types=%s", worker_name, task_types)
                         await session.rollback()
-                        await self._handle_worker_failure(session, jobs, exc)
+                        await self._handle_worker_failure(session, jobs, exc, lease_owner=lease_owner)
                         await session.commit()
             except asyncio.CancelledError:
                 return
@@ -363,7 +366,59 @@ class PipelineRuntime:
                 logger.exception("Worker loop crashed worker=%s task_types=%s", worker_name, task_types)
                 await asyncio.sleep(WORKER_IDLE_SECONDS)
 
-    async def _handle_worker_failure(self, session: AsyncSession, jobs: list[Job], exc: Exception) -> None:
+    async def _run_handler_with_lease_heartbeat(
+        self,
+        session: AsyncSession,
+        jobs: list[Job],
+        lease_owner: str,
+        handler,
+    ) -> None:
+        job_ids = [job.id for job in jobs]
+        handler_task = asyncio.create_task(handler(session, jobs))
+        heartbeat_task = asyncio.create_task(self._heartbeat_job_leases(job_ids, lease_owner))
+        try:
+            await asyncio.wait({handler_task, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # Also runs when the worker itself is cancelled, so no handler keeps
+            # writing after runtime stop.
+            for task in (heartbeat_task, handler_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(heartbeat_task, handler_task, return_exceptions=True)
+        if handler_task.cancelled() and heartbeat_task.done() and not heartbeat_task.cancelled():
+            # The heartbeat only finishes when another owner took a job, so the
+            # handler was cancelled and its uncommitted outputs must roll back.
+            raise job_service.JobLeaseLostError(f"Lease lost for jobs {heartbeat_task.result()}")
+        handler_task.result()
+
+    async def _heartbeat_job_leases(self, job_ids: list[int], lease_owner: str) -> list[int]:
+        while True:
+            await asyncio.sleep(JOB_LEASE_HEARTBEAT_SECONDS)
+            try:
+                async with self.session_factory() as session:
+                    stolen_ids = await job_service.renew_job_leases(
+                        session,
+                        job_ids=job_ids,
+                        lease_owner=lease_owner,
+                        lease_seconds=JOB_LEASE_SECONDS,
+                    )
+            except Exception:
+                # A transient lock is not lease loss; the next beat retries well
+                # before the lease runs out.
+                logger.warning("Lease heartbeat failed owner=%s job_ids=%s", lease_owner, job_ids, exc_info=True)
+                continue
+            if stolen_ids:
+                logger.warning("Lease lost owner=%s job_ids=%s", lease_owner, stolen_ids)
+                return stolen_ids
+
+    async def _handle_worker_failure(
+        self,
+        session: AsyncSession,
+        jobs: list[Job],
+        exc: Exception,
+        *,
+        lease_owner: str,
+    ) -> None:
         # AsyncSession.rollback() expires ORM attributes, so derive stable identity
         # keys from the instance state before refreshing the rows in this session.
         job_ids = [identity[0] for job in jobs if (identity := inspect(job).identity) and isinstance(identity[0], int)]
@@ -371,7 +426,11 @@ class PipelineRuntime:
             refreshed = await session.get(Job, job_id)
             if refreshed is None or refreshed.status != job_service.JOB_STATUS_LEASED:
                 continue
-            if refreshed.attempt_count < MAX_JOB_ATTEMPTS:
+            if refreshed.lease_owner != lease_owner:
+                # Another worker owns the job now; its outcome is not ours to record.
+                continue
+            # Losing a lease is not the job's fault, so it must not burn the last attempt.
+            if refreshed.attempt_count < MAX_JOB_ATTEMPTS or isinstance(exc, job_service.JobLeaseLostError):
                 await job_service.release_job(session, refreshed, delay_seconds=15, error_text=str(exc))
             else:
                 await job_service.mark_job_failed(session, refreshed, error_text=str(exc))
@@ -379,20 +438,25 @@ class PipelineRuntime:
 
     async def _run_jobs_in_fresh_session(
         self,
-        job_ids: list[int],
+        claimed_jobs: list[Job],
         handler: Callable[[AsyncSession, list[Job]], Awaitable[None]],
     ) -> None:
-        requested_ids = [job_id for job_id in dict.fromkeys(job_ids) if isinstance(job_id, int)]
+        claimed_owners = {job.id: job.lease_owner for job in claimed_jobs}
+        requested_ids = [job_id for job_id in claimed_owners if isinstance(job_id, int)]
         if not requested_ids:
             return
 
         async with self.session_factory() as session:
             result = await session.execute(select(Job).where(Job.id.in_(requested_ids)).order_by(Job.id.asc()))
             jobs_by_id = {job.id: job for job in result.scalars().all()}
+            # Re-check the owner too: a reloaded row may already belong to a
+            # worker that took over an expired lease.
             fresh_jobs = [
                 jobs_by_id[job_id]
                 for job_id in requested_ids
-                if job_id in jobs_by_id and jobs_by_id[job_id].status == job_service.JOB_STATUS_LEASED
+                if job_id in jobs_by_id
+                and jobs_by_id[job_id].status == job_service.JOB_STATUS_LEASED
+                and jobs_by_id[job_id].lease_owner == claimed_owners[job_id]
             ]
             if not fresh_jobs:
                 return
@@ -431,25 +495,25 @@ class PipelineRuntime:
         await _refresh_search(session, jobs[0])
 
     async def _handle_source_jobs(self, _session: AsyncSession, jobs: list[Job]) -> None:
-        await self._run_jobs_in_fresh_session([job.id for job in jobs], _canonize_source_jobs)
+        await self._run_jobs_in_fresh_session(jobs, _canonize_source_jobs)
 
     async def _handle_marker_jobs(self, _session: AsyncSession, jobs: list[Job]) -> None:
-        await self._run_jobs_in_fresh_session([job.id for job in jobs], _canonize_marker_jobs)
+        await self._run_jobs_in_fresh_session(jobs, _canonize_marker_jobs)
 
     async def _handle_group_jobs(self, _session: AsyncSession, jobs: list[Job]) -> None:
-        await self._run_jobs_in_fresh_session([job.id for job in jobs], _canonize_group_jobs)
+        await self._run_jobs_in_fresh_session(jobs, _canonize_group_jobs)
 
     async def _handle_unit_jobs(self, _session: AsyncSession, jobs: list[Job]) -> None:
-        await self._run_jobs_in_fresh_session([job.id for job in jobs], _canonize_unit_jobs)
+        await self._run_jobs_in_fresh_session(jobs, _canonize_unit_jobs)
 
     async def _handle_conversion_jobs(self, _session: AsyncSession, jobs: list[Job]) -> None:
-        await self._run_jobs_in_fresh_session([job.id for job in jobs], _canonize_conversion_jobs)
+        await self._run_jobs_in_fresh_session(jobs, _canonize_conversion_jobs)
 
     async def _handle_qualitative_jobs(self, _session: AsyncSession, jobs: list[Job]) -> None:
-        await self._run_jobs_in_fresh_session([job.id for job in jobs], _canonize_qualitative_jobs)
+        await self._run_jobs_in_fresh_session(jobs, _canonize_qualitative_jobs)
 
     async def _handle_anomalous_rescaling_jobs(self, _session: AsyncSession, jobs: list[Job]) -> None:
-        await self._run_jobs_in_fresh_session([job.id for job in jobs], _review_anomalous_rescaling_jobs)
+        await self._run_jobs_in_fresh_session(jobs, _review_anomalous_rescaling_jobs)
 
 
 async def start_pipeline_runtime(session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -499,11 +563,58 @@ async def queue_file(session: AsyncSession, file_id: int) -> LabFile:
         await session.execute(
             delete(Job).where(Job.task_type == TASK_CANONIZE_SOURCE, Job.task_key == file.source_candidate_key)
         )
+    await _delete_failed_shared_normalization_jobs(session, file.id)
     await job_service.delete_jobs_for_file(session, file.id)
     await _reset_file_processing_state(session, file, file_status=FILE_STATUS_QUEUED)
     await _request_file_ensure(session, file.id)
     await session.flush()
     return file
+
+
+async def _delete_failed_shared_normalization_jobs(session: AsyncSession, file_id: int) -> None:
+    # Like the source job above, these jobs are keyed globally, and a FAILED row
+    # makes _apply_known_measurement_rules error the re-extracted measurements
+    # without retrying. Only failed rows this file depends on are dropped;
+    # pending/leased rows may still be serving other files.
+    result = await session.execute(
+        select(Measurement)
+        .options(selectinload(Measurement.measurement_type))
+        .where(Measurement.lab_file_id == file_id)
+    )
+    task_keys: dict[str, set[str]] = {
+        TASK_CANONIZE_MARKER: set(),
+        TASK_CANONIZE_GROUP: set(),
+        TASK_CANONIZE_UNIT: set(),
+        TASK_CANONIZE_CONVERSION: set(),
+        TASK_CANONIZE_QUALITATIVE: set(),
+    }
+    for measurement in result.scalars().all():
+        if measurement.normalized_marker_key:
+            task_keys[TASK_CANONIZE_MARKER].add(_marker_task_key(measurement.normalized_marker_key))
+        if measurement.original_qualitative_value:
+            qualitative_key = qualitative_values.normalize_qualitative_key(measurement.original_qualitative_value)
+            if qualitative_key:
+                task_keys[TASK_CANONIZE_QUALITATIVE].add(_qualitative_task_key(qualitative_key))
+        measurement_type = measurement.measurement_type
+        if measurement_type is None:
+            continue
+        task_keys[TASK_CANONIZE_GROUP].add(_group_task_key(measurement_type.normalized_key))
+        task_keys[TASK_CANONIZE_UNIT].add(_canonical_unit_task_key(measurement_type.normalized_key))
+        original_unit_key = rescaling.normalize_unit_key(measurement.original_unit)
+        canonical_unit_key = rescaling.normalize_unit_key(measurement_type.canonical_unit)
+        if original_unit_key and canonical_unit_key:
+            task_keys[TASK_CANONIZE_CONVERSION].add(
+                _conversion_task_key(measurement_type.normalized_key, original_unit_key, canonical_unit_key)
+            )
+    for task_type, keys in task_keys.items():
+        if keys:
+            await session.execute(
+                delete(Job).where(
+                    Job.task_type == task_type,
+                    Job.task_key.in_(keys),
+                    Job.status == job_service.JOB_STATUS_FAILED,
+                )
+            )
 
 
 async def queue_files(session: AsyncSession, file_ids: list[int]) -> list[int]:
@@ -600,6 +711,32 @@ async def reset_incomplete_processing(session: AsyncSession) -> None:
         select(LabFile).options(selectinload(LabFile.tags)).where(LabFile.status != FILE_STATUS_COMPLETE)
     )
     for file in result.scalars().unique().all():
+        # Shared normalization reruns can project a completed file back to
+        # processing, so cancel must not discard manual measurement edits. Keep
+        # those artifacts and settle a status that startup will not resume.
+        edited_result = await session.execute(
+            select(Measurement.id)
+            .where(
+                Measurement.lab_file_id == file.id,
+                or_(
+                    Measurement.user_canonical_value_override,
+                    Measurement.user_canonical_unit_override,
+                    Measurement.user_original_unit_override,
+                    Measurement.user_qualitative_value_override,
+                    Measurement.user_qualitative_bool_override,
+                    Measurement.user_canonical_reference_low_override,
+                    Measurement.user_canonical_reference_high_override,
+                    Measurement.user_measured_at_override,
+                ),
+            )
+            .limit(1)
+        )
+        if edited_result.scalar_one_or_none() is not None:
+            await _refresh_file_status_projection(session, file)
+            if file.status not in {FILE_STATUS_COMPLETE, FILE_STATUS_ERROR}:
+                file.status = FILE_STATUS_ERROR
+                file.processing_error = "Processing cancelled; manual edits were kept. Reprocess to rebuild the file."
+            continue
         await _reset_file_processing_state(session, file, file_status=FILE_STATUS_UPLOADED)
 
 

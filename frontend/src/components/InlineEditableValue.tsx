@@ -74,12 +74,6 @@ export default function InlineEditableValue({
   const clickTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
-    if (!editing) {
-      setDraft(editValue);
-    }
-  }, [editValue, editing]);
-
-  useEffect(() => {
     return () => {
       if (clickTimeoutRef.current !== null) {
         window.clearTimeout(clickTimeoutRef.current);

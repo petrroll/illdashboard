@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
@@ -12,10 +13,12 @@ from illdashboard.models import (
     MarkerGroup,
     Measurement,
     MeasurementAlias,
+    MeasurementBatch,
     MeasurementType,
     QualitativeRule,
     RescalingRule,
     SourceAlias,
+    TextBatch,
     utc_now,
 )
 from illdashboard.services import jobs as job_service
@@ -397,7 +400,7 @@ async def test_worker_failure_handler_survives_expired_jobs_after_rollback(sessi
         leased_jobs = list((await session.execute(select(Job).where(Job.id == job_id))).scalars())
 
         await session.rollback()
-        await runtime._handle_worker_failure(session, leased_jobs, RuntimeError("boom"))
+        await runtime._handle_worker_failure(session, leased_jobs, RuntimeError("boom"), lease_owner="test-runtime")
         await session.commit()
 
         refreshed = await session.get(Job, job_id)
@@ -405,6 +408,97 @@ async def test_worker_failure_handler_survives_expired_jobs_after_rollback(sessi
     assert refreshed is not None
     assert refreshed.status == job_service.JOB_STATUS_PENDING
     assert refreshed.error_text == "boom"
+
+
+@pytest.mark.asyncio
+async def test_worker_failure_handler_skips_jobs_leased_by_another_owner(session_factory):
+    runtime = pipeline.PipelineRuntime(session_factory)
+
+    async with session_factory() as session:
+        job = Job(
+            task_type=pipeline.TASK_CANONIZE_MARKER,
+            task_key="stolen-marker",
+            status=job_service.JOB_STATUS_LEASED,
+            attempt_count=pipeline.MAX_JOB_ATTEMPTS,
+            lease_owner="new-owner",
+            lease_until=utc_now() + timedelta(minutes=5),
+            payload_json=job_service.json_dumps({}),
+        )
+        session.add(job)
+        await session.commit()
+        job_id = job.id
+
+        await runtime._handle_worker_failure(session, [job], RuntimeError("boom"), lease_owner="old-owner")
+        await session.commit()
+        refreshed = await session.get(Job, job_id)
+
+    assert refreshed is not None
+    assert refreshed.status == job_service.JOB_STATUS_LEASED
+    assert refreshed.lease_owner == "new-owner"
+    assert refreshed.error_text is None
+
+
+@pytest.mark.asyncio
+async def test_lease_heartbeat_renews_and_cancels_handler_when_lease_is_stolen(session_factory, monkeypatch):
+    monkeypatch.setattr(pipeline, "JOB_LEASE_HEARTBEAT_SECONDS", 0.01)
+    runtime = pipeline.PipelineRuntime(session_factory)
+
+    async with session_factory() as session:
+        job = Job(
+            task_type=pipeline.TASK_CANONIZE_MARKER,
+            task_key="heartbeat-marker",
+            status=job_service.JOB_STATUS_LEASED,
+            lease_owner="worker-a",
+            lease_until=utc_now() + timedelta(seconds=1),
+            payload_json=job_service.json_dumps({}),
+        )
+        session.add(job)
+        await session.commit()
+        async with session_factory() as probe:
+            stored_before = await probe.get(Job, job.id)
+            assert stored_before is not None
+            original_until = stored_before.lease_until
+
+        renewed = asyncio.Event()
+        handler_cancelled = asyncio.Event()
+
+        async def slow_handler(handler_session, jobs):
+            # Left unflushed so the test does not hold SQLite's write lock against the heartbeat.
+            handler_session.add(MeasurementType(name="Uncommitted", normalized_key="uncommitted"))
+            try:
+                while True:
+                    async with session_factory() as probe:
+                        current = await probe.get(Job, job.id)
+                        assert current is not None
+                        if current.lease_until > original_until and not renewed.is_set():
+                            renewed.set()
+                            # Simulate a takeover by another worker.
+                            current.lease_owner = "worker-b"
+                            await probe.commit()
+                    await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                handler_cancelled.set()
+                raise
+
+        with pytest.raises(job_service.JobLeaseLostError):
+            await asyncio.wait_for(
+                runtime._run_handler_with_lease_heartbeat(session, [job], "worker-a", slow_handler), timeout=5
+            )
+        await session.rollback()
+        await runtime._handle_worker_failure(
+            session, [job], job_service.JobLeaseLostError("lost"), lease_owner="worker-a"
+        )
+        await session.commit()
+
+        stored = await session.get(Job, job.id)
+        leftover_types = list((await session.execute(select(MeasurementType))).scalars())
+
+    assert renewed.is_set()
+    assert handler_cancelled.is_set()
+    assert stored is not None
+    assert stored.status == job_service.JOB_STATUS_LEASED
+    assert stored.lease_owner == "worker-b"
+    assert leftover_types == []
 
 
 @pytest.mark.asyncio
@@ -1219,3 +1313,127 @@ async def test_apply_known_measurement_rules_applies_resolved_anomalous_review_j
     assert current_measurement.normalization_status == pipeline.MEASUREMENT_STATE_RESOLVED
     assert current_measurement.canonical_value == pytest.approx(0.292)
     assert rules == []
+
+
+@pytest.mark.asyncio
+async def test_queue_file_retries_failed_shared_normalization_jobs_for_that_file(session_factory):
+    async with session_factory() as session:
+        lab_file = LabFile(filename="retry.png", filepath="/tmp/retry.png", mime_type="image/png", status="error")
+        glucose = MeasurementType(name="Glucose", normalized_key="glucose", canonical_unit="mmol/L")
+        session.add_all([lab_file, glucose])
+        await session.flush()
+        session.add_all(
+            [
+                Measurement(
+                    lab_file_id=lab_file.id,
+                    raw_marker_name="CRP",
+                    normalized_marker_key=normalize_marker_alias_key("CRP"),
+                    original_qualitative_value="Positive",
+                    normalization_status=pipeline.MEASUREMENT_STATE_ERROR,
+                ),
+                Measurement(
+                    lab_file_id=lab_file.id,
+                    measurement_type_id=glucose.id,
+                    raw_marker_name="Glucose",
+                    normalized_marker_key=normalize_marker_alias_key("Glucose"),
+                    original_value=90,
+                    original_unit="mg/dL",
+                    normalization_status=pipeline.MEASUREMENT_STATE_ERROR,
+                ),
+            ]
+        )
+        qualitative_key = qualitative_values.normalize_qualitative_key("Positive")
+        conversion_key = pipeline._conversion_task_key(
+            "glucose", rescaling.normalize_unit_key("mg/dL"), rescaling.normalize_unit_key("mmol/L")
+        )
+        failed = [
+            (pipeline.TASK_CANONIZE_MARKER, normalize_marker_alias_key("CRP")),
+            (pipeline.TASK_CANONIZE_QUALITATIVE, qualitative_key),
+            (pipeline.TASK_CANONIZE_GROUP, "glucose"),
+            (pipeline.TASK_CANONIZE_UNIT, "glucose"),
+            (pipeline.TASK_CANONIZE_CONVERSION, conversion_key),
+            # Unrelated to this file, so an explicit reprocess must leave it alone.
+            (pipeline.TASK_CANONIZE_MARKER, "unrelated"),
+        ]
+        session.add_all(
+            [
+                Job(task_type=task_type, task_key=task_key, status=job_service.JOB_STATUS_FAILED, error_text="x")
+                for task_type, task_key in failed
+            ]
+        )
+        await session.commit()
+
+        await pipeline.queue_file(session, lab_file.id)
+        await session.commit()
+        remaining = {
+            (job.task_type, job.task_key)
+            for job in (await session.execute(select(Job).where(Job.file_id.is_(None)))).scalars()
+        }
+
+    assert remaining == {(pipeline.TASK_CANONIZE_MARKER, "unrelated")}
+
+
+@pytest.mark.asyncio
+async def test_cancel_processing_keeps_manually_edited_measurements(session_factory):
+    async with session_factory() as session:
+        now = utc_now()
+        edited_file = LabFile(
+            filename="edited.png",
+            filepath="/tmp/edited.png",
+            mime_type="image/png",
+            page_count=1,
+            # A completed file is projected back to processing when shared
+            # normalization re-requests work for it.
+            status=pipeline.FILE_STATUS_PROCESSING,
+            text_assembled_at=now,
+            summary_generated_at=now,
+            source_resolved_at=now,
+        )
+        plain_file = LabFile(
+            filename="plain.png",
+            filepath="/tmp/plain.png",
+            mime_type="image/png",
+            status=pipeline.FILE_STATUS_PROCESSING,
+        )
+        session.add_all([edited_file, plain_file])
+        await session.flush()
+        session.add_all(
+            [
+                MeasurementBatch(file_id=edited_file.id, task_key="m", start_page=0, stop_page=1, dpi=144),
+                TextBatch(file_id=edited_file.id, task_key="t", start_page=0, stop_page=1, dpi=144),
+                Measurement(
+                    lab_file_id=edited_file.id,
+                    raw_marker_name="CRP",
+                    normalized_marker_key="crp",
+                    normalization_status=pipeline.MEASUREMENT_STATE_RESOLVED,
+                    user_canonical_value=5.0,
+                    user_canonical_value_override=True,
+                ),
+                Measurement(lab_file_id=plain_file.id, raw_marker_name="ALT", normalized_marker_key="alt"),
+                Job(
+                    file_id=edited_file.id,
+                    task_type=pipeline.TASK_PROCESS_MEASUREMENTS,
+                    task_key=f"file:{edited_file.id}:process-measurements",
+                    status=job_service.JOB_STATUS_PENDING,
+                ),
+            ]
+        )
+        await session.commit()
+
+        await pipeline.cancel_processing(session)
+
+        edited_measurements = list(
+            (await session.execute(select(Measurement).where(Measurement.lab_file_id == edited_file.id))).scalars()
+        )
+        plain_measurements = list(
+            (await session.execute(select(Measurement).where(Measurement.lab_file_id == plain_file.id))).scalars()
+        )
+        jobs = list((await session.execute(select(Job))).scalars())
+        await session.refresh(edited_file)
+        await session.refresh(plain_file)
+
+    assert [measurement.user_canonical_value for measurement in edited_measurements] == [5.0]
+    assert edited_file.status == pipeline.FILE_STATUS_COMPLETE
+    assert plain_measurements == []
+    assert plain_file.status == pipeline.FILE_STATUS_UPLOADED
+    assert jobs == []

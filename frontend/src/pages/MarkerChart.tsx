@@ -220,13 +220,24 @@ export default function MarkerChart() {
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedMarker = searchParams.get("marker") ?? "";
   const [overview, setOverview] = useState<MarkerOverviewGroup[]>([]);
-  const [selectedMarker, setSelectedMarker] = useState(requestedMarker);
+  const [defaultMarker, setDefaultMarker] = useState("");
+  const selectedMarker = requestedMarker || defaultMarker;
   const [detail, setDetail] = useState<MarkerDetailResponse | null>(null);
   const [loadingOverview, setLoadingOverview] = useState(true);
-  const [loadingDetail, setLoadingDetail] = useState(false);
-  const [insight, setInsight] = useState<string | null>(null);
-  const [insightCached, setInsightCached] = useState(false);
-  const [loadingInsight, setLoadingInsight] = useState(false);
+  const [loadedDetailMarker, setLoadedDetailMarker] = useState("");
+  const loadingDetail = !!selectedMarker && loadedDetailMarker !== selectedMarker;
+  const [insightResult, setInsightResult] = useState<{
+    markerName: string;
+    explanation: string | null;
+    cached: boolean;
+    loading: boolean;
+  } | null>(null);
+  // Results belong to a marker; a route change must not reuse another marker's insight.
+  const currentInsight = insightResult?.markerName === selectedMarker ? insightResult : null;
+  const currentDetail = detail?.marker_name === selectedMarker ? detail : null;
+  const insight = shareExportMode ? null : currentInsight?.explanation ?? currentDetail?.explanation ?? null;
+  const insightCached = currentInsight?.cached ?? currentDetail?.explanation_cached ?? false;
+  const loadingInsight = !shareExportMode && !!selectedMarker && (currentInsight?.loading ?? true);
   const [search, setSearch] = useState("");
   const [listPaneWidth, setListPaneWidth] = useState(getStoredListPaneWidth);
   const deferredSearch = useDeferredValue(search.trim().toLowerCase());
@@ -239,11 +250,12 @@ export default function MarkerChart() {
   const [collapsedGroups, setCollapsedGroups] = useState(getStoredCollapsedGroups);
   const latestInsightRequestRef = useRef(0);
 
-  const syncMarkerQuery = (markerName: string) => {
+  const syncMarkerQuery = useCallback((markerName: string) => {
+    if (searchParams.get("marker") === markerName) return;
     const nextParams = new URLSearchParams(searchParams);
     nextParams.set("marker", markerName);
     setSearchParams(nextParams, { replace: true, preventScrollReset: true });
-  };
+  }, [searchParams, setSearchParams]);
 
   const clampListPaneWidth = (nextWidth: number) => {
     const browserWidth = markerBrowserRef.current?.clientWidth ?? window.innerWidth;
@@ -256,10 +268,9 @@ export default function MarkerChart() {
 
   const cancelPendingInsightRefresh = useCallback(() => {
     latestInsightRequestRef.current += 1;
-    setLoadingInsight(false);
   }, []);
 
-  const refreshMarkerInsight = useCallback(async (markerName: string) => {
+  const refreshMarkerInsight = useCallback((markerName: string) => {
     if (shareExportMode) {
       cancelPendingInsightRefresh();
       return;
@@ -267,24 +278,20 @@ export default function MarkerChart() {
 
     const requestId = latestInsightRequestRef.current + 1;
     latestInsightRequestRef.current = requestId;
-    setLoadingInsight(true);
 
-    try {
-      const response = await fetchMarkerInsight(markerName);
+    return fetchMarkerInsight(markerName).then((response) => {
       if (latestInsightRequestRef.current !== requestId) {
         return;
       }
-      setInsight(response.explanation);
-      setInsightCached(response.explanation_cached);
-    } catch {
+      setInsightResult({ markerName, explanation: response.explanation, cached: response.explanation_cached, loading: false });
+    }).catch(() => {
       if (latestInsightRequestRef.current !== requestId) {
         return;
       }
-    } finally {
-      if (latestInsightRequestRef.current === requestId) {
-        setLoadingInsight(false);
-      }
-    }
+      setInsightResult((current) => current?.markerName === markerName
+        ? { ...current, loading: false }
+        : { markerName, explanation: null, cached: false, loading: false });
+    });
   }, [cancelPendingInsightRefresh, shareExportMode]);
 
   useEffect(() => {
@@ -298,7 +305,7 @@ export default function MarkerChart() {
         setOverview(response);
 
         const firstMarker = response[0]?.markers[0]?.marker_name ?? "";
-        setSelectedMarker((current) => current || requestedMarker || firstMarker);
+        setDefaultMarker((current) => current || firstMarker);
       } finally {
         if (!cancelled) {
           setLoadingOverview(false);
@@ -312,13 +319,6 @@ export default function MarkerChart() {
       cancelled = true;
     };
   }, [filterTags]);
-
-  useEffect(() => {
-    if (!requestedMarker || requestedMarker === selectedMarker) {
-      return;
-    }
-    setSelectedMarker(requestedMarker);
-  }, [requestedMarker, selectedMarker]);
 
   useEffect(() => {
     fetchMarkerTags().then(setAllMarkerTags);
@@ -351,47 +351,31 @@ export default function MarkerChart() {
 
   useEffect(() => {
     if (!selectedMarker) {
-      cancelPendingInsightRefresh();
       return;
     }
     let cancelled = false;
 
-    setInsight(null);
-    setInsightCached(false);
-
-    const loadDetail = async () => {
-      setLoadingDetail(true);
-      try {
-        const response = await fetchMarkerDetail(selectedMarker);
+    void fetchMarkerDetail(selectedMarker)
+      .then((response) => {
         if (!cancelled) {
           setDetail(response);
           if (response.marker_name !== selectedMarker) {
-            setSelectedMarker(response.marker_name);
             syncMarkerQuery(response.marker_name);
           }
-          if (shareExportMode) {
-            setInsight(null);
-            setInsightCached(false);
-          } else {
-            setInsight(response.explanation);
-            setInsightCached(response.explanation_cached);
-          }
         }
-      } finally {
+      }).finally(() => {
         if (!cancelled) {
-          setLoadingDetail(false);
+          setLoadedDetailMarker(selectedMarker);
         }
-      }
-    };
+      });
 
-    void loadDetail();
     void refreshMarkerInsight(selectedMarker);
 
     return () => {
       cancelled = true;
       cancelPendingInsightRefresh();
     };
-  }, [cancelPendingInsightRefresh, refreshMarkerInsight, selectedMarker, shareExportMode]);
+  }, [cancelPendingInsightRefresh, refreshMarkerInsight, selectedMarker, syncMarkerQuery]);
 
   const filteredOverview = useMemo(
     () =>
@@ -591,10 +575,6 @@ export default function MarkerChart() {
 
   const selectMarker = (markerName: string) => {
     startTransition(() => {
-      setSelectedMarker(markerName);
-      if (searchParams.get("marker") === markerName) {
-        return;
-      }
       syncMarkerQuery(markerName);
     });
   };
@@ -604,15 +584,14 @@ export default function MarkerChart() {
     const refreshedOverview = await fetchMarkerOverview(filterTags);
     setOverview(refreshedOverview);
     setDetail(updatedDetail);
-    setSelectedMarker(updatedDetail.marker_name);
+    setLoadedDetailMarker(updatedDetail.marker_name);
     syncMarkerQuery(updatedDetail.marker_name);
-    if (shareExportMode) {
-      setInsight(null);
-      setInsightCached(false);
-    } else {
-      setInsight(updatedDetail.explanation);
-      setInsightCached(updatedDetail.explanation_cached);
-    }
+    setInsightResult({
+      markerName: updatedDetail.marker_name,
+      explanation: updatedDetail.explanation,
+      cached: updatedDetail.explanation_cached,
+      loading: !shareExportMode && !updatedDetail.explanation_cached,
+    });
   };
 
   const handleMarkerRename = async (nextMarkerName: string) => {
@@ -1473,7 +1452,7 @@ export default function MarkerChart() {
                   )}
                 </div>
                 {insight ? (
-                  <ReactMarkdown>{insight}</ReactMarkdown>
+                  <ReactMarkdown disallowedElements={["img"]}>{insight}</ReactMarkdown>
                 ) : loadingInsight ? (
                   <div className="card-empty detail-loading-block">
                     <span className="spinner" /> Generating interpretation…

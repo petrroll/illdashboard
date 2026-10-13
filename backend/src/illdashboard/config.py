@@ -39,22 +39,17 @@ class Settings(BaseSettings):
     NORMALIZATION_PROVIDER: ProviderName = "copilot"
 
     # GitHub Copilot SDK settings
-    COPILOT_DEFAULT_MODEL: str = "gpt-5.4"
-    COPILOT_MEASUREMENT_EXTRACTION_MODEL: str = "gpt-5.4-mini"
-    # Measurement extraction behaves like OCR/structured parsing, so keep
-    # reasoning disabled unless we have evidence it improves accuracy enough to
-    # justify the latency.
+    # Terra balances general-purpose quality and cost for summaries; Luna keeps
+    # repeated OCR, translation, and normalization batches lightweight. This is
+    # a workload/cost policy, not a healthcare accuracy benchmark.
+    COPILOT_DEFAULT_MODEL: str = "gpt-5.6-terra"
+    COPILOT_MEASUREMENT_EXTRACTION_MODEL: str = "gpt-6-luna"
+    # None preserves each model's default reasoning, rather than disabling it.
+    # Avoid forcing extra effort on every batch without measured quality gains.
     COPILOT_MEASUREMENT_EXTRACTION_REASONING_EFFORT: Literal["low", "medium", "high", "xhigh"] | None = None
-    # Use the mini model for free-form document OCR so raw transcription and
-    # translation do not consume the same premium model budget as the downstream
-    # summary, which still uses the default model above.
-    COPILOT_TEXT_EXTRACTION_MODEL: str = "gpt-5.4-mini"
-    # Text extraction is OCR/transcription work rather than a task that
-    # benefits from extra reasoning.
+    COPILOT_TEXT_EXTRACTION_MODEL: str = "gpt-6-luna"
     COPILOT_TEXT_EXTRACTION_REASONING_EFFORT: Literal["low", "medium", "high", "xhigh"] | None = None
-    COPILOT_NORMALIZATION_MODEL: str = "gpt-5.4-mini"
-    # Keep mini-model normalization valid by default; the client only forwards
-    # reasoning when the selected model explicitly advertises support.
+    COPILOT_NORMALIZATION_MODEL: str = "gpt-6-luna"
     COPILOT_NORMALIZATION_REASONING_EFFORT: Literal["low", "medium", "high", "xhigh"] | None = None
     # Token is read from environment – set GITHUB_TOKEN before running
     GITHUB_TOKEN: str = ""

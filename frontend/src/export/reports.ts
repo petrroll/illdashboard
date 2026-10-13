@@ -95,6 +95,10 @@ const VALUE_COLORS: Record<string, [number, number, number]> = {
 const TREND_POINT_OK_COLOR = "#22d9a0";
 const TREND_POINT_OOR_COLOR = "#f5a254";
 const MARKDOWN_TREND_BLOCKS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+// jsPDF's built-in Helvetica is WinAnsi-only and mangles ≤, μ, ⁹, Czech and non-Latin text.
+// The embedded DejaVu Sans subset (see assets/fonts/dejavu, pyftsubset of Latin/Latin Extended,
+// Greek, Cyrillic, punctuation, super/subscripts, letterlike, arrows, math) is used for PDF only.
+const PDF_FONT_FAMILY = "DejaVuSans";
 
 function normalizeMarkerNames(markerNames: string[]) {
   const seen = new Set<string>();
@@ -401,7 +405,7 @@ function renderTrendGraphicDataUrl(
   );
   const minValue = yAxisScale.domain[0];
   const maxValue = yAxisScale.domain[1];
-  const valueSpan = Math.max(maxValue - minValue, 1);
+  const valueSpan = maxValue > minValue ? maxValue - minValue : 1;
   const minTimestamp = Math.min(...points.map((point) => point.timestamp));
   const maxTimestamp = Math.max(...points.map((point) => point.timestamp));
   const useEvenSpacing = maxTimestamp === minTimestamp;
@@ -622,7 +626,7 @@ function buildNumericTrendText(
   const values = points.map((point) => point.value);
   const minValue = Math.min(...values);
   const maxValue = Math.max(...values);
-  const valueSpan = Math.max(maxValue - minValue, 1);
+  const valueSpan = maxValue > minValue ? maxValue - minValue : 1;
 
   return points
     .map((point) => {
@@ -918,10 +922,28 @@ function buildSummaryPdfBody(report: ExportReport) {
   return { headers, body, rowMeta };
 }
 
+function dataUrlBase64(dataUrl: string) {
+  const marker = ";base64,";
+  const markerIndex = dataUrl.indexOf(marker);
+  if (markerIndex < 0) {
+    throw new Error("PDF font asset must be an inline base64 data URL.");
+  }
+  return dataUrl.slice(markerIndex + marker.length);
+}
+
 async function renderPdfReport(report: ExportReport) {
-  const [{ jsPDF }, { default: autoTable }] = await Promise.all([
+  // Fonts are inlined (?inline) and lazy-loaded with jsPDF so standalone share exports
+  // need no network request and the regular app bundle does not carry them.
+  const [
+    { jsPDF },
+    { default: autoTable },
+    { default: regularFontDataUrl },
+    { default: boldFontDataUrl },
+  ] = await Promise.all([
     import("jspdf"),
     import("jspdf-autotable"),
+    import("../assets/fonts/dejavu/DejaVuSans-ExportSubset.ttf?inline"),
+    import("../assets/fonts/dejavu/DejaVuSans-Bold-ExportSubset.ttf?inline"),
   ]);
 
   const doc = new jsPDF({
@@ -930,6 +952,11 @@ async function renderPdfReport(report: ExportReport) {
     putOnlyUsedFonts: true,
     unit: "pt",
   });
+  doc.addFileToVFS("DejaVuSans-ExportSubset.ttf", dataUrlBase64(regularFontDataUrl));
+  doc.addFont("DejaVuSans-ExportSubset.ttf", PDF_FONT_FAMILY, "normal");
+  doc.addFileToVFS("DejaVuSans-Bold-ExportSubset.ttf", dataUrlBase64(boldFontDataUrl));
+  doc.addFont("DejaVuSans-Bold-ExportSubset.ttf", PDF_FONT_FAMILY, "bold");
+  doc.setFont(PDF_FONT_FAMILY, "normal");
   const pageWidth = doc.internal.pageSize.getWidth();
   const pageHeight = doc.internal.pageSize.getHeight();
   const margin = 40;
@@ -980,7 +1007,7 @@ async function renderPdfReport(report: ExportReport) {
     }
 
     ensureSpace(20);
-    doc.setFont("helvetica", "normal");
+    doc.setFont(PDF_FONT_FAMILY, "normal");
     doc.setFontSize(10);
     doc.setTextColor(110, 118, 129);
     doc.text("Trend unavailable.", margin, currentY + 10);
@@ -999,7 +1026,7 @@ async function renderPdfReport(report: ExportReport) {
       theme: "grid",
       styles: {
         cellPadding: 4,
-        font: "helvetica",
+        font: PDF_FONT_FAMILY,
         fontSize: 8.5,
         lineColor: [216, 222, 228],
         lineWidth: 0.5,
@@ -1009,12 +1036,13 @@ async function renderPdfReport(report: ExportReport) {
       headStyles: {
         fillColor: accentColor,
         textColor: [255, 255, 255],
+        font: PDF_FONT_FAMILY,
         fontStyle: "bold",
       },
       alternateRowStyles: {
         fillColor: [246, 249, 252],
       },
-      didDrawCell: (data: any) => {
+      didDrawCell: (data) => {
         const meta = rowMeta[data.row.index];
         if (!meta || meta.kind !== "summary" || data.column.index !== trendColumnIndex || !meta.trendDataUrl) {
           return;
@@ -1037,7 +1065,7 @@ async function renderPdfReport(report: ExportReport) {
 
   const isSingleMarkerReport = report.kind === "markers" && report.markerSections.length === 1;
 
-  doc.setFont("helvetica", "bold");
+  doc.setFont(PDF_FONT_FAMILY, "bold");
   doc.setFontSize(20);
   const titleLines = doc.splitTextToSize(report.title, pageWidth - margin * 2);
   doc.setTextColor(...textColor);
@@ -1045,7 +1073,7 @@ async function renderPdfReport(report: ExportReport) {
   currentY += titleLines.length * 22;
 
   if (report.focalFile) {
-    doc.setFont("helvetica", "normal");
+    doc.setFont(PDF_FONT_FAMILY, "normal");
     doc.setFontSize(10);
     doc.setTextColor(110, 118, 129);
     const metadataLines = [
@@ -1076,7 +1104,7 @@ async function renderPdfReport(report: ExportReport) {
         doc.setDrawColor(224, 231, 238);
         doc.line(margin, currentY, pageWidth - margin, currentY);
         currentY += 14;
-        doc.setFont("helvetica", "bold");
+        doc.setFont(PDF_FONT_FAMILY, "bold");
         doc.setFontSize(14);
         doc.setTextColor(...textColor);
         doc.text(section.markerName, margin, currentY);
@@ -1101,7 +1129,7 @@ async function renderPdfReport(report: ExportReport) {
         theme: "grid",
         styles: {
           cellPadding: 4,
-          font: "helvetica",
+          font: PDF_FONT_FAMILY,
           fontSize: 8.5,
           lineColor: [216, 222, 228],
           lineWidth: 0.5,
@@ -1111,6 +1139,7 @@ async function renderPdfReport(report: ExportReport) {
         headStyles: {
           fillColor: accentColor,
           textColor: [255, 255, 255],
+          font: PDF_FONT_FAMILY,
           fontStyle: "bold",
         },
         alternateRowStyles: {
@@ -1124,7 +1153,7 @@ async function renderPdfReport(report: ExportReport) {
   const pageCount = doc.getNumberOfPages();
   for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
     doc.setPage(pageNumber);
-    doc.setFont("helvetica", "normal");
+    doc.setFont(PDF_FONT_FAMILY, "normal");
     doc.setFontSize(9);
     doc.setTextColor(110, 118, 129);
     doc.text(

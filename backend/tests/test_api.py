@@ -124,6 +124,82 @@ async def test_upload_markdown_file_exposes_text_preview(client):
 
 
 @pytest.mark.asyncio
+async def test_invalid_pdf_upload_leaves_no_artifacts(client, session_factory):
+    response = await client.post(
+        "/api/files/upload", files={"file": ("broken.pdf", b"not a PDF", "application/pdf")}
+    )
+    assert response.status_code == 400
+    assert list(Path(settings.UPLOAD_DIR).iterdir()) == []
+    async with session_factory() as session:
+        assert (await session.scalars(select(LabFile))).all() == []
+
+
+@pytest.mark.asyncio
+async def test_uploaded_lab_date_survives_processing_reset(client):
+    response = await client.post(
+        "/api/files/upload",
+        params={"lab_date": "2026-01-02T00:00:00Z"},
+        files={"file": ("dated.png", b"image", "image/png")},
+    )
+    assert response.status_code == 200
+    file_id = response.json()["id"]
+    assert (await client.post(f"/api/files/{file_id}/ocr")).status_code == 200
+    refreshed = (await client.get(f"/api/files/{file_id}")).json()
+    assert refreshed["lab_date"].startswith("2026-01-02")
+    assert refreshed["has_user_edits"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["single", "batch", "unprocessed"])
+async def test_reprocessing_requires_explicit_measurement_discard(client, session_factory, action):
+    async with session_factory() as session:
+        lab = LabFile(filename="edited.png", filepath="/tmp/edited.png", mime_type="image/png", status="error")
+        measurement_type = MeasurementType(name="CRP", normalized_key="crp")
+        session.add_all([lab, measurement_type])
+        await session.flush()
+        measurement = Measurement(
+            lab_file_id=lab.id,
+            measurement_type_id=measurement_type.id,
+            raw_marker_name="CRP",
+            normalized_marker_key="crp",
+            user_canonical_value=0.004,
+            user_canonical_value_override=True,
+        )
+        session.add(measurement)
+        await session.commit()
+        file_id, measurement_id = lab.id, measurement.id
+
+    if action == "single":
+        url, body = f"/api/files/{file_id}/ocr", None
+    elif action == "batch":
+        url, body = "/api/files/ocr/batch", {"file_ids": [file_id]}
+    else:
+        url, body = "/api/files/ocr/unprocessed", None
+    response = await client.post(url, json=body)
+    assert response.status_code == 409
+    async with session_factory() as session:
+        assert await session.get(Measurement, measurement_id) is not None
+        assert (await session.get(LabFile, file_id)).status == "error"
+    if body is not None:
+        body["discard_user_edits"] = True
+    response = await client.post(url, json=body, params={"discard_user_edits": "true"})
+    assert response.status_code == 200
+    async with session_factory() as session:
+        assert await session.get(Measurement, measurement_id) is None
+
+
+@pytest.mark.asyncio
+async def test_batch_rejects_unknown_file_before_resetting_valid_file(client, session_factory):
+    response = await client.post("/api/files/upload", files={"file": ("valid.png", b"image", "image/png")})
+    file_id = response.json()["id"]
+    assert (await client.post("/api/files/999999/ocr")).status_code == 404
+    response = await client.post("/api/files/ocr/batch", json={"file_ids": [file_id, 999999]})
+    assert response.status_code == 404
+    async with session_factory() as session:
+        assert (await session.get(LabFile, file_id)).status == "uploaded"
+
+
+@pytest.mark.asyncio
 async def test_delete_file_removes_original_name_sidecar(client, session_factory):
     upload_response = await client.post(
         "/api/files/upload",
@@ -1203,7 +1279,7 @@ async def test_patch_marker_invalidates_cached_insight_and_defers_regeneration(c
         assert result.scalar_one_or_none() is None
 
     with patch("illdashboard.services.insights.explain_marker_history", AsyncMock(return_value="fresh insight")):
-        insight_response = await client.get("/api/measurements/insight", params={"marker_name": "Ferritin"})
+        insight_response = await client.post("/api/measurements/insight", params={"marker_name": "Ferritin"})
 
     assert insight_response.status_code == 200
     insight_body = insight_response.json()
