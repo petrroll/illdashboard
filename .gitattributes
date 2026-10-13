@@ -1,0 +1,5 @@
+# Keep Linux container scripts/configuration usable with Windows Git checkouts.
+.devcontainer/** text eol=lf
+justfile text eol=lf
+*.sh text eol=lf
+*.example text eol=lf

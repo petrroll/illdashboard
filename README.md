@@ -81,16 +81,121 @@ tools/
 justfile                             Setup, dev, build, lint, test, and utility commands
 ```
 
-## Prerequisites
+## Prerequisites (native development)
+
+These host tools are not needed when using the recommended container workflow.
 
 - Python 3.11+
-- Node.js 18+
+- Node.js 22.12+ (required by the current Vite toolchain)
 - [uv](https://docs.astral.sh/uv/) for Python dependency management
 - [just](https://just.systems/) for command recipes
 - `GITHUB_TOKEN` with GitHub Copilot access
 - Optional: `MISTRAL_API_KEY` if you want to switch extraction or normalization providers
 
-## Quick start
+## Container development (recommended)
+
+Local VS Code Dev Containers and GitHub Codespaces use the same
+`.devcontainer/devcontainer.json`. The container supplies Python 3.12, Node.js 22,
+`uv`, and `just`, and installs dependencies from the committed lockfiles as the
+non-root `vscode` user. You do not need these tools installed on Windows or in WSL.
+
+### Local containers (Windows + WSL2)
+
+1. Install/start **Docker Desktop** with its **WSL 2 engine** enabled. Under
+   **Settings → Resources → WSL Integration**, enable the distro containing this
+   checkout. Run `docker info` in that WSL distro to confirm access to the engine.
+2. Install Windows **VS Code** and its **WSL** and **Dev Containers** extensions.
+3. Keep the checkout in the WSL Linux filesystem (recommended for performance
+   and reliable file watching), then open it from a WSL terminal. From PowerShell,
+   enter WSL with `wsl` first:
+
+   ```bash
+   cd ~/projects/illdashboard
+   code .
+   ```
+
+   Use your own checkout path if different. An existing Windows/WSL launcher is
+   also fine, provided VS Code opens the folder in a **WSL** window rather than
+   as a plain Windows network folder.
+4. Run **Dev Containers: Reopen in Container** from the VS Code command palette.
+   Wait for the image build and dependency installation to finish.
+5. In the container, edit the automatically created `backend/.env` and set
+   `GITHUB_TOKEN` to a token with Copilot access. This file is Git-ignored and is
+   not overwritten when rebuilding. Windows/WSL environment variables are not
+   automatically copied into the container.
+6. In the VS Code **container terminal**, run:
+
+   ```bash
+   just dev
+   ```
+
+Open <http://localhost:5173> in your Windows browser; API docs are at
+<http://localhost:8000/docs>. Both ports are forwarded privately by VS Code. If
+one is already occupied on Windows, use the address shown in VS Code's **Ports**
+panel. Servers are started manually, not automatically on every container attach.
+
+For a checkout managed entirely by VS Code, use **Dev Containers: Clone Repository
+in Container Volume...** instead. This avoids sharing a checkout with host tools.
+
+### GitHub Codespaces
+
+On GitHub, select **Code > Codespaces > Create codespace** on the branch containing
+this configuration. Wait for setup to finish, configure `backend/.env` if needed,
+then run `just dev` in the Codespaces terminal. Use the **Ports** panel to open the
+frontend; both forwarded ports should remain **Private**. Desktop VS Code can
+connect through the **GitHub Codespaces** extension or **Open in VS Code**.
+
+New Codespaces use the committed configuration on the selected branch, not
+uncommitted changes in a local checkout. For an existing Codespace, apply changes
+with **Codespaces: Rebuild Container**.
+
+### Terminal access
+
+In an attached VS Code window, **Terminal > New Terminal** opens a shell inside the
+container. For a local checkout, install the Dev Containers CLI using VS Code's
+**Dev Containers: Install devcontainer CLI** command, then run these from the host
+checkout directory in WSL or PowerShell:
+
+```sh
+devcontainer up --workspace-folder .
+devcontainer exec --workspace-folder . bash
+```
+
+Keep a WSL checkout's CLI commands in WSL. The standalone CLI does not provide
+VS Code's port forwarding; attach VS Code for private browser access. For GitHub
+Codespaces, the GitHub CLI provides terminal and desktop editor access:
+
+```sh
+gh codespace ssh
+gh codespace code
+```
+
+### Dependencies, data, and security
+
+Dependencies live in the standard `backend/.venv` and `frontend/node_modules`
+workspace directories. Install and run them inside the container; use a separate
+checkout for native host development. Setup does not use `sudo`, change ownership,
+or weaken permissions. A bind-mounted checkout must already be writable by your
+normal host user; Dev Containers handles matching the container user's UID on
+Linux. A container cannot repair an incorrectly owned host checkout automatically.
+
+Use private forwarded ports, not Docker host port publishing or public Codespaces
+ports. The application handles personal health data and is not a public service.
+
+Uploaded files, SQLite databases, and `backend/.env` remain in the mounted
+workspace across container rebuilds. Back them up before deleting a checkout,
+container volume, or Codespace;
+`just clean` also deletes the default databases. Dependencies can be reinstalled
+with `bash .devcontainer/post-create.sh` without replacing your `.env`.
+For shareable HTML downloads, run `just build-frontend` once.
+
+If Docker is unavailable in WSL, check Docker Desktop's distro integration and
+restart the WSL/VS Code session. If opening from a Windows drive (`/mnt/c/...`)
+causes slow installs or missed reloads, move the checkout into the WSL filesystem.
+After changing `.devcontainer/`, use **Dev Containers: Rebuild Container** locally
+or **Codespaces: Rebuild Container** in Codespaces.
+
+## Native quick start
 
 ```bash
 # Install backend and frontend dependencies
