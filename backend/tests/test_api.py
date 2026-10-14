@@ -1657,6 +1657,50 @@ async def test_patch_marker_invalidates_cached_insight_and_defers_regeneration(c
 
 
 @pytest.mark.asyncio
+async def test_concurrent_marker_insight_requests_generate_once(client, session_factory):
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="tsh.pdf",
+            filepath="backend/data/tsh.pdf",
+            mime_type="application/pdf",
+            page_count=1,
+        )
+        measurement_type = MeasurementType(name="TSH", normalized_key="tsh", canonical_unit="mIU/l")
+        session.add_all([lab_file, measurement_type])
+        await session.flush()
+        session.add(
+            Measurement(
+                lab_file_id=lab_file.id,
+                measurement_type_id=measurement_type.id,
+                raw_marker_name="TSH",
+                normalized_marker_key="tsh",
+                original_value=2.0,
+                original_unit="mIU/l",
+                canonical_value=2.0,
+                canonical_unit="mIU/l",
+                normalization_status="resolved",
+                measured_at=datetime(2026, 4, 20, 8, 0, tzinfo=UTC),
+            )
+        )
+        await session.commit()
+
+    async def slow_explain(*_args):
+        await asyncio.sleep(0.05)
+        return "fresh insight"
+
+    explain = AsyncMock(side_effect=slow_explain)
+    with patch("illdashboard.services.insights.explain_marker_history", explain):
+        responses = await asyncio.gather(
+            client.post("/api/measurements/insight", params={"marker_name": "TSH"}),
+            client.post("/api/measurements/insight", params={"marker_name": "TSH"}),
+        )
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert sorted(response.json()["explanation_cached"] for response in responses) == [False, True]
+    assert explain.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_patch_measurement_original_unit_override_updates_conversion_warning(client, session_factory):
     async with session_factory() as session:
         lab_file = LabFile(

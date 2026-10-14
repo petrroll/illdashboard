@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections import defaultdict
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -172,37 +174,45 @@ def fallback_marker_explanation(marker_name: str, measurements: list[Measurement
     return "\n\n".join(parts)
 
 
+# Concurrent requests for one marker (e.g. dev StrictMode double effects) would each pay for a
+# Copilot call and then race on the unique measurement_type_id insert; the second waits and reuses.
+_insight_generation_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
 async def get_cached_or_generated_insight(
     measurement_type: MeasurementType,
     measurements: list[Measurement],
     db: AsyncSession,
 ) -> tuple[str, bool]:
     signature = marker_signature(measurements)
-    result = await db.execute(
-        select(BiomarkerInsight).where(BiomarkerInsight.measurement_type_id == measurement_type.id)
-    )
-    cached_insight = result.scalar_one_or_none()
-    if cached_insight and cached_insight.measurement_signature == signature:
-        return cached_insight.summary_markdown, True
-
-    try:
-        explanation = await explain_marker_history(measurement_type.name, serialize_history_for_ai(measurements))
-    except Exception:
-        explanation = fallback_marker_explanation(measurement_type.name, measurements)
-
-    if cached_insight is None:
-        cached_insight = BiomarkerInsight(
-            measurement_type_id=measurement_type.id,
-            measurement_signature=signature,
-            summary_markdown=explanation,
+    async with _insight_generation_locks[measurement_type.id]:
+        result = await db.execute(
+            select(BiomarkerInsight)
+            .where(BiomarkerInsight.measurement_type_id == measurement_type.id)
+            .execution_options(populate_existing=True)
         )
-        db.add(cached_insight)
-    else:
-        cached_insight.measurement_signature = signature
-        cached_insight.summary_markdown = explanation
+        cached_insight = result.scalar_one_or_none()
+        if cached_insight and cached_insight.measurement_signature == signature:
+            return cached_insight.summary_markdown, True
 
-    await db.commit()
-    return explanation, False
+        try:
+            explanation = await explain_marker_history(measurement_type.name, serialize_history_for_ai(measurements))
+        except Exception:
+            explanation = fallback_marker_explanation(measurement_type.name, measurements)
+
+        if cached_insight is None:
+            cached_insight = BiomarkerInsight(
+                measurement_type_id=measurement_type.id,
+                measurement_signature=signature,
+                summary_markdown=explanation,
+            )
+            db.add(cached_insight)
+        else:
+            cached_insight.measurement_signature = signature
+            cached_insight.summary_markdown = explanation
+
+        await db.commit()
+        return explanation, False
 
 
 async def invalidate_cached_insight(
