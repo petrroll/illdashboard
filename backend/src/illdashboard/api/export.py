@@ -269,7 +269,7 @@ async def _build_file_assets(file_id: int, db: AsyncSession) -> ShareExportFileA
     file_path = files_api.get_file_path_or_404(lab_file)
 
     if file_types.is_text_document_mime_type(lab_file.mime_type):
-        return ShareExportFileAssets(text_preview=file_path.read_text(encoding="utf-8-sig"))
+        return ShareExportFileAssets(text_preview=await asyncio.to_thread(file_path.read_text, encoding="utf-8-sig"))
 
     return ShareExportFileAssets(page_image_urls=await documents.run_pymupdf(_render_preview_pages, file_path))
 
@@ -325,6 +325,11 @@ async def build_share_export_bundle(db: AsyncSession) -> ShareExportBundle:
     )
 
 
+def _embed_share_bundle(shell_html: str, bundle: ShareExportBundle) -> str:
+    encoded_bundle = base64.b64encode(bundle.model_dump_json(exclude_none=True).encode("utf-8")).decode("ascii")
+    return shell_html.replace(EXPORT_BUNDLE_PLACEHOLDER, encoded_bundle, 1)
+
+
 @router.get("/export/share-html", tags=["export"])
 async def export_share_html(db: AsyncSession = Depends(get_db)):
     """Download a reduced read-only HTML snapshot with display-quality previews.
@@ -338,8 +343,8 @@ async def export_share_html(db: AsyncSession = Depends(get_db)):
     if EXPORT_BUNDLE_PLACEHOLDER not in shell_html:
         raise HTTPException(500, "Share export shell is invalid.")
 
-    encoded_bundle = base64.b64encode(bundle.model_dump_json(exclude_none=True).encode("utf-8")).decode("ascii")
-    content = shell_html.replace(EXPORT_BUNDLE_PLACEHOLDER, encoded_bundle, 1)
+    # The bundle embeds every page preview, so serializing it can take long enough to stall other requests.
+    content = await asyncio.to_thread(_embed_share_bundle, shell_html, bundle)
 
     filename = f"health-dashboard-share-{datetime.now(UTC).strftime('%Y-%m-%d')}.html"
     quoted_filename = quote(filename)

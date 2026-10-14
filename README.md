@@ -229,7 +229,8 @@ Then open:
 | Command | What it does |
 | --- | --- |
 | `just setup` | Install backend and frontend dependencies |
-| `just dev` | Run the backend and frontend dev servers together |
+| `just dev` | Run the backend and frontend dev servers together; output also goes to `run.log` (previous run in `run.prev.log`) |
+| `just dev-isolated <name> [copy]` | Run both servers on ports `8001`/`5174` against `backend/data/instances/<name>`; `copy` first replaces it with a snapshot of the main databases and uploads. Logs to `run-<name>.log` |
 | `just dev-backend` | Apply pending backend migrations, then run FastAPI with auto-reload on port `8000` |
 | `just dev-frontend` | Run the Vite dev server on port `5173` |
 | `just migrate-backend` | Apply pending backend database migrations without starting the server |
@@ -244,6 +245,7 @@ Then open:
 | `just lint` | Run backend and frontend validation |
 | `just fmt` | Format backend code and apply safe Ruff fixes |
 | `just run-log-viewer` | Serve the standalone `run.log` viewer on port `4173` |
+| `just retry-failed-jobs` | Reset failed pipeline jobs to pending so the running server retries them (can incur AI costs) |
 | `just clean` | Remove build artifacts, databases, caches, and `node_modules` |
 | `just help` | List all available recipes |
 

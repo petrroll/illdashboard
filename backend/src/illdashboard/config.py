@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     # reuse its existing job graph without adding per-request provider state.
     EXTRACTION_PROVIDER: ProviderName = "copilot"
     NORMALIZATION_PROVIDER: ProviderName = "copilot"
+    # Off for isolated repro instances that only need the API: a copied database
+    # would otherwise resume its pending jobs and make paid AI requests.
+    PIPELINE_WORKERS_ENABLED: bool = True
 
     # GitHub Copilot SDK settings
     # Terra balances general-purpose quality and cost for summaries; Luna keeps

@@ -1,6 +1,8 @@
 import asyncio
 import base64
+import itertools
 import json
+import logging
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -1604,3 +1606,61 @@ async def test_explain_marker_history_prompt_avoids_generic_caution_and_trend_fi
     assert "Please explain what the Potassium values mean based on these results." in user_prompt
     assert "whether that is commonly seen" in user_prompt
     assert "We understand this is not medical advice, so no disclaimer is necessary." in user_prompt
+
+
+def test_file_attachment_includes_display_name_required_by_sdk_event_parser():
+    from copilot.generated.session_events import session_event_from_dict
+
+    attachment = copilot_ocr._file_attachment("/tmp/page-1.png")
+    event = session_event_from_dict(
+        {
+            "id": "00000000-0000-0000-0000-000000000000",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "user.message",
+            "data": {"content": "extract", "attachments": [attachment]},
+        }
+    )
+
+    assert event.data.attachments[0].display_name == "page-1.png"
+
+
+def test_unknown_shutdown_type_filter_drops_only_the_known_sdk_error():
+    log_filter = copilot_client._UnknownShutdownTypeFilter()
+
+    def record_for(exc: Exception) -> logging.LogRecord:
+        return logging.LogRecord(
+            "asyncio", logging.ERROR, __file__, 1, "Exception in callback", None, (type(exc), exc, None)
+        )
+
+    assert log_filter.filter(record_for(ValueError("'destroy' is not a valid ShutdownType"))) is False
+    assert log_filter.filter(record_for(ValueError("'other' is not a valid ShutdownType"))) is True
+    assert log_filter.filter(record_for(AssertionError())) is True
+
+
+@pytest.mark.asyncio
+async def test_ask_reuses_response_kept_after_rolled_back_job(tmp_path):
+    attachment_path = tmp_path / "page.png"
+    attachment_path.write_bytes(b"page-pixels")
+    session = DummySession(response=SimpleNamespace(data=SimpleNamespace(content="paid answer")))
+    client = SimpleNamespace(create_session=AsyncMock(return_value=session), delete_session=AsyncMock())
+    copilot_client._retry_responses.clear()
+    render_numbers = itertools.count()
+
+    async def run_job() -> tuple[str, dict[str, str]]:
+        recorded = copilot_client.record_responses()
+        # Re-rendered pages land in new temp files, so reuse must match content, not path.
+        retry_path = tmp_path / f"page-{next(render_numbers)}.png"
+        retry_path.write_bytes(attachment_path.read_bytes())
+        result = await copilot_client._ask("system", "user", attachments=[{"type": "file", "path": str(retry_path)}])
+        return result, recorded
+
+    with patch("illdashboard.copilot.client._get_client", new=AsyncMock(return_value=client)):
+        first_result, recorded = await asyncio.create_task(run_job())
+        copilot_client.keep_responses_for_retry(recorded)
+        retry_result, _ = await asyncio.create_task(run_job())
+        fresh_result, _ = await asyncio.create_task(run_job())
+
+    assert first_result == retry_result == fresh_result == "paid answer"
+    # The kept response is single-use: the retry reuses it, the next request asks again.
+    assert client.create_session.await_count == 2
+    copilot_client._retry_responses.clear()

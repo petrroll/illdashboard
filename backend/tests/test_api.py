@@ -2081,9 +2081,13 @@ async def test_queue_files_from_clean_runtime_cancels_inflight_work(session_fact
         extract_attempts += 1
         if extract_attempts == 1:
             first_run_started.set()
-            await shutdown_requested.wait()
-            first_run_cancelled.set()
-            raise RuntimeError("aborted during clean-runtime reset")
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # A Copilot client shut down first would fail this request and the job with it.
+                assert not shutdown_requested.is_set()
+                first_run_cancelled.set()
+                raise
         return {
             "measurements": [
                 {

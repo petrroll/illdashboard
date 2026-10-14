@@ -10,7 +10,8 @@ export default defineConfig({
     allowedHosts: ['.app.github.dev'],
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        // `just dev-isolated` runs a second backend on another port next to `just dev`.
+        target: `http://localhost:${process.env.BACKEND_PORT ?? '8000'}`,
         changeOrigin: true,
       },
     },

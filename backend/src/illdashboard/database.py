@@ -20,7 +20,9 @@ def create_database_engine(database_url: str) -> AsyncEngine:
         def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.execute("PRAGMA busy_timeout=5000")
+            # Waiting happens on aiosqlite's connection thread, not the event loop, so a
+            # longer wait costs little and turns write bursts into delays instead of failures.
+            cursor.execute("PRAGMA busy_timeout=30000")
             # Many pipeline workers write while API requests read; WAL lets readers
             # proceed during writes instead of failing or stalling on the rollback journal.
             cursor.execute("PRAGMA journal_mode=WAL")

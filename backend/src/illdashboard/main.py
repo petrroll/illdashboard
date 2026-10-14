@@ -19,6 +19,7 @@ from illdashboard.copilot.client import prewarm_client, shutdown_client
 from illdashboard.database import dispose_database_engine, get_async_session_factory
 from illdashboard.medications_database import dispose_medications_engine, init_medications_database
 from illdashboard.services.pipeline import start_pipeline_runtime, stop_pipeline_runtime
+from illdashboard.sparkline import shutdown_sparkline_worker
 
 
 def configure_logging() -> None:
@@ -71,9 +72,12 @@ async def lifespan(app: FastAPI):
     session_factory = get_async_session_factory()
 
     await init_medications_database()
-    await start_pipeline_runtime(session_factory)
+    if settings.PIPELINE_WORKERS_ENABLED:
+        await start_pipeline_runtime(session_factory)
+        logger.info("Pipeline runtime started")
+    else:
+        logger.warning("Pipeline workers disabled by PIPELINE_WORKERS_ENABLED=false; queued jobs will not run")
     prewarm_task = asyncio.create_task(prewarm_client())
-    logger.info("Pipeline runtime started")
     try:
         yield
     finally:
@@ -85,6 +89,7 @@ async def lifespan(app: FastAPI):
                 pass
         await stop_pipeline_runtime()
         await shutdown_client()
+        shutdown_sparkline_worker()
         await dispose_database_engine()
         await dispose_medications_engine()
 

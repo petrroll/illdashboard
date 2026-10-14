@@ -73,6 +73,12 @@ def _save_pixmap_to_temp_png(pixmap: fitz.Pixmap) -> str:
     return temp_path
 
 
+def _file_attachment(path: str) -> dict:
+    # The SDK's attachment TypedDict marks displayName optional, but its event parser
+    # requires it when the CLI echoes the user.message back, logging an error otherwise.
+    return {"type": "file", "path": path, "displayName": Path(path).name}
+
+
 def _is_request_too_large_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return "413" in message or "failed to parse request" in message
@@ -791,7 +797,7 @@ async def _pdf_batch_extract(
 
     try:
         temp_images = await run_pymupdf(_pdf_to_images, pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi)
-        attachments = [{"type": "file", "path": path} for path in temp_images]
+        attachments = [_file_attachment(path) for path in temp_images]
 
         batch_context = f"{filename}:p{start_page + 1}-{stop_page}:{dpi}dpi"
         result = await kind.extract_fn(attachments, filename=filename, request_context=batch_context)
@@ -835,7 +841,7 @@ async def _image_extract(
 
     try:
         temp_images = [await run_pymupdf(_image_to_png, image_path, dpi=dpi)]
-        attachments = [{"type": "file", "path": temp_images[0]}]
+        attachments = [_file_attachment(temp_images[0])]
 
         result = await kind.extract_fn(attachments, filename=filename, request_context=f"{filename}:{dpi}dpi")
         logger.info(

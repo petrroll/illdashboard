@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Sequence
 from dataclasses import asdict
@@ -139,7 +140,7 @@ async def upload_file(
     safe_name = f"{uuid.uuid4().hex}{extension}"
     destination = (upload_dir / safe_name).resolve()
     content = await file.read()
-    destination.write_bytes(content)
+    await asyncio.to_thread(destination.write_bytes, content)
     try:
         try:
             page_count = await documents.read_page_count(destination, mime_type)
@@ -269,8 +270,9 @@ async def get_file_page_image(file_id: int, page_num: int, db: AsyncSession = De
     if page_num != 1:
         raise HTTPException(404, "Page not found")
     if file_types.is_text_document_mime_type(lab.mime_type):
-        return Response(content=file_path.read_text(encoding="utf-8-sig"), media_type=lab.mime_type)
-    return Response(content=file_path.read_bytes(), media_type=lab.mime_type)
+        content = await asyncio.to_thread(file_path.read_text, encoding="utf-8-sig")
+        return Response(content=content, media_type=lab.mime_type)
+    return Response(content=await asyncio.to_thread(file_path.read_bytes), media_type=lab.mime_type)
 
 
 async def validate_reprocessing(file_ids: list[int], discard_user_edits: bool, db: AsyncSession) -> None:

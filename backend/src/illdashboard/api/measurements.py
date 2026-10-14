@@ -597,7 +597,7 @@ async def measurement_sparkline(
             for measurement in sparkline_measurements
             if (value := marker_service.effective_measurement_value(measurement)) is not None
         ]
-        png_bytes = generate_sparkline(
+        png_bytes = await generate_sparkline(
             values=numeric_values,
             ref_low=ref_low,
             ref_high=ref_high,
@@ -619,7 +619,7 @@ async def measurement_sparkline(
     if cached:
         return Response(content=cached, media_type="image/png", headers={"Cache-Control": "no-store"})
 
-    png_bytes = generate_sparkline(
+    png_bytes = await generate_sparkline(
         values=[
             1.0 if marker_service.effective_measurement_qualitative_bool(measurement) else 0.0
             for measurement in qualitative_sparkline_measurements

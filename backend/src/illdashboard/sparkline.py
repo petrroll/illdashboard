@@ -1,13 +1,21 @@
 """Generate tiny sparkline PNGs for biomarker history."""
 
+import asyncio
+import functools
 import hashlib
 import io
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 
-from matplotlib import pyplot as plt
+from matplotlib.figure import Figure
 
-plt.switch_backend("Agg")
-
+# Rendering is CPU-bound and holds the GIL, so a thread would still starve the
+# event loop (and every SQLite write waiting on it) when a page requests dozens
+# of sparklines. One spawned process keeps it fully off the server; spawn avoids
+# forking a process that already runs threads.
+_executor: ProcessPoolExecutor | None = None
 
 SPARKLINE_CACHE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "sparklines"
 SPARKLINE_WIDTH = 180  # px
@@ -112,18 +120,16 @@ def _draw_sparkline(ax, values, ref_low, ref_high, color_ok, color_oor, is_oor):
     ax.set_xlim(-0.3, len(values) - 0.7)
 
 
-def generate_sparkline(
+def render_sparkline_png(
     values: list[float],
     ref_low: float | None,
     ref_high: float | None,
-    signature: str,
-    marker_name: str,
-    qualitative_mode: bool = False,
 ) -> bytes:
-    """Render a tiny sparkline PNG and cache it."""
+    """Render a tiny sparkline PNG. Runs in the sparkline worker process."""
     fig_w = SPARKLINE_WIDTH / DPI
     fig_h = SPARKLINE_HEIGHT / DPI
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=DPI)
+    fig = Figure(figsize=(fig_w, fig_h), dpi=DPI)
+    ax = fig.subplots()
     fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
     ax.set_axis_off()
 
@@ -145,8 +151,40 @@ def generate_sparkline(
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", transparent=True, dpi=DPI)
-    plt.close(fig)
-    png_bytes = buf.getvalue()
+    return buf.getvalue()
+
+
+def _get_executor() -> ProcessPoolExecutor:
+    global _executor
+    if _executor is None:
+        _executor = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+    return _executor
+
+
+def shutdown_sparkline_worker() -> None:
+    global _executor
+    if _executor is not None:
+        _executor.shutdown(wait=False, cancel_futures=True)
+        _executor = None
+
+
+async def generate_sparkline(
+    values: list[float],
+    ref_low: float | None,
+    ref_high: float | None,
+    signature: str,
+    marker_name: str,
+    qualitative_mode: bool = False,
+) -> bytes:
+    """Render a sparkline in the worker process and cache it."""
+    try:
+        png_bytes = await asyncio.get_running_loop().run_in_executor(
+            _get_executor(), functools.partial(render_sparkline_png, values, ref_low, ref_high)
+        )
+    except BrokenProcessPool:
+        # A crashed worker poisons the pool; drop it so the next request starts a fresh one.
+        shutdown_sparkline_worker()
+        raise
 
     # Cache to disk
     SPARKLINE_CACHE_DIR.mkdir(parents=True, exist_ok=True)

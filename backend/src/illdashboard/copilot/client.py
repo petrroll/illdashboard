@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import shutil
 import time
 import uuid
 from contextlib import AsyncExitStack
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -23,6 +25,18 @@ from illdashboard.config import settings
 from illdashboard.metrics import add_premium_requests
 
 logger = logging.getLogger(__name__)
+
+
+class _UnknownShutdownTypeFilter(logging.Filter):
+    # SDK 1.0.21 (the latest release) lacks the "destroy" value that its pinned CLI sends
+    # in session.shutdown, so every session close logs an asyncio callback traceback. The
+    # event is informational only; drop this one known record so real errors stay visible.
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        return not (isinstance(exc, ValueError) and str(exc) == "'destroy' is not a valid ShutdownType")
+
+
+logging.getLogger("asyncio").addFilter(_UnknownShutdownTypeFilter())
 
 # Recent runs still hit the 10-minute ceiling for document OCR, so keep a
 # larger shared request budget while lane reservations prevent extraction from
@@ -71,6 +85,48 @@ _lane_semaphores: dict[str, asyncio.Semaphore] = {}
 _lane_semaphore_limits: dict[str, int] = {}
 _queued_request_count = 0
 _active_request_count = 0
+
+# Pipeline jobs write their results in one transaction after the Copilot call. When
+# that transaction is rolled back by a transient SQLite lock, the paid responses are
+# kept here so the retried job can reuse them instead of asking again. Entries are
+# single-use and only offered after a rollback, so reprocessing still gets fresh answers.
+RETRY_RESPONSE_TTL_SECONDS = 1800
+_response_recorder: ContextVar[dict[str, str] | None] = ContextVar("copilot_response_recorder", default=None)
+_retry_responses: dict[str, tuple[float, str]] = {}
+
+
+def record_responses() -> dict[str, str]:
+    """Collect successful responses from this context and the tasks it creates afterwards."""
+    recorded: dict[str, str] = {}
+    _response_recorder.set(recorded)
+    return recorded
+
+
+def keep_responses_for_retry(recorded: dict[str, str]) -> None:
+    now = time.monotonic()
+    for key, (stored_at, _content) in list(_retry_responses.items()):
+        if now - stored_at > RETRY_RESPONSE_TTL_SECONDS:
+            del _retry_responses[key]
+    _retry_responses.update({key: (now, content) for key, content in recorded.items()})
+
+
+def _response_key(
+    request_name: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    attachments: list[Attachment] | None,
+) -> str:
+    digest = hashlib.sha256()
+    for part in (request_name, model, system_prompt, user_prompt):
+        digest.update(part.encode())
+        digest.update(b"\0")
+    for attachment in attachments or []:
+        # Attachments are freshly rendered temp files, so compare content rather than paths.
+        path = attachment.get("path")
+        digest.update(Path(path).read_bytes() if path else json.dumps(attachment, sort_keys=True).encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -365,6 +421,23 @@ async def _ask(
     lane_semaphore = _get_request_lane_semaphore(lane_name)
     observed_usage_cost_total = 0.0
 
+    recorder = _response_recorder.get()
+    response_key: str | None = None
+    if recorder is not None:
+        response_key = await asyncio.to_thread(
+            _response_key, request_name, request_settings.model, system_prompt, user_prompt, attachments
+        )
+        reusable = _retry_responses.pop(response_key, None)
+        if reusable is not None and time.monotonic() - reusable[0] <= RETRY_RESPONSE_TTL_SECONDS:
+            logger.info(
+                "Copilot request reused response from a rolled-back job request_name=%s request_id=%s context=%s",
+                request_name,
+                request_id,
+                request_context or "none",
+            )
+            recorder[response_key] = reusable[1]
+            return reusable[1]
+
     for attempt in range(1, COPILOT_TRANSIENT_RETRY_ATTEMPTS + 1):
         content = ""
         observed_usage_cost = 0.0
@@ -617,6 +690,8 @@ async def _ask(
                 observed_cache_read_tokens,
                 request_context or "none",
             )
+            if recorder is not None and response_key is not None:
+                recorder[response_key] = content
             return content
 
         if _is_retryable_session_error(request_error) and attempt < COPILOT_TRANSIENT_RETRY_ATTEMPTS:

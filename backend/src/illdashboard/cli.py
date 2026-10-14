@@ -5,12 +5,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
+import shutil
+import sqlite3
 from collections.abc import Sequence
+from pathlib import Path
 
 import uvicorn
+from sqlalchemy.engine import make_url
 
-from illdashboard.database import dispose_database_engine, get_database_engine
+from illdashboard.config import settings
+from illdashboard.database import dispose_database_engine, get_async_session_factory, get_database_engine
 from illdashboard.database_migrations import prepare_main_database
+from illdashboard.services import pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +35,79 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--reload", action="store_true")
     serve_parser.set_defaults(command="serve")
 
+    snapshot_parser = subparsers.add_parser(
+        "snapshot",
+        help="Replace TARGET_DIR with a copy of the configured databases and uploads (for isolated repro runs)",
+    )
+    snapshot_parser.add_argument("target_dir", type=Path)
+    snapshot_parser.set_defaults(command="snapshot")
+
+    retry_parser = subparsers.add_parser(
+        "retry-failed-jobs",
+        help="Reset failed pipeline jobs to pending; a running server picks them up (may make paid AI requests)",
+    )
+    retry_parser.set_defaults(command="retry-failed-jobs")
+
     return parser
+
+
+def _sqlite_path(database_url: str) -> Path:
+    database = make_url(database_url).database
+    if not database or database == ":memory:":
+        raise SystemExit(f"Not a file-backed SQLite URL: {database_url}")
+    return Path(database).resolve()
+
+
+def _snapshot_data(target_dir: Path) -> None:
+    target_dir = target_dir.resolve()
+    upload_dir = Path(settings.UPLOAD_DIR).resolve()
+    databases = {
+        "health.db": _sqlite_path(settings.DATABASE_URL),
+        "medications.db": _sqlite_path(settings.MEDICATIONS_DATABASE_URL),
+    }
+    if target_dir in {upload_dir, *(path.parent for path in databases.values())}:
+        raise SystemExit(f"Refusing to snapshot onto the source data directory {target_dir}")
+
+    target_uploads = target_dir / "uploads"
+    shutil.rmtree(target_uploads, ignore_errors=True)
+    target_uploads.mkdir(parents=True)
+    for name in ("metrics.json", *(f"{db}{suffix}" for db in databases for suffix in ("", "-wal", "-shm"))):
+        (target_dir / name).unlink(missing_ok=True)
+
+    for name, source in databases.items():
+        if not source.exists():
+            continue
+        # The backup API gives a consistent copy even while `just dev` is writing in WAL mode.
+        with sqlite3.connect(source) as source_conn, sqlite3.connect(target_dir / name) as target_conn:
+            source_conn.backup(target_conn)
+        source_conn.close()
+        target_conn.close()
+
+    if upload_dir.is_dir():
+        for upload in upload_dir.iterdir():
+            if not upload.is_file():
+                continue
+            try:
+                # Hard links are cheap, and deleting a file in the instance only drops its own link.
+                os.link(upload, target_uploads / upload.name)
+            except OSError:
+                shutil.copy2(upload, target_uploads / upload.name)
+
+    health_copy = target_dir / "health.db"
+    if health_copy.exists():
+        # File rows store absolute paths; repoint them so instance deletes cannot touch main uploads.
+        with sqlite3.connect(health_copy) as conn:
+            source_prefix = f"{upload_dir}{os.sep}"
+            conn.execute(
+                "UPDATE lab_files SET filepath = ? || substr(filepath, ?) WHERE substr(filepath, 1, ?) = ?",
+                (f"{target_uploads}{os.sep}", len(source_prefix) + 1, len(source_prefix), source_prefix),
+            )
+        conn.close()
+
+    metrics = upload_dir.parent / "metrics.json"
+    if metrics.is_file():
+        shutil.copy2(metrics, target_dir / "metrics.json")
+    print(f"Snapshot written to {target_dir}")
 
 
 async def _prepare_database() -> list[int]:
@@ -44,6 +123,16 @@ async def _prepare_database() -> list[int]:
 async def _migrate_then_dispose() -> list[int]:
     try:
         return await _prepare_database()
+    finally:
+        await dispose_database_engine()
+
+
+async def _retry_failed_jobs() -> int:
+    try:
+        async with get_async_session_factory()() as session:
+            retried = await pipeline.retry_failed_jobs(session)
+            await session.commit()
+        return retried
     finally:
         await dispose_database_engine()
 
@@ -66,6 +155,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             port=args.port,
             reload=args.reload,
         )
+        return 0
+
+    if args.command == "snapshot":
+        _snapshot_data(args.target_dir)
+        return 0
+
+    if args.command == "retry-failed-jobs":
+        print(f"Reset {asyncio.run(_retry_failed_jobs())} failed jobs to pending")
         return 0
 
     parser.error(f"Unsupported command: {args.command}")

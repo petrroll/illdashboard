@@ -23,7 +23,13 @@ from sqlalchemy.orm import Session, selectinload
 from illdashboard.config import settings
 from illdashboard.copilot import extraction as copilot_extraction
 from illdashboard.copilot import normalization as copilot_normalization
-from illdashboard.copilot.client import COPILOT_REQUEST_TIMEOUT, get_copilot_request_load, shutdown_client
+from illdashboard.copilot.client import (
+    COPILOT_REQUEST_TIMEOUT,
+    get_copilot_request_load,
+    keep_responses_for_retry,
+    record_responses,
+    shutdown_client,
+)
 from illdashboard.models import (
     COMPLETE_FILE_STATUS,
     DEFAULT_GROUP_NAME,
@@ -90,6 +96,9 @@ MEASUREMENT_BATCH_SIZE = 2
 TEXT_BATCH_SIZE = 2
 DEFAULT_OCR_DPI = 144
 MAX_JOB_ATTEMPTS = 3
+# Lock timeouts are contention, not job faults: retry soon and do not spend an attempt.
+LOCKED_JOB_RETRY_DELAY_SECONDS = 2.0
+FAILURE_RECORD_ATTEMPTS = 5
 JOB_LEASE_SECONDS = COPILOT_REQUEST_TIMEOUT
 # One handler can wait on several queued/retried Copilot calls, so a single
 # timeout-sized lease is not enough; workers renew it well before it expires.
@@ -348,14 +357,20 @@ class PipelineRuntime:
         self.stop_event.set()
         _running_runtimes.discard(self)
         self.wake(set(self.wake_events))
-        if abort_copilot_requests:
-            await shutdown_client()
         if self.tasks:
-            done, pending = await asyncio.wait(self.tasks, timeout=WORKER_STOP_GRACE_SECONDS)
+            # Cancel workers before stopping the client when aborting. Killing the CLI
+            # first fails in-flight requests, and handlers record that as a job failure
+            # (extraction jobs fail permanently). Cancelled jobs stay leased and the next
+            # start() resets them to pending.
+            grace_seconds = 0 if abort_copilot_requests else WORKER_STOP_GRACE_SECONDS
+            done, pending = await asyncio.wait(self.tasks, timeout=grace_seconds)
             for task in pending:
                 task.cancel()
             await asyncio.gather(*done, *pending, return_exceptions=True)
         self.tasks.clear()
+        if abort_copilot_requests:
+            # Also aborts interactive requests that do not run inside a worker.
+            await shutdown_client()
 
     def _spawn_workers(
         self,
@@ -404,22 +419,34 @@ class PipelineRuntime:
                         lease_seconds=JOB_LEASE_SECONDS,
                     )
                     if jobs:
+                        recorded_responses = record_responses()
                         try:
                             await self._run_handler_with_lease_heartbeat(session, jobs, lease_owner, handler)
                             await session.commit()
                         except asyncio.CancelledError:
                             raise
                         except Exception as exc:
-                            logger.exception("Worker failed worker=%s task_types=%s", worker_name, task_types)
+                            if job_service.is_database_locked_error(exc):
+                                logger.warning(
+                                    "Worker hit a locked database; retrying jobs worker=%s job_ids=%s error=%s",
+                                    worker_name,
+                                    [job.id for job in jobs],
+                                    exc,
+                                )
+                                keep_responses_for_retry(recorded_responses)
+                            else:
+                                logger.exception("Worker failed worker=%s task_types=%s", worker_name, task_types)
                             await session.rollback()
-                            await self._handle_worker_failure(session, jobs, exc, lease_owner=lease_owner)
-                            await session.commit()
+                            await self._record_worker_failure(session, jobs, exc, lease_owner=lease_owner)
                 if not jobs:
                     await self._wait_for_work(wake_event)
             except asyncio.CancelledError:
                 return
-            except Exception:
-                logger.exception("Worker loop crashed worker=%s task_types=%s", worker_name, task_types)
+            except Exception as exc:
+                if job_service.is_database_locked_error(exc):
+                    logger.warning("Worker loop hit a locked database worker=%s error=%s", worker_name, exc)
+                else:
+                    logger.exception("Worker loop crashed worker=%s task_types=%s", worker_name, task_types)
                 await asyncio.sleep(WORKER_IDLE_SECONDS)
 
     async def _run_handler_with_lease_heartbeat(
@@ -467,6 +494,27 @@ class PipelineRuntime:
                 logger.warning("Lease lost owner=%s job_ids=%s", lease_owner, stolen_ids)
                 return stolen_ids
 
+    async def _record_worker_failure(
+        self,
+        session: AsyncSession,
+        jobs: list[Job],
+        exc: Exception,
+        *,
+        lease_owner: str,
+    ) -> None:
+        # Recording the failure is itself a write. If it also hit the lock, the job
+        # would stay leased until the lease expires and then spend another attempt.
+        for record_attempt in range(1, FAILURE_RECORD_ATTEMPTS + 1):
+            try:
+                await self._handle_worker_failure(session, jobs, exc, lease_owner=lease_owner)
+                await session.commit()
+                return
+            except Exception as record_exc:
+                await session.rollback()
+                if not job_service.is_database_locked_error(record_exc) or record_attempt == FAILURE_RECORD_ATTEMPTS:
+                    raise
+                await asyncio.sleep(LOCKED_JOB_RETRY_DELAY_SECONDS)
+
     async def _handle_worker_failure(
         self,
         session: AsyncSession,
@@ -484,6 +532,15 @@ class PipelineRuntime:
                 continue
             if refreshed.lease_owner != lease_owner:
                 # Another worker owns the job now; its outcome is not ours to record.
+                continue
+            if job_service.is_database_locked_error(exc):
+                await job_service.release_job(
+                    session,
+                    refreshed,
+                    delay_seconds=LOCKED_JOB_RETRY_DELAY_SECONDS,
+                    error_text=str(exc),
+                    refund_attempt=True,
+                )
                 continue
             # Losing a lease is not the job's fault, so it must not burn the last attempt.
             if refreshed.attempt_count < MAX_JOB_ATTEMPTS or isinstance(exc, job_service.JobLeaseLostError):
@@ -702,6 +759,23 @@ async def cancel_processing_from_clean_runtime(session: AsyncSession) -> None:
     await _run_with_clean_runtime(session, cancel_processing)
 
 
+async def retry_failed_jobs(session: AsyncSession) -> int:
+    """Give every failed job a fresh attempt budget; running workers pick them up by polling."""
+    failed_file_ids = set(
+        (
+            await session.scalars(
+                select(Job.file_id).where(Job.status == job_service.JOB_STATUS_FAILED, Job.file_id.is_not(None))
+            )
+        ).all()
+    )
+    retried = await job_service.retry_failed_jobs(session)
+    # Shared canonization jobs re-request their files when they finish; file-level jobs
+    # need ensure.file to refresh the file's error status once they succeed.
+    for file_id in sorted(failed_file_ids):
+        await _request_file_ensure(session, file_id)
+    return retried
+
+
 async def run_with_pipeline_runtime_stopped(operation: Callable[[], Awaitable[_T]]) -> _T:
     async with _runtime_reset_lock:
         session_factory = _runtime.session_factory if _runtime is not None else None
@@ -822,7 +896,11 @@ async def _ensure_file(session: AsyncSession, job: Job) -> None:
         await _request_text_ensure(session, file.id)
 
     if progress.total_measurements > progress.ready_measurements:
-        await _request_process_measurements(session, file.id)
+        # ensure.file only re-checks state; it never changes process.measurements' inputs.
+        # Every input change (new batch, canonization result, terminal failure) requests
+        # processing itself, so rerunning a finished job here is wasted work. With error
+        # rows it was an endless ensure <-> process loop.
+        await _request_process_measurements(session, file.id, only_if_missing=True)
 
     if file.text_assembled_at is not None and file.summary_generated_at is None:
         await _request_summary(session, file.id)
@@ -2748,6 +2826,7 @@ async def _request_job(
     payload: dict | None = None,
     file_id: int | None = None,
     priority: int,
+    only_if_missing: bool = False,
 ) -> bool:
     task_key = task_key.strip()
     if not task_key:
@@ -2761,6 +2840,8 @@ async def _request_job(
     existing_status = existing[0] if existing is not None else None
     existing_rerun_requested = bool(existing[1]) if existing is not None else False
     if existing_status in {job_service.JOB_STATUS_FAILED, job_service.JOB_STATUS_CANCELLED}:
+        return False
+    if only_if_missing and existing is not None:
         return False
     await job_service.enqueue_job(
         session,
@@ -2857,7 +2938,9 @@ async def _request_assemble_text(session: AsyncSession, file_id: int) -> None:
     )
 
 
-async def _request_process_measurements(session: AsyncSession, file_id: int) -> None:
+async def _request_process_measurements(
+    session: AsyncSession, file_id: int, *, only_if_missing: bool = False
+) -> None:
     await _request_job(
         session,
         task_type=TASK_PROCESS_MEASUREMENTS,
@@ -2865,6 +2948,7 @@ async def _request_process_measurements(session: AsyncSession, file_id: int) -> 
         payload={"file_id": file_id},
         file_id=file_id,
         priority=PRIORITY_PROCESS_MEASUREMENTS,
+        only_if_missing=only_if_missing,
     )
 
 
