@@ -5,13 +5,11 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   server: {
-    allowedHosts: true,
+    // Only localhost and private Codespaces forwarding hosts; allowing every host
+    // disables Vite's DNS-rebinding check in front of the proxied health data API.
+    allowedHosts: ['.app.github.dev'],
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
-      },
-      '/uploads': {
         target: 'http://localhost:8000',
         changeOrigin: true,
       },

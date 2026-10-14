@@ -56,6 +56,11 @@ export default function Search() {
         if (!cancelled) {
           setResults(response);
         }
+      } catch {
+        // Do not keep showing matches for a previous query after a failed search.
+        if (!cancelled) {
+          setResults([]);
+        }
       } finally {
         if (!cancelled) {
           setLoading(false);

@@ -211,7 +211,7 @@ async def test_full_export_preserves_databases_originals_and_all_records(client,
     async with session_factory() as session:
         await session.execute(text("PRAGMA journal_mode=WAL"))
         lab = await session.get(LabFile, file_id)
-        lab.ocr_raw = '{"private": "raw extraction"}'
+        lab.ocr_text_raw = "private raw extraction"
         lab.ocr_summary_english = "Stored summary"
         session.add(Measurement(
             lab_file_id=file_id, raw_marker_name="CRP", normalized_marker_key="crp",
@@ -248,7 +248,7 @@ async def test_full_export_preserves_databases_originals_and_all_records(client,
         assert set(records["main"]) == set(Base.metadata.tables)
         assert set(records["medications"]) == set(MedicationsBase.metadata.tables)
         assert records["main"]["lab_files"][0]["ocr_summary_english"] == "Stored summary"
-        assert records["main"]["lab_files"][0]["ocr_raw"] == '{"private": "raw extraction"}'
+        assert records["main"]["lab_files"][0]["ocr_text_raw"] == "private raw extraction"
         measurement = records["main"]["measurements"][0]
         assert measurement["normalization_status"] == "pending"
         assert measurement["original_value"] == 4
@@ -276,7 +276,9 @@ async def test_full_export_preserves_databases_originals_and_all_records(client,
 async def test_full_export_empty_database_and_missing_original(client, tmp_path, missing_original):
     if missing_original:
         upload = await client.post("/api/files/upload", files={"file": ("report.md", b"original", "text/markdown")})
-        Path(upload.json()["filepath"]).unlink()
+        assert upload.status_code == 200
+        for original in Path(settings.UPLOAD_DIR).glob("*.md"):
+            original.unlink()
     temporary_paths = []
 
     def create_directory(**kwargs):
@@ -672,7 +674,7 @@ async def test_share_export_html_embeds_assets_and_omits_summary_content(
     assert bundle["kind"] == "share-export-v1"
     assert bundle["files"][0]["filename"] == "share-report.png"
     assert "ocr_summary_english" not in bundle["files"][0]
-    assert bundle["files"][0]["filepath"] == ""
+    assert "filepath" not in bundle["files"][0]
     assert "ocr_raw" not in bundle["files"][0]
     assert "original_file_data_url" not in bundle["file_assets"][str(bundle["files"][0]["id"])]
     assert bundle["file_assets"][str(bundle["files"][0]["id"])]["page_image_urls"][0].startswith("data:image/")
@@ -889,7 +891,6 @@ async def test_pipeline_runtime_processes_file_end_to_end(session_factory):
     assert complete_file.lab_date is not None
     assert complete_file.source_name == "synlab"
     assert any(tag.tag == "source:synlab" for tag in complete_file.tags)
-    assert complete_file.ocr_raw is not None
     assert len(complete_file.measurements) == 1
     measurement = complete_file.measurements[0]
     assert measurement.marker_name == "CRP"
@@ -2302,7 +2303,6 @@ async def test_queue_files_only_requeues_selected_files(session_factory):
             mime_type="image/png",
             page_count=1,
             status="complete",
-            ocr_raw="published",
             ocr_text_raw="text",
             ocr_summary_english="summary",
             source_name="synlab",
@@ -2494,7 +2494,7 @@ async def test_cancel_ocr_clears_jobs_and_resets_active_files(client, session_fa
             mime_type="image/png",
             page_count=1,
             status="complete",
-            ocr_raw="published",
+            ocr_text_raw="published",
             text_assembled_at=utc_now(),
             summary_generated_at=utc_now(),
             source_resolved_at=utc_now(),
@@ -2576,7 +2576,7 @@ async def test_cancel_ocr_clears_jobs_and_resets_active_files(client, session_fa
         measurements = measurements_result.scalars().all()
 
     assert complete_file.status == "complete"
-    assert complete_file.ocr_raw == "published"
+    assert complete_file.ocr_text_raw == "published"
 
     assert queued_file.status == "uploaded"
     assert queued_file.processing_error is None

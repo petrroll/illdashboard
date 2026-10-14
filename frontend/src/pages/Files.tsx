@@ -14,7 +14,7 @@ import {
 import TagInput from "../components/TagInput";
 import TagFilter from "../components/TagFilter";
 import { isShareExportMode } from "../export/runtime";
-import type { LabFile } from "../types";
+import type { LabFileSummary } from "../types";
 import { formatDate } from "../utils/measurements";
 
 type SortField = "lab_date" | "uploaded_at";
@@ -22,11 +22,11 @@ type PendingProcessAction = "queue" | "reprocess" | "cancel" | null;
 
 const FILE_POLL_INTERVAL_MS = 3000;
 
-function isFileActive(file: LabFile) {
+function isFileActive(file: LabFileSummary) {
   return file.status === "queued" || file.status === "processing";
 }
 
-function getProcessingLabel(file: LabFile) {
+function getProcessingLabel(file: LabFileSummary) {
   if (file.status === "error") {
     return file.processing_error || "Processing failed";
   }
@@ -60,7 +60,7 @@ function getProcessingLabel(file: LabFile) {
   return "Processing";
 }
 
-function getProgressSummary(file: LabFile) {
+function getProgressSummary(file: LabFileSummary) {
   return [
     `Measurements ${file.progress.measurement_pages_done}/${file.progress.measurement_pages_total}p`,
     `Text ${file.progress.text_pages_done}/${file.progress.text_pages_total}p`,
@@ -68,7 +68,7 @@ function getProgressSummary(file: LabFile) {
   ].join(" · ");
 }
 
-function renderStatusBadge(file: LabFile) {
+function renderStatusBadge(file: LabFileSummary) {
   if (file.status === "complete") {
     return <span className="badge badge-success">Complete</span>;
   }
@@ -95,7 +95,7 @@ function renderStatusBadge(file: LabFile) {
 export default function Files() {
   const shareExportMode = isShareExportMode();
   const canManageFiles = !shareExportMode;
-  const [files, setFiles] = useState<LabFile[]>([]);
+  const [files, setFiles] = useState<LabFileSummary[]>([]);
   const [uploading, setUploading] = useState(false);
   const [pendingProcessAction, setPendingProcessAction] = useState<PendingProcessAction>(null);
   const [processingError, setProcessingError] = useState<string | null>(null);
@@ -287,7 +287,7 @@ export default function Files() {
   };
 
   const unprocessedCount = files.filter((file) => file.status === "uploaded" || file.status === "error").length;
-  const isFileChecked = (file: LabFile) => selected.has(file.id) || isFileActive(file);
+  const isFileChecked = (file: LabFileSummary) => selected.has(file.id) || isFileActive(file);
   const allFilesSelected = canManageFiles && files.length > 0 && files.every(isFileChecked);
 
   const sortedFiles = useMemo(() => {
@@ -295,7 +295,7 @@ export default function Files() {
     const filtered = query
       ? files.filter((file) => file.filename.toLowerCase().includes(query))
       : files;
-    const sortValue = (file: LabFile) => (
+    const sortValue = (file: LabFileSummary) => (
       sortField === "lab_date" ? file.lab_date ?? file.uploaded_at : file.uploaded_at
     );
 
@@ -309,7 +309,7 @@ export default function Files() {
     });
   }, [files, sortField, searchQuery]);
 
-  const getYear = (file: LabFile) => {
+  const getYear = (file: LabFileSummary) => {
     const value = sortField === "lab_date" ? file.lab_date ?? file.uploaded_at : file.uploaded_at;
     return value ? new Date(value).getFullYear() : null;
   };

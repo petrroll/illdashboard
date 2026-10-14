@@ -17,6 +17,10 @@ JOB_STATUS_CANCELLED = "cancelled"
 
 TERMINAL_JOB_STATUSES = {JOB_STATUS_RESOLVED, JOB_STATUS_FAILED, JOB_STATUS_CANCELLED}
 
+# Session.info key collecting task types enqueued in the current transaction, so
+# idle workers can be woken once the rows are actually committed and claimable.
+ENQUEUED_TASK_TYPES_INFO_KEY = "illdashboard.enqueued_task_types"
+
 
 class JobLeaseLostError(RuntimeError):
     """Raised when a worker tries to finish a job whose lease it no longer holds."""
@@ -82,6 +86,7 @@ async def enqueue_job(
         },
     )
     await session.execute(stmt)
+    session.info.setdefault(ENQUEUED_TASK_TYPES_INFO_KEY, set()).add(task_type)
 
 
 async def claim_jobs(
@@ -97,22 +102,31 @@ async def claim_jobs(
 
     now = utc_now()
     lease_until = now + timedelta(seconds=lease_seconds)
-    candidate_ids = (
+    claimable = and_(
+        Job.task_type.in_(task_types),
+        Job.available_at <= now,
+        or_(
+            Job.status == JOB_STATUS_PENDING,
+            and_(Job.status == JOB_STATUS_LEASED, Job.lease_until.is_not(None), Job.lease_until < now),
+        ),
+    )
+    # Probe with a plain SELECT first: an UPDATE takes the SQLite write lock even
+    # when it matches nothing, and idle workers probe constantly.
+    candidate_result = await session.execute(
         select(Job.id)
-        .where(
-            Job.task_type.in_(task_types),
-            Job.available_at <= now,
-            or_(
-                Job.status == JOB_STATUS_PENDING,
-                and_(Job.status == JOB_STATUS_LEASED, Job.lease_until.is_not(None), Job.lease_until < now),
-            ),
-        )
+        .where(claimable)
         .order_by(Job.priority.asc(), Job.created_at.asc(), Job.id.asc())
         .limit(limit)
     )
+    candidate_ids = list(candidate_result.scalars().all())
+    if not candidate_ids:
+        await session.rollback()
+        return []
+
+    # Re-check claimability so a concurrent worker that won the race is not overwritten.
     result = await session.execute(
         update(Job)
-        .where(Job.id.in_(candidate_ids))
+        .where(Job.id.in_(candidate_ids), claimable)
         .values(
             status=JOB_STATUS_LEASED,
             lease_owner=lease_owner,
@@ -121,6 +135,7 @@ async def claim_jobs(
             updated_at=now,
         )
         .returning(Job.id)
+        .execution_options(synchronize_session=False)
     )
     claimed_ids = [row[0] for row in result.all()]
     if not claimed_ids:

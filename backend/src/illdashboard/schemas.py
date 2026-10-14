@@ -26,21 +26,16 @@ class FileProgressOut(BaseModel):
     is_complete: bool
 
 
-class LabFileOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class LabFileSummaryOut(BaseModel):
+    """File row for lists; omits OCR text so polling the list stays small."""
 
     id: int
     filename: str
-    filepath: str
     mime_type: str
     page_count: int
     status: str
     processing_error: str | None = None
     uploaded_at: datetime
-    ocr_raw: str | None = None
-    ocr_text_raw: str | None = None
-    ocr_text_english: str | None = None
-    ocr_summary_english: str | None = None
     lab_date: datetime | None = None
     source_name: str | None = None
     text_assembled_at: datetime | None = None
@@ -53,24 +48,11 @@ class LabFileOut(BaseModel):
     tags: list[str] = Field(default_factory=list)
     progress: FileProgressOut
 
-    @model_validator(mode="before")
-    @classmethod
-    def _flatten_tags(cls, data: Any):
-        if isinstance(data, dict):
-            return data
-        if hasattr(data, "__table__"):
-            model = data
-            raw_tags = model.__dict__.get("tags", [])
-            flattened = {column.key: getattr(model, column.key) for column in model.__table__.columns}
-            flattened["lab_date"] = getattr(model, "effective_lab_date", getattr(model, "lab_date", None))
-            flattened["has_user_edits"] = bool(getattr(model, "has_user_edits", False))
-            flattened["user_edited_fields"] = list(getattr(model, "user_edited_fields", []))
-            flattened["has_measurement_edits"] = bool(getattr(model, "has_measurement_edits", False))
-            flattened["tags"] = (
-                [tag.tag for tag in raw_tags] if raw_tags and hasattr(raw_tags[0], "tag") else list(raw_tags)
-            )
-            return flattened
-        return data
+
+class LabFileOut(LabFileSummaryOut):
+    ocr_text_raw: str | None = None
+    ocr_text_english: str | None = None
+    ocr_summary_english: str | None = None
 
 
 def _resolve_effective_measured_at(

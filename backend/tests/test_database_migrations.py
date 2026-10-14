@@ -244,6 +244,7 @@ async def test_prepare_main_database_migrates_pre_edit_schema(tmp_path: Path):
             ).one()
 
         assert {"user_lab_date", "user_lab_date_override"}.issubset(lab_columns)
+        assert "ocr_raw" not in lab_columns
         assert {
             "user_original_unit",
             "user_original_unit_override",

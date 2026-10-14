@@ -11,7 +11,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from illdashboard.api.files import refresh_search_projection
 from illdashboard.database import get_db
 from illdashboard.models import LabFile, MarkerTag, Measurement, MeasurementType
 from illdashboard.schemas import (
@@ -26,7 +25,7 @@ from illdashboard.schemas import (
 )
 from illdashboard.services import insights as insight_service
 from illdashboard.services import markers as marker_service
-from illdashboard.services import rescaling
+from illdashboard.services import pipeline, rescaling
 from illdashboard.services.rescaling import annotate_missing_rescaling_measurements
 from illdashboard.sparkline import generate_sparkline, get_cached_sparkline
 
@@ -292,7 +291,7 @@ async def update_measurement(measurement_id: int, body: MeasurementPatchRequest,
         measurement.user_edited_at = datetime.now(UTC)
 
     await annotate_missing_rescaling_measurements(db, [measurement])
-    await refresh_search_projection(measurement.lab_file, db)
+    await pipeline.refresh_file_search_projection(db, measurement.lab_file)
     await db.commit()
     refreshed_measurement = await get_measurement_or_404(measurement_id, db)
     await annotate_missing_rescaling_measurements(db, [refreshed_measurement])
@@ -426,7 +425,7 @@ async def update_marker(marker_name: str, body: MarkerPatchRequest, db: AsyncSes
     )
     affected_files = affected_file_result.scalars().all()
     for lab_file in affected_files:
-        await refresh_search_projection(lab_file, db)
+        await pipeline.refresh_file_search_projection(db, lab_file)
 
     if marker_changed:
         await insight_service.invalidate_cached_insight(measurement_type, db)

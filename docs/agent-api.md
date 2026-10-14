@@ -129,7 +129,9 @@ only to medications/events, not file, measurement, marker, or tag mutations.
 
 Upload first with multipart field `file` at `POST /api/files/upload`; uploading
 does not run extraction. Queue separately at `POST /api/files/{id}/ocr`, then poll
-`GET /api/files/{id}` for progress/errors. OCR may incur AI costs and is a reset,
+`GET /api/files/{id}` for progress/errors. `GET /api/files` returns progress and
+metadata only; OCR text and summaries are available from `GET /api/files/{id}`.
+OCR may incur AI costs and is a reset,
 not an idempotent "ensure processed" request. Manual measurement edits require
 explicit `discard_user_edits=true`; metadata overrides survive reprocessing.
 Batch/unprocessed processing affects the shared runtime; cancellation is global.

@@ -12,19 +12,14 @@ export interface FileProgress {
   is_complete: boolean;
 }
 
-export interface LabFile {
+export interface LabFileSummary {
   id: number;
   filename: string;
-  filepath: string;
   mime_type: string;
   page_count: number;
   status: "uploaded" | "queued" | "processing" | "complete" | "error";
   processing_error: string | null;
   uploaded_at: string;
-  ocr_raw: string | null;
-  ocr_text_raw: string | null;
-  ocr_text_english: string | null;
-  ocr_summary_english: string | null;
   lab_date: string | null;
   source_name: string | null;
   text_assembled_at: string | null;
@@ -36,6 +31,12 @@ export interface LabFile {
   has_measurement_edits?: boolean;
   tags: string[];
   progress: FileProgress;
+}
+
+export interface LabFile extends LabFileSummary {
+  ocr_text_raw: string | null;
+  ocr_text_english: string | null;
+  ocr_summary_english: string | null;
 }
 
 export interface Measurement {

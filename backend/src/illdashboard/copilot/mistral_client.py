@@ -16,6 +16,7 @@ from mistralai.client import Mistral
 
 from illdashboard.config import settings
 from illdashboard.copilot.client import JSON_REPAIR_SYSTEM_PROMPT, _format_json_user_prompt, _parse_json_response
+from illdashboard.services.documents import run_pymupdf
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +223,7 @@ async def process_ocr_file(
     document_annotation_prompt: str | None = None,
     timeout: float = MISTRAL_REQUEST_TIMEOUT,
 ) -> Any:
-    source_path, temp_path = _ocr_input_path(file_path, start_page=start_page, stop_page=stop_page)
+    source_path, temp_path = await run_pymupdf(_ocr_input_path, file_path, start_page=start_page, stop_page=stop_page)
     started_at = time.perf_counter()
     logger.info(
         "Mistral OCR starting request_name=%s path=%s source_path=%s model=%s context=%s",

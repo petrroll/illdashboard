@@ -52,8 +52,7 @@ flowchart TD
     V --> X{"File complete?"}
     V0 --> X
     W --> X
-    X -->|yes| Y["Build final ocr_raw payload"]
-    Y --> Z{"Search fresh?"}
+    X -->|yes| Z{"Search fresh?"}
     Z -->|no| AA["refresh.search"]
     AA --> AB["Index complete file"]
 ```
@@ -238,6 +237,17 @@ stateDiagram-v2
 - For those batchable normalization/review lanes, one worker claims multiple job rows into a single batch session and may call the LLM on that combined batch. The lane still keeps `concurrency = 1`, so only one batch for that lane can run at a time.
 - Those lanes now use the same handler path for `1..N` claimed jobs; they do not keep separate single-job handler variants.
 
+### Worker wakeups and SQLite
+
+- `enqueue_job` records the task type on the session; after that transaction commits, idle workers for that lane are woken immediately. Idle workers otherwise re-check only once per second, which covers delayed retries.
+- Idle claims probe with a plain `SELECT` and only issue the leasing `UPDATE` when work exists, so idle workers do not take the SQLite write lock.
+- Both databases run in WAL mode so API reads are not blocked by pipeline writes.
+
+### Extraction retries
+
+- `extract.*` jobs call the page-range extraction functions, which already split oversized/timeout batches and retry single pages at a lower DPI. A failure that survives those retries fails the job; the pipeline does not re-split it again.
+- PyMuPDF rendering runs on one dedicated thread (PyMuPDF is not thread-safe) so rendering never blocks the event loop.
+
 ## 6) API / UI projections
 
 The API no longer exposes old per-stage file columns as pipeline truth.
@@ -251,7 +261,7 @@ The API no longer exposes old per-stage file columns as pipeline truth.
   - search ready
   - completeness
 - Measurement endpoints expose only `Measurement.normalization_status == resolved`.
-- File detail and file list views render progress from those derived facts rather than from old stage enums.
+- File detail and file list views render progress from those derived facts rather than from old stage enums. Progress for a whole file list is computed with a fixed number of grouped queries, and the list omits OCR text.
 - Biomarker views, exports, and search snippets consume canonical marker names, canonical units, converted numeric values, and normalized qualitative values rather than raw OCR tokens.
 - Supported uploads include PDF/image files plus `.txt`/`.md`; text documents behave as single-page text sources for preview, export, and share bundles.
 - Search indexes complete files across filename, tags, summary, raw text, translated text, and measurement text.
@@ -272,7 +282,7 @@ That size is understandable for the first cut because all of those pieces are co
 The clearest future split points are:
 
 - `pipeline_runtime.py` for worker startup / loop / failure policy
-- `pipeline_extraction.py` for coverage, batch persistence, and fallback splitting
+- `pipeline_extraction.py` for coverage and batch persistence
 - `pipeline_measurements.py` for `process.measurements` plus `canonize.*`
 - `pipeline_progress.py` for derived file progress and search freshness helpers
 

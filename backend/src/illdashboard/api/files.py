@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-import io
 import uuid
+from collections.abc import Sequence
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from typing import TypeVar
 
 import fitz
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -16,12 +18,21 @@ from sqlalchemy.orm import selectinload
 
 from illdashboard.config import settings
 from illdashboard.database import get_db
-from illdashboard.models import LabFile, LabFileTag, Measurement, utc_now
-from illdashboard.schemas import BatchOcrRequest, FilePatchRequest, FileProgressOut, LabFileOut, QueueFilesResponse
-from illdashboard.services import file_types, pipeline, upload_metadata
+from illdashboard.models import LabFile, LabFileTag, Measurement
+from illdashboard.schemas import (
+    BatchOcrRequest,
+    FilePatchRequest,
+    FileProgressOut,
+    LabFileOut,
+    LabFileSummaryOut,
+    QueueFilesResponse,
+)
+from illdashboard.services import documents, file_types, pipeline, upload_metadata
 from illdashboard.services import search as search_service
 
 router = APIRouter(prefix="")
+
+_FileSchema = TypeVar("_FileSchema", bound=LabFileSummaryOut)
 
 _MEASUREMENT_EDITS = or_(
     Measurement.user_canonical_value_override,
@@ -50,83 +61,58 @@ def get_file_path_or_404(lab: LabFile) -> Path:
     return file_path
 
 
-def get_page_count(file_path: Path, mime_type: str) -> int:
-    if mime_type == "application/pdf":
-        with fitz.open(str(file_path)) as document:
-            return document.page_count
-    return 1
+async def serialize_lab_files(
+    labs: Sequence[LabFile], db: AsyncSession, schema: type[_FileSchema]
+) -> list[_FileSchema]:
+    progress_by_id = await pipeline.get_files_progress(db, labs)
+    edited_file_ids = set(
+        (
+            await db.scalars(
+                select(Measurement.lab_file_id)
+                .where(Measurement.lab_file_id.in_([lab.id for lab in labs]), _MEASUREMENT_EDITS)
+                .distinct()
+            )
+        ).all()
+    )
+    return [
+        schema.model_validate(
+            {
+                "id": lab.id,
+                "filename": lab.filename,
+                "mime_type": lab.mime_type,
+                "page_count": lab.page_count,
+                "status": lab.status,
+                "processing_error": lab.processing_error,
+                "uploaded_at": lab.uploaded_at,
+                "ocr_text_raw": lab.ocr_text_raw,
+                "ocr_text_english": lab.ocr_text_english,
+                "ocr_summary_english": lab.ocr_summary_english,
+                "lab_date": lab.effective_lab_date,
+                "source_name": lab.source_name,
+                "text_assembled_at": lab.text_assembled_at,
+                "summary_generated_at": lab.summary_generated_at,
+                "source_resolved_at": lab.source_resolved_at,
+                "search_indexed_at": lab.search_indexed_at,
+                "has_user_edits": lab.has_user_edits,
+                "user_edited_fields": lab.user_edited_fields,
+                "has_measurement_edits": lab.id in edited_file_ids,
+                "tags": [tag.tag for tag in lab.__dict__.get("tags", []) if hasattr(tag, "tag")],
+                "progress": FileProgressOut(**asdict(progress_by_id[lab.id])),
+            }
+        )
+        for lab in labs
+    ]
 
 
 async def serialize_lab_file(lab: LabFile, db: AsyncSession) -> LabFileOut:
-    progress = await pipeline.get_file_progress(db, lab)
-    edited_measurement_result = await db.execute(
-        select(Measurement.id)
-        .where(
-            Measurement.lab_file_id == lab.id,
-            _MEASUREMENT_EDITS,
-        )
-        .limit(1)
-    )
-    raw_tags = lab.__dict__.get("tags", [])
-    tags = [tag.tag for tag in raw_tags if hasattr(tag, "tag")]
-    return LabFileOut(
-        id=lab.id,
-        filename=lab.filename,
-        filepath=lab.filepath,
-        mime_type=lab.mime_type,
-        page_count=lab.page_count,
-        status=lab.status,
-        processing_error=lab.processing_error,
-        uploaded_at=lab.uploaded_at,
-        ocr_raw=lab.ocr_raw,
-        ocr_text_raw=lab.ocr_text_raw,
-        ocr_text_english=lab.ocr_text_english,
-        ocr_summary_english=lab.ocr_summary_english,
-        lab_date=lab.effective_lab_date,
-        source_name=lab.source_name,
-        text_assembled_at=lab.text_assembled_at,
-        summary_generated_at=lab.summary_generated_at,
-        source_resolved_at=lab.source_resolved_at,
-        search_indexed_at=lab.search_indexed_at,
-        has_user_edits=lab.has_user_edits,
-        user_edited_fields=lab.user_edited_fields,
-        has_measurement_edits=edited_measurement_result.scalar_one_or_none() is not None,
-        tags=tags,
-        progress=FileProgressOut(
-            measurement_pages_done=progress.measurement_pages_done,
-            measurement_pages_total=progress.measurement_pages_total,
-            text_pages_done=progress.text_pages_done,
-            text_pages_total=progress.text_pages_total,
-            ready_measurements=progress.ready_measurements,
-            total_measurements=progress.total_measurements,
-            summary_ready=progress.summary_ready,
-            source_ready=progress.source_ready,
-            search_ready=progress.search_ready,
-            measurement_error_count=progress.measurement_error_count,
-            is_complete=progress.is_complete,
-        ),
-    )
-
-
-async def refresh_search_projection(lab: LabFile, db: AsyncSession) -> None:
-    progress = await pipeline.get_file_progress(db, lab)
-    if progress.is_complete:
-        await search_service.refresh_lab_search_document(lab.id, db)
-        lab.search_indexed_at = utc_now()
-    else:
-        await search_service.remove_lab_search_document(lab.id, db)
-        lab.search_indexed_at = None
+    return (await serialize_lab_files([lab], db, LabFileOut))[0]
 
 
 def render_pdf_page(file_path: Path, page_num: int) -> bytes:
     with fitz.open(str(file_path)) as document:
         if page_num < 1 or page_num > document.page_count:
             raise HTTPException(404, "Page not found")
-        page = document[page_num - 1]
-        pixmap = page.get_pixmap(dpi=150)
-        buffer = io.BytesIO()
-        buffer.write(pixmap.tobytes("png"))
-        return buffer.getvalue()
+        return document[page_num - 1].get_pixmap(dpi=150).tobytes("png")
 
 
 @router.post("/files/upload", response_model=LabFileOut, tags=["files"])
@@ -156,7 +142,7 @@ async def upload_file(
     destination.write_bytes(content)
     try:
         try:
-            page_count = get_page_count(destination, mime_type)
+            page_count = await documents.read_page_count(destination, mime_type)
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(400, "Invalid or unreadable document") from exc
         if page_count < 1:
@@ -183,22 +169,28 @@ async def upload_file(
     return await serialize_lab_file(lab, db)
 
 
-@router.get("/files", response_model=list[LabFileOut], tags=["files"])
+@router.get("/files", response_model=list[LabFileSummaryOut], tags=["files"])
 async def list_files(
     tags: list[str] | None = Query(None, description="Filter files having ALL of these tags"),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all files newest first, including OCR text, errors, and processing progress.
+    """List all files newest first with errors and processing progress.
 
+    OCR text and summaries are omitted; read GET /api/files/{file_id} for them.
     Repeated `tags` parameters use AND matching. There is no pagination.
     """
+    return await serialize_lab_files(await _load_lab_files(db, tags), db, LabFileSummaryOut)
+
+
+async def _load_lab_files(db: AsyncSession, tags: list[str] | None) -> list[LabFile]:
     query = select(LabFile).options(selectinload(LabFile.tags)).order_by(LabFile.uploaded_at.desc())
-    if tags:
-        for tag in tags:
-            query = query.where(LabFile.id.in_(select(LabFileTag.lab_file_id).where(LabFileTag.tag == tag)))
-    result = await db.execute(query)
-    labs = result.scalars().unique().all()
-    return [await serialize_lab_file(lab, db) for lab in labs]
+    for tag in tags or []:
+        query = query.where(LabFile.id.in_(select(LabFileTag.lab_file_id).where(LabFileTag.tag == tag)))
+    return list((await db.execute(query)).scalars().unique().all())
+
+
+async def list_files_with_text(db: AsyncSession) -> list[LabFileOut]:
+    return await serialize_lab_files(await _load_lab_files(db, None), db, LabFileOut)
 
 
 @router.get("/files/{file_id}", response_model=LabFileOut, tags=["files"])
@@ -233,7 +225,7 @@ async def update_file(file_id: int, body: FilePatchRequest, db: AsyncSession = D
         lab.user_lab_date_override = True
         lab.user_lab_date = body.lab_date
 
-    await refresh_search_projection(lab, db)
+    await pipeline.refresh_file_search_projection(db, lab)
     await db.commit()
     return await serialize_lab_file(await get_lab_file_or_404(file_id, db), db)
 
@@ -270,7 +262,9 @@ async def get_file_page_image(file_id: int, page_num: int, db: AsyncSession = De
     file_path = get_file_path_or_404(lab)
 
     if lab.mime_type == "application/pdf":
-        return Response(content=render_pdf_page(file_path, page_num), media_type="image/png")
+        return Response(
+            content=await documents.run_pymupdf(render_pdf_page, file_path, page_num), media_type="image/png"
+        )
 
     if page_num != 1:
         raise HTTPException(404, "Page not found")

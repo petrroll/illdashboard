@@ -42,7 +42,6 @@ class LabFile(Base):
     source_candidate: Mapped[str | None] = mapped_column(String, nullable=True)
     source_candidate_key: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     source_name: Mapped[str | None] = mapped_column(String, nullable=True)
-    ocr_raw: Mapped[str | None] = mapped_column(Text, nullable=True)
     ocr_text_raw: Mapped[str | None] = mapped_column(Text, nullable=True)
     ocr_text_english: Mapped[str | None] = mapped_column(Text, nullable=True)
     ocr_summary_english: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -306,7 +305,13 @@ class Measurement(Base):
 
     @property
     def effective_measured_at(self) -> datetime | None:
-        return self.user_measured_at if self.user_measured_at_override else self.measured_at
+        measured_at = self.user_measured_at if self.user_measured_at_override else self.measured_at
+        if measured_at is not None:
+            return measured_at
+        # Undated rows inherit the report date like the API and SQL ordering do.
+        # Read only an already-loaded file: lazy loading is unavailable under asyncio.
+        lab_file = self.__dict__.get("lab_file")
+        return (lab_file.effective_lab_date or lab_file.uploaded_at) if lab_file is not None else None
 
     @property
     def user_edited_fields(self) -> list[str]:

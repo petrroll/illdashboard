@@ -107,6 +107,13 @@ async def _migration_0002_measurement_date_overrides(session: AsyncSession) -> N
     )
 
 
+async def _migration_0003_drop_lab_file_ocr_raw(session: AsyncSession) -> None:
+    # ocr_raw duplicated measurements/text into a JSON snapshot that went stale
+    # after edits and was never read; the normalized rows are the source of truth.
+    if "ocr_raw" in await _table_column_names(session, "lab_files"):
+        await session.execute(text('ALTER TABLE "lab_files" DROP COLUMN "ocr_raw"'))
+
+
 MIGRATIONS: tuple[DatabaseMigration, ...] = (
     DatabaseMigration(
         version=1,
@@ -117,6 +124,11 @@ MIGRATIONS: tuple[DatabaseMigration, ...] = (
         version=2,
         name="measurement-date-overrides",
         apply=_migration_0002_measurement_date_overrides,
+    ),
+    DatabaseMigration(
+        version=3,
+        name="drop-lab-file-ocr-raw",
+        apply=_migration_0003_drop_lab_file_ocr_raw,
     ),
 )
 

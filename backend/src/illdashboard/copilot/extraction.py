@@ -1,4 +1,4 @@
-"""Copilot-backed document extraction pipeline."""
+"""Copilot-backed page-range document extraction used by the durable pipeline."""
 
 from __future__ import annotations
 
@@ -17,25 +17,17 @@ import fitz
 
 from illdashboard.config import settings
 from illdashboard.copilot import mistral_client
-from illdashboard.copilot.client import COPILOT_REQUEST_TIMEOUT, get_copilot_request_load
+from illdashboard.copilot.client import COPILOT_REQUEST_TIMEOUT
 from illdashboard.copilot.client import _ask_json as copilot_ask_json
 from illdashboard.services import file_types
+from illdashboard.services.documents import run_pymupdf
 
 logger = logging.getLogger(__name__)
 
-# Earlier 300s validation forced single-page OCR. With the larger request
-# budget and the existing retry path still ready to split or lower DPI, start
-# from two-page batches again to reduce request overhead.
-OCR_PDF_BATCH_SIZE = 2
-OCR_PDF_MAX_BATCH_SIZE = 2
 OCR_PDF_RENDER_DPI = 144
 OCR_PDF_MIN_RENDER_DPI = 72
 OCR_ASK_TIMEOUT = COPILOT_REQUEST_TIMEOUT
 OCR_RETRY_DELAY = 3
-OCR_PDF_BATCH_CONCURRENCY = 4
-OCR_PDF_BACKPRESSURE_BATCH_CONCURRENCY = 2
-OCR_PDF_BACKPRESSURE_MIN_PAGE_COUNT = 8
-OCR_PDF_BACKPRESSURE_QUEUE_THRESHOLD = 6
 A4_WIDTH_INCHES = 210 / 25.4
 A4_HEIGHT_INCHES = 297 / 25.4
 
@@ -79,84 +71,6 @@ def _save_pixmap_to_temp_png(pixmap: fitz.Pixmap) -> str:
     temp_path = _new_temp_png_path()
     pixmap.save(temp_path)
     return temp_path
-
-
-class _PdfRenderCache:
-    def __init__(self, pdf_path: str):
-        self.pdf_path = pdf_path
-        self._lock = asyncio.Lock()
-        self._images_by_batch: dict[tuple[int, int, int], list[str]] = {}
-
-    async def attachments_for_range(self, *, start_page: int, stop_page: int, dpi: int) -> list[dict]:
-        key = (start_page, stop_page, dpi)
-        async with self._lock:
-            paths = self._images_by_batch.get(key)
-            if paths is None:
-                paths = _pdf_to_images(self.pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi)
-                self._images_by_batch[key] = paths
-        return [{"type": "file", "path": path} for path in paths]
-
-    async def aclose(self) -> None:
-        async with self._lock:
-            cached_paths = [path for paths in self._images_by_batch.values() for path in paths]
-            self._images_by_batch.clear()
-
-        _unlink_paths(cached_paths)
-
-
-class _ImageRenderCache:
-    def __init__(self, image_path: str):
-        self.image_path = image_path
-        self._lock = asyncio.Lock()
-        self._images_by_dpi: dict[int, str] = {}
-
-    async def attachments_for_dpi(self, *, dpi: int) -> list[dict]:
-        async with self._lock:
-            path = self._images_by_dpi.get(dpi)
-            if path is None:
-                path = _image_to_png(self.image_path, dpi=dpi)
-                self._images_by_dpi[dpi] = path
-        return [{"type": "file", "path": path}]
-
-    async def aclose(self) -> None:
-        async with self._lock:
-            cached_paths = list(self._images_by_dpi.values())
-            self._images_by_dpi.clear()
-
-        _unlink_paths(cached_paths)
-
-
-@dataclass(frozen=True)
-class _PdfBatchPlan:
-    batch_size: int
-    concurrency: int
-    queue_depth: int
-    active_requests: int
-
-
-@dataclass(frozen=True)
-class _ExtractionBatch:
-    batch_index: int
-    start_page: int
-    stop_page: int
-    result: dict
-
-
-def _select_pdf_batch_plan(page_count: int) -> _PdfBatchPlan:
-    queue_depth, active_requests = get_copilot_request_load()
-    batch_size = OCR_PDF_BATCH_SIZE
-    concurrency = OCR_PDF_BATCH_CONCURRENCY
-
-    if page_count >= OCR_PDF_BACKPRESSURE_MIN_PAGE_COUNT and queue_depth >= OCR_PDF_BACKPRESSURE_QUEUE_THRESHOLD:
-        batch_size = OCR_PDF_MAX_BATCH_SIZE
-        concurrency = OCR_PDF_BACKPRESSURE_BATCH_CONCURRENCY
-
-    return _PdfBatchPlan(
-        batch_size=batch_size,
-        concurrency=concurrency,
-        queue_depth=queue_depth,
-        active_requests=active_requests,
-    )
 
 
 def _is_request_too_large_error(exc: Exception) -> bool:
@@ -832,29 +746,6 @@ def _merge_document_text_results(results: list[dict]) -> dict:
     return merged
 
 
-def _combine_ocr_outputs(medical_result: dict, text_result: dict | None, summary_result: dict | None) -> dict:
-    combined = {
-        # File-level lab dates must come from the summary call over the merged
-        # all-pages OCR text. Batch-level measurement extraction can see only a
-        # slice of the document and is therefore not the source of truth.
-        "lab_date": (summary_result or {}).get("lab_date"),
-        "source": (summary_result or {}).get("source") or medical_result.get("source"),
-        "measurements": medical_result.get("measurements", []),
-    }
-    if text_result and text_result.get("raw_text"):
-        combined["raw_text"] = text_result["raw_text"]
-    if text_result and text_result.get("translated_text_english"):
-        combined["translated_text_english"] = text_result["translated_text_english"]
-    if summary_result and summary_result.get("summary_english"):
-        combined["summary_english"] = summary_result["summary_english"]
-    return combined
-
-
-def _pdf_page_count(file_path: str) -> int:
-    with fitz.open(file_path) as document:
-        return document.page_count
-
-
 def _mistral_request_context(
     filename: str | None,
     *,
@@ -885,7 +776,6 @@ async def _pdf_batch_extract(
     stop_page: int,
     dpi: int,
     filename: str | None = None,
-    render_cache: _PdfRenderCache | None = None,
 ) -> dict:
     temp_images: list[str] = []
     started_at = time.perf_counter()
@@ -900,11 +790,8 @@ async def _pdf_batch_extract(
     )
 
     try:
-        if render_cache is None:
-            temp_images = _pdf_to_images(pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi)
-            attachments = [{"type": "file", "path": path} for path in temp_images]
-        else:
-            attachments = await render_cache.attachments_for_range(start_page=start_page, stop_page=stop_page, dpi=dpi)
+        temp_images = await run_pymupdf(_pdf_to_images, pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi)
+        attachments = [{"type": "file", "path": path} for path in temp_images]
 
         batch_context = f"{filename}:p{start_page + 1}-{stop_page}:{dpi}dpi"
         result = await kind.extract_fn(attachments, filename=filename, request_context=batch_context)
@@ -941,18 +828,14 @@ async def _image_extract(
     *,
     dpi: int,
     filename: str | None = None,
-    render_cache: _ImageRenderCache | None = None,
 ) -> dict:
     temp_images: list[str] = []
     started_at = time.perf_counter()
     logger.info("%s image extract start path=%s filename=%s dpi=%s", kind.label, image_path, filename, dpi)
 
     try:
-        if render_cache is None:
-            temp_images = [_image_to_png(image_path, dpi=dpi)]
-            attachments = [{"type": "file", "path": temp_images[0]}]
-        else:
-            attachments = await render_cache.attachments_for_dpi(dpi=dpi)
+        temp_images = [await run_pymupdf(_image_to_png, image_path, dpi=dpi)]
+        attachments = [{"type": "file", "path": temp_images[0]}]
 
         result = await kind.extract_fn(attachments, filename=filename, request_context=f"{filename}:{dpi}dpi")
         logger.info(
@@ -986,7 +869,6 @@ async def _pdf_range_with_retries(
     stop_page: int,
     dpi: int = OCR_PDF_RENDER_DPI,
     filename: str | None = None,
-    render_cache: _PdfRenderCache | None = None,
 ) -> dict:
     page_count = stop_page - start_page
     started_at = time.perf_counter()
@@ -1020,7 +902,6 @@ async def _pdf_range_with_retries(
             pdf_path,
             kind,
             filename=filename,
-            render_cache=render_cache,
             **arguments,
         )
 
@@ -1032,7 +913,6 @@ async def _pdf_range_with_retries(
             stop_page=stop_page,
             dpi=dpi,
             filename=filename,
-            render_cache=render_cache,
         )
         logger.info(
             "%s range success path=%s filename=%s pages=%s-%s dpi=%s duration=%.2fs",
@@ -1120,7 +1000,6 @@ async def _image_with_retries(
     *,
     dpi: int = OCR_PDF_RENDER_DPI,
     filename: str | None = None,
-    render_cache: _ImageRenderCache | None = None,
 ) -> dict:
     started_at = time.perf_counter()
     logger.info("%s image start path=%s filename=%s dpi=%s", kind.label, image_path, filename, dpi)
@@ -1131,7 +1010,6 @@ async def _image_with_retries(
             kind,
             dpi=dpi,
             filename=filename,
-            render_cache=render_cache,
         )
         logger.info(
             "%s image success path=%s filename=%s dpi=%s duration=%.2fs",
@@ -1164,7 +1042,6 @@ async def _image_with_retries(
                 kind,
                 dpi=OCR_PDF_MIN_RENDER_DPI,
                 filename=filename,
-                render_cache=render_cache,
             )
 
         logger.exception(
@@ -1175,121 +1052,6 @@ async def _image_with_retries(
             dpi,
         )
         raise
-
-
-async def _extract_file(
-    file_path: str,
-    kind: _ExtractionKind,
-    *,
-    filename: str | None = None,
-    render_cache: _PdfRenderCache | _ImageRenderCache | None = None,
-) -> dict:
-    """Extract data from a file using the given extraction kind."""
-    started_at = time.perf_counter()
-    logger.info("%s start path=%s filename=%s", kind.label, file_path, filename)
-
-    batches: list[_ExtractionBatch] = []
-    async for batch in _extract_file_batches(
-        file_path,
-        kind,
-        filename=filename,
-        render_cache=render_cache,
-    ):
-        batches.append(batch)
-
-    result = kind.merge_fn([batch.result for batch in sorted(batches, key=lambda current: current.batch_index)])
-
-    logger.info(
-        "%s finished path=%s filename=%s duration=%.2fs",
-        kind.label,
-        file_path,
-        filename,
-        time.perf_counter() - started_at,
-    )
-    return result
-
-
-async def _extract_file_batches(
-    file_path: str,
-    kind: _ExtractionKind,
-    *,
-    filename: str | None = None,
-    render_cache: _PdfRenderCache | _ImageRenderCache | None = None,
-):
-    """Yield finished extraction batches as soon as they complete.
-
-    This is the core primitive that lets downstream code start normalizing the
-    first extracted measurement pages before the whole file has finished OCR.
-    """
-
-    if Path(file_path).suffix.lower() != ".pdf":
-        logger.info("%s single-image path=%s filename=%s", kind.label, file_path, filename)
-        image_cache = render_cache if isinstance(render_cache, _ImageRenderCache) else None
-        result = await _image_with_retries(
-            file_path,
-            kind,
-            filename=filename,
-            render_cache=image_cache,
-        )
-        yield _ExtractionBatch(
-            batch_index=0,
-            start_page=0,
-            stop_page=1,
-            result=result,
-        )
-        return
-
-    with fitz.open(file_path) as document:
-        page_count = document.page_count
-
-    batch_plan = _select_pdf_batch_plan(page_count)
-    batch_count = math.ceil(page_count / batch_plan.batch_size)
-    logger.info(
-        "%s pdf batches path=%s filename=%s page_count=%s batch_size=%s "
-        "batch_count=%s concurrency=%s queue_depth=%s active_requests=%s",
-        kind.label,
-        file_path,
-        filename,
-        page_count,
-        batch_plan.batch_size,
-        batch_count,
-        batch_plan.concurrency,
-        batch_plan.queue_depth,
-        batch_plan.active_requests,
-    )
-
-    semaphore = asyncio.Semaphore(batch_plan.concurrency)
-
-    async def _run_range(batch_index: int, start_page: int, stop_page: int) -> _ExtractionBatch:
-        async with semaphore:
-            result = await _pdf_range_with_retries(
-                file_path,
-                kind,
-                start_page=start_page,
-                stop_page=stop_page,
-                filename=filename,
-                render_cache=render_cache,
-            )
-        return _ExtractionBatch(
-            batch_index=batch_index,
-            start_page=start_page,
-            stop_page=stop_page,
-            result=result,
-        )
-
-    tasks = [
-        asyncio.create_task(
-            _run_range(
-                batch_index,
-                start_page,
-                min(start_page + batch_plan.batch_size, page_count),
-            )
-        )
-        for batch_index, start_page in enumerate(range(0, page_count, batch_plan.batch_size))
-    ]
-
-    for task in asyncio.as_completed(tasks):
-        yield await task
 
 
 _MEDICAL_EXTRACTION = _ExtractionKind(
@@ -1304,227 +1066,6 @@ _TEXT_EXTRACTION = _ExtractionKind(
     extract_fn=_extract_document_text_from_attachments,
     merge_fn=_merge_document_text_results,
 )
-
-
-async def ocr_extract(
-    file_path: str,
-    *,
-    filename: str | None = None,
-    on_medical_batch: Callable[[int, dict], Awaitable[None]] | None = None,
-) -> dict:
-    """Run the full OCR extraction pipeline for one uploaded file."""
-    started_at = time.perf_counter()
-    logger.info("OCR pipeline start path=%s filename=%s", file_path, filename)
-    usable_text_result: dict | None = None
-    summary_result: dict | None = None
-    medical_task: asyncio.Task[dict] | None = None
-    text_task: asyncio.Task[dict] | None = None
-    render_cache: _PdfRenderCache | _ImageRenderCache | None = None
-    if file_types.is_text_document_path(file_path):
-        request_context = _text_document_request_context(filename)
-
-        async def _extract_medical_result() -> dict:
-            result = await _extract_structured_medical_data_from_text_document(
-                file_path,
-                filename=filename,
-                request_context=request_context,
-            )
-            if on_medical_batch is not None:
-                await on_medical_batch(0, result)
-            return result
-
-        medical_task = asyncio.create_task(_extract_medical_result(), name="ocr:medical")
-        text_task = asyncio.create_task(
-            _extract_text_from_text_document(
-                file_path,
-                filename=filename,
-                request_context=request_context,
-            ),
-            name="ocr:text",
-        )
-    elif settings.EXTRACTION_PROVIDER == "mistral":
-
-        async def _extract_medical_result() -> dict:
-            start_page = 0 if Path(file_path).suffix.lower() == ".pdf" else None
-            stop_page = _pdf_page_count(file_path) if start_page is not None else None
-            result = await _extract_structured_medical_data_from_file_mistral(
-                file_path,
-                start_page=start_page,
-                stop_page=stop_page,
-                filename=filename,
-                request_context=_mistral_request_context(filename, start_page=start_page, stop_page=stop_page),
-            )
-            # Mistral OCR processes the requested file range directly, so the
-            # optional callback becomes one whole-file batch notification.
-            if on_medical_batch is not None:
-                await on_medical_batch(0, result)
-            return result
-
-        medical_task = asyncio.create_task(_extract_medical_result(), name="ocr:medical")
-        text_task = asyncio.create_task(
-            _extract_document_text_from_file_mistral(
-                file_path,
-                filename=filename,
-                request_context=_mistral_request_context(filename),
-            ),
-            name="ocr:text",
-        )
-    else:
-        render_cache = (
-            _PdfRenderCache(file_path) if Path(file_path).suffix.lower() == ".pdf" else _ImageRenderCache(file_path)
-        )
-
-        async def _extract_medical_result() -> dict:
-            if on_medical_batch is None:
-                return await _extract_file(file_path, _MEDICAL_EXTRACTION, filename=filename, render_cache=render_cache)
-
-            medical_batches: list[_ExtractionBatch] = []
-            async for batch in _extract_file_batches(
-                file_path,
-                _MEDICAL_EXTRACTION,
-                filename=filename,
-                render_cache=render_cache,
-            ):
-                medical_batches.append(batch)
-                await on_medical_batch(batch.batch_index, batch.result)
-
-            return _MEDICAL_EXTRACTION.merge_fn(
-                [batch.result for batch in sorted(medical_batches, key=lambda current: current.batch_index)]
-            )
-
-        medical_task = asyncio.create_task(_extract_medical_result(), name="ocr:medical")
-        text_task = asyncio.create_task(
-            extract_text(
-                file_path,
-                filename=filename,
-                render_cache=render_cache,
-            ),
-            name="ocr:text",
-        )
-
-    try:
-        try:
-            medical_result = await medical_task
-        except Exception:
-            if text_task is not None:
-                if not text_task.done():
-                    text_task.cancel()
-                await asyncio.gather(text_task, return_exceptions=True)
-            raise
-
-        logger.info(
-            "OCR pipeline medical extraction ready path=%s filename=%s measurements=%s elapsed=%.2fs",
-            file_path,
-            filename,
-            len(medical_result.get("measurements", [])),
-            time.perf_counter() - started_at,
-        )
-
-        try:
-            usable_text_result = await text_task
-        except Exception as exc:
-            logger.error(
-                "Document text extraction failed for %s (filename=%s): %s",
-                file_path,
-                filename,
-                exc,
-            )
-            usable_text_result = None
-        else:
-            logger.info(
-                "OCR pipeline text extraction ready path=%s filename=%s has_raw_text=%s "
-                "has_translated_text=%s elapsed=%.2fs",
-                file_path,
-                filename,
-                bool(usable_text_result.get("raw_text")),
-                bool(usable_text_result.get("translated_text_english")),
-                time.perf_counter() - started_at,
-            )
-            try:
-                # Keep text OCR and summarization in separate calls so summary
-                # always sees the merged document text, independent of provider.
-                summary_result = await generate_summary(
-                    (usable_text_result or {}).get("raw_text"),
-                    filename=filename,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Medical summary generation failed for %s (filename=%s): %s",
-                    file_path,
-                    filename,
-                    exc,
-                )
-                summary_result = None
-            else:
-                logger.info(
-                    "OCR pipeline summary ready path=%s filename=%s has_summary=%s elapsed=%.2fs",
-                    file_path,
-                    filename,
-                    bool((summary_result or {}).get("summary_english")),
-                    time.perf_counter() - started_at,
-                )
-    finally:
-        if render_cache is not None:
-            await render_cache.aclose()
-
-    logger.info(
-        "OCR pipeline finished path=%s filename=%s measurements=%s raw_text=%s summary=%s duration=%.2fs",
-        file_path,
-        filename,
-        len(medical_result.get("measurements", [])),
-        bool((usable_text_result or {}).get("raw_text")),
-        bool((summary_result or {}).get("summary_english")),
-        time.perf_counter() - started_at,
-    )
-    return _combine_ocr_outputs(medical_result, usable_text_result, summary_result)
-
-
-async def extract_text(
-    file_path: str,
-    *,
-    filename: str | None = None,
-    render_cache: _PdfRenderCache | _ImageRenderCache | None = None,
-) -> dict:
-    started_at = time.perf_counter()
-    logger.info(
-        "Document text extraction start path=%s filename=%s",
-        file_path,
-        filename,
-    )
-
-    try:
-        if file_types.is_text_document_path(file_path):
-            result = await _extract_text_from_text_document(
-                file_path,
-                filename=filename,
-                request_context=_text_document_request_context(filename),
-            )
-        elif settings.EXTRACTION_PROVIDER == "mistral":
-            result = await _extract_document_text_from_file_mistral(
-                file_path,
-                filename=filename,
-                request_context=_mistral_request_context(filename),
-            )
-        else:
-            result = await _extract_file(file_path, _TEXT_EXTRACTION, filename=filename, render_cache=render_cache)
-        logger.info(
-            "Document text extraction finished path=%s filename=%s has_raw_text=%s has_translated_text=%s "
-            "duration=%.2fs",
-            file_path,
-            filename,
-            bool(result.get("raw_text")),
-            bool(result.get("translated_text_english")),
-            time.perf_counter() - started_at,
-        )
-        return result
-    except Exception:
-        logger.exception(
-            "Document text extraction failed path=%s filename=%s after %.2fs",
-            file_path,
-            filename,
-            time.perf_counter() - started_at,
-        )
-        raise
 
 
 async def extract_measurement_batch(
@@ -1633,7 +1174,3 @@ async def generate_summary(
     filename: str | None = None,
 ) -> dict[str, str | None]:
     return await _generate_medical_summary(raw_text, filename=filename)
-
-
-def is_retryable_batch_error(exc: Exception) -> bool:
-    return _is_retryable_pdf_error(exc)

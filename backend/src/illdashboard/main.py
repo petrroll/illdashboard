@@ -12,7 +12,6 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from illdashboard.api import router
 from illdashboard.config import settings
@@ -160,7 +159,3 @@ app.add_middleware(
 )
 
 app.include_router(router, prefix="/api")
-
-upload_path = Path(settings.UPLOAD_DIR)
-upload_path.mkdir(parents=True, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=str(upload_path)), name="uploads")

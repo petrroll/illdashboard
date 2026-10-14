@@ -37,7 +37,7 @@ from illdashboard.schemas import (
     ShareExportFileAssets,
     ShareExportSearchDocument,
 )
-from illdashboard.services import file_types
+from illdashboard.services import documents, file_types
 from illdashboard.services import search as search_service
 from illdashboard.services.upload_metadata import original_name_sidecar_path
 
@@ -211,14 +211,7 @@ def get_share_export_shell_html() -> str:
 
 
 def _sanitize_export_file(lab_file: LabFileOut) -> LabFileOut:
-    return lab_file.model_copy(
-        update={
-            "filepath": "",
-            "ocr_raw": None,
-            "ocr_summary_english": None,
-            "summary_generated_at": None,
-        }
-    )
+    return lab_file.model_copy(update={"ocr_summary_english": None, "summary_generated_at": None})
 
 
 def _sanitize_marker_detail(detail: MarkerDetailResponse) -> MarkerDetailResponse:
@@ -266,6 +259,11 @@ def _render_preview_page(document: fitz.Document, page_num: int) -> str:
     return _encode_data_url(png_bytes, "image/png")
 
 
+def _render_preview_pages(file_path: Path) -> list[str]:
+    with fitz.open(str(file_path)) as document:
+        return [_render_preview_page(document, page_num) for page_num in range(1, document.page_count + 1)]
+
+
 async def _build_file_assets(file_id: int, db: AsyncSession) -> ShareExportFileAssets:
     lab_file = await files_api.get_lab_file_or_404(file_id, db)
     file_path = files_api.get_file_path_or_404(lab_file)
@@ -273,13 +271,7 @@ async def _build_file_assets(file_id: int, db: AsyncSession) -> ShareExportFileA
     if file_types.is_text_document_mime_type(lab_file.mime_type):
         return ShareExportFileAssets(text_preview=file_path.read_text(encoding="utf-8-sig"))
 
-    with fitz.open(str(file_path)) as document:
-        page_image_urls = [
-            _render_preview_page(document, page_num)
-            for page_num in range(1, document.page_count + 1)
-        ]
-
-    return ShareExportFileAssets(page_image_urls=page_image_urls)
+    return ShareExportFileAssets(page_image_urls=await documents.run_pymupdf(_render_preview_pages, file_path))
 
 
 async def _build_marker_sparkline_url(marker_name: str, db: AsyncSession) -> str | None:
@@ -295,7 +287,7 @@ async def _build_marker_sparkline_url(marker_name: str, db: AsyncSession) -> str
 
 
 async def build_share_export_bundle(db: AsyncSession) -> ShareExportBundle:
-    files = [_sanitize_export_file(lab_file) for lab_file in await files_api.list_files(tags=None, db=db)]
+    files = [_sanitize_export_file(lab_file) for lab_file in await files_api.list_files_with_text(db)]
     marker_names = await measurements_api.list_marker_names(db=db)
 
     file_measurements: dict[str, list[MeasurementOut]] = {}

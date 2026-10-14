@@ -8,11 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from illdashboard.database import get_db
-from illdashboard.models import LabFile, LabFileTag, MarkerTag, Measurement, MeasurementType, utc_now
+from illdashboard.models import LabFile, LabFileTag, MarkerTag, Measurement, MeasurementType
 from illdashboard.schemas import TagsUpdate
 from illdashboard.services import markers as marker_service
 from illdashboard.services import pipeline
-from illdashboard.services import search as search_service
 
 router = APIRouter(prefix="")
 VISIBLE_MEASUREMENT_STATUS = "resolved"
@@ -80,13 +79,7 @@ async def set_file_tags(file_id: int, body: TagsUpdate, db: AsyncSession = Depen
     for tag in unique_tags:
         db.add(LabFileTag(lab_file_id=file_id, tag=tag))
     await db.flush()
-    progress = await pipeline.get_file_progress(db, lab)
-    if progress.is_complete:
-        await search_service.refresh_lab_search_document(file_id, db)
-        lab.search_indexed_at = utc_now()
-    else:
-        await search_service.remove_lab_search_document(file_id, db)
-        lab.search_indexed_at = None
+    await pipeline.refresh_file_search_projection(db, lab)
     await db.commit()
     return unique_tags
 

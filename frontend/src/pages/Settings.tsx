@@ -16,7 +16,7 @@ import {
   isShareExportMode,
 } from "../export/runtime";
 import type {
-  LabFile,
+  LabFileSummary,
   Measurement,
   RescalingRule,
 } from "../types";
@@ -151,7 +151,7 @@ function ExportSettings() {
 }
 
 function OnlineSettings() {
-  const [files, setFiles] = useState<LabFile[]>([]);
+  const [files, setFiles] = useState<LabFileSummary[]>([]);
   const [markers, setMarkers] = useState<string[]>([]);
   const [recentMeasurements, setRecentMeasurements] = useState<Measurement[]>([]);
   const [rescalingRules, setRescalingRules] = useState<RescalingRule[]>([]);

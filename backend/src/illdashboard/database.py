@@ -21,6 +21,10 @@ def create_database_engine(database_url: str) -> AsyncEngine:
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.execute("PRAGMA busy_timeout=5000")
+            # Many pipeline workers write while API requests read; WAL lets readers
+            # proceed during writes instead of failing or stalling on the rollback journal.
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.close()
 
     return engine

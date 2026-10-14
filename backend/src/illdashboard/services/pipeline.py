@@ -8,17 +8,17 @@ import math
 import re
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections import defaultdict
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypeVar
 
-import fitz
-from sqlalchemy import delete, func, inspect, or_, select
+from sqlalchemy import delete, event, func, inspect, or_, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import Session, selectinload
 
 from illdashboard.config import settings
 from illdashboard.copilot import extraction as copilot_extraction
@@ -43,7 +43,7 @@ from illdashboard.models import (
     TextBatch,
     utc_now,
 )
-from illdashboard.services import file_types, qualitative_values, rescaling, upload_metadata
+from illdashboard.services import documents, file_types, qualitative_values, rescaling, upload_metadata
 from illdashboard.services import jobs as job_service
 from illdashboard.services import search as search_service
 from illdashboard.services.markers import (
@@ -89,15 +89,14 @@ TASK_REVIEW_ANOMALOUS_RESCALING = "review.anomalous-rescaling"
 MEASUREMENT_BATCH_SIZE = 2
 TEXT_BATCH_SIZE = 2
 DEFAULT_OCR_DPI = 144
-MIN_OCR_DPI = 96
 MAX_JOB_ATTEMPTS = 3
 JOB_LEASE_SECONDS = COPILOT_REQUEST_TIMEOUT
 # One handler can wait on several queued/retried Copilot calls, so a single
 # timeout-sized lease is not enough; workers renew it well before it expires.
 JOB_LEASE_HEARTBEAT_SECONDS = 60.0
-# Keep polling latency low enough that controller->worker handoffs do not add
-# noticeable lag or cause clean-runtime restart tests to become timing-sensitive.
-WORKER_IDLE_SECONDS = 0.2
+# Idle workers are woken by committed enqueues (see _wake_workers_after_commit);
+# this timeout only bounds latency for delayed retries and rows written elsewhere.
+WORKER_IDLE_SECONDS = 1.0
 WORKER_STOP_GRACE_SECONDS = 1.0
 MEASUREMENT_EXTRACT_WORKER_CONCURRENCY = 4
 TEXT_EXTRACT_WORKER_CONCURRENCY = 2
@@ -133,7 +132,21 @@ ANOMALOUS_RESCALING_MIN_RANGE_COUNT = 2
 
 _runtime: PipelineRuntime | None = None
 _runtime_reset_lock = asyncio.Lock()
+_running_runtimes: set[PipelineRuntime] = set()
 _T = TypeVar("_T")
+
+
+@event.listens_for(Session, "after_commit")
+def _wake_workers_after_commit(session: Session) -> None:
+    task_types = session.info.pop(job_service.ENQUEUED_TASK_TYPES_INFO_KEY, None)
+    if task_types:
+        for runtime in _running_runtimes:
+            runtime.wake(task_types)
+
+
+@event.listens_for(Session, "after_rollback")
+def _discard_enqueued_task_types(session: Session) -> None:
+    session.info.pop(job_service.ENQUEUED_TASK_TYPES_INFO_KEY, None)
 
 @dataclass(frozen=True)
 class FileProgressSnapshot:
@@ -172,8 +185,7 @@ async def preload_uploaded_files(session: AsyncSession) -> int:
         page_count = 1
         if mime_type == "application/pdf":
             try:
-                with fitz.open(str(file_path)) as document:
-                    page_count = document.page_count
+                page_count = await documents.read_page_count(file_path, mime_type)
             except Exception:
                 logger.warning("Could not read page count for %s, defaulting to 1", file_path.name)
 
@@ -200,6 +212,19 @@ class PipelineRuntime:
         self.runtime_id = uuid.uuid4().hex[:12]
         self.stop_event = asyncio.Event()
         self.tasks: list[asyncio.Task] = []
+        self.wake_events: dict[str, asyncio.Event] = {}
+
+    def wake(self, task_types: set[str]) -> None:
+        for task_type in task_types:
+            wake_event = self.wake_events.get(task_type)
+            if wake_event is not None:
+                wake_event.set()
+
+    async def _wait_for_work(self, wake_event: asyncio.Event) -> None:
+        try:
+            await asyncio.wait_for(wake_event.wait(), timeout=WORKER_IDLE_SECONDS)
+        except TimeoutError:
+            pass
 
     async def start(self) -> None:
         async with self.session_factory() as session:
@@ -214,14 +239,30 @@ class PipelineRuntime:
             await preload_uploaded_files(session)
 
         async with self.session_factory() as session:
-            result = await session.execute(select(LabFile).order_by(LabFile.id.asc()))
-            for file in result.scalars().all():
-                if await _should_resume_file_on_startup(session, file):
+            files = (await session.execute(select(LabFile).order_by(LabFile.id.asc()))).scalars().all()
+            # Startup only resumes files the user had already scheduled, not every
+            # uploaded or errored file in the database.
+            scheduled_file_ids = set(
+                (
+                    await session.scalars(
+                        select(Job.file_id).where(
+                            Job.file_id.is_not(None),
+                            Job.status.in_([job_service.JOB_STATUS_PENDING, job_service.JOB_STATUS_LEASED]),
+                        )
+                    )
+                ).all()
+            )
+            complete_progress = await get_files_progress(
+                session, [file for file in files if file.status == FILE_STATUS_COMPLETE]
+            )
+            for file in files:
+                if file.status in {FILE_STATUS_QUEUED, FILE_STATUS_PROCESSING} or file.id in scheduled_file_ids:
                     await _request_file_ensure(session, file.id)
-                elif file.status == FILE_STATUS_COMPLETE and await _file_needs_search_refresh(session, file):
+                elif file.id in complete_progress and not complete_progress[file.id].search_ready:
                     await _request_search_refresh(session, file.id)
             await session.commit()
 
+        _running_runtimes.add(self)
         self._spawn_workers(
             "ensure-file", [TASK_ENSURE_FILE], 1, ENSURE_WORKER_CONCURRENCY, self._handle_ensure_file_jobs
         )
@@ -305,6 +346,8 @@ class PipelineRuntime:
 
     async def stop(self, *, abort_copilot_requests: bool = False) -> None:
         self.stop_event.set()
+        _running_runtimes.discard(self)
+        self.wake(set(self.wake_events))
         if abort_copilot_requests:
             await shutdown_client()
         if self.tasks:
@@ -322,6 +365,9 @@ class PipelineRuntime:
         concurrency: int,
         handler,
     ) -> None:
+        wake_event = asyncio.Event()
+        for task_type in task_types:
+            self.wake_events[task_type] = wake_event
         for worker_index in range(concurrency):
             task = asyncio.create_task(
                 self._worker_loop(
@@ -329,15 +375,26 @@ class PipelineRuntime:
                     task_types,
                     claim_limit,
                     handler,
+                    wake_event,
                 ),
                 name=f"pipeline:{worker_name}:{worker_index}",
             )
             self.tasks.append(task)
 
-    async def _worker_loop(self, worker_name: str, task_types: list[str], claim_limit: int, handler) -> None:
+    async def _worker_loop(
+        self,
+        worker_name: str,
+        task_types: list[str],
+        claim_limit: int,
+        handler,
+        wake_event: asyncio.Event,
+    ) -> None:
         lease_owner = f"{self.runtime_id}:{worker_name}"
         while not self.stop_event.is_set():
             try:
+                # Clear before claiming so an enqueue committed during the claim
+                # still wakes this worker instead of waiting for the timeout.
+                wake_event.clear()
                 async with self.session_factory() as session:
                     jobs = await job_service.claim_jobs(
                         session,
@@ -346,20 +403,19 @@ class PipelineRuntime:
                         limit=claim_limit,
                         lease_seconds=JOB_LEASE_SECONDS,
                     )
-                    if not jobs:
-                        await asyncio.sleep(WORKER_IDLE_SECONDS)
-                        continue
-
-                    try:
-                        await self._run_handler_with_lease_heartbeat(session, jobs, lease_owner, handler)
-                        await session.commit()
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        logger.exception("Worker failed worker=%s task_types=%s", worker_name, task_types)
-                        await session.rollback()
-                        await self._handle_worker_failure(session, jobs, exc, lease_owner=lease_owner)
-                        await session.commit()
+                    if jobs:
+                        try:
+                            await self._run_handler_with_lease_heartbeat(session, jobs, lease_owner, handler)
+                            await session.commit()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.exception("Worker failed worker=%s task_types=%s", worker_name, task_types)
+                            await session.rollback()
+                            await self._handle_worker_failure(session, jobs, exc, lease_owner=lease_owner)
+                            await session.commit()
+                if not jobs:
+                    await self._wait_for_work(wake_event)
             except asyncio.CancelledError:
                 return
             except Exception:
@@ -531,23 +587,6 @@ async def stop_pipeline_runtime(*, abort_copilot_requests: bool = False) -> None
         return
     await _runtime.stop(abort_copilot_requests=abort_copilot_requests)
     _runtime = None
-
-
-async def _should_resume_file_on_startup(session: AsyncSession, file: LabFile) -> bool:
-    # Startup should only resume files the user had already scheduled, not
-    # opportunistically start every uploaded or errored file in the database.
-    if file.status in {FILE_STATUS_QUEUED, FILE_STATUS_PROCESSING}:
-        return True
-
-    active_job_result = await session.execute(
-        select(Job.id)
-        .where(
-            Job.file_id == file.id,
-            Job.status.in_([job_service.JOB_STATUS_PENDING, job_service.JOB_STATUS_LEASED]),
-        )
-        .limit(1)
-    )
-    return active_job_result.scalar_one_or_none() is not None
 
 
 async def queue_file(session: AsyncSession, file_id: int) -> LabFile:
@@ -756,7 +795,6 @@ async def _reset_file_processing_state(session: AsyncSession, file: LabFile, *, 
     file.source_candidate = None
     file.source_candidate_key = None
     file.source_name = None
-    file.ocr_raw = None
     file.ocr_text_raw = None
     file.ocr_text_english = None
     file.ocr_summary_english = None
@@ -776,7 +814,6 @@ async def _ensure_file(session: AsyncSession, job: Job) -> None:
         return
 
     progress = await get_file_progress(session, file)
-    measurements = await _load_file_measurements(session, file.id)
 
     if progress.measurement_pages_done < progress.measurement_pages_total:
         await _request_measurement_extraction_ensure(session, file.id)
@@ -797,19 +834,8 @@ async def _ensure_file(session: AsyncSession, job: Job) -> None:
             await _mark_source_resolved(session, file, canonical_source=None)
 
     progress = await get_file_progress(session, file)
-    if progress.is_complete:
-        file.ocr_raw = json.dumps(
-            {
-                **_build_medical_payload(file, measurements),
-                "raw_text": file.ocr_text_raw,
-                "translated_text_english": file.ocr_text_english,
-                "summary_english": file.ocr_summary_english,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        if await _file_needs_search_refresh(session, file):
-            await _request_search_refresh(session, file.id)
+    if progress.is_complete and not progress.search_ready:
+        await _request_search_refresh(session, file.id)
 
     await _refresh_file_status_projection(session, file, progress=progress)
     await job_service.mark_job_resolved(session, job)
@@ -917,38 +943,8 @@ async def _process_extraction_job(session: AsyncSession, job: Job, *, measuremen
                 filename=file.filename,
             )
     except Exception as exc:
-        if copilot_extraction.is_retryable_batch_error(exc):
-            fallback_ranges = _fallback_batch_ranges(start_page, stop_page, dpi)
-            if fallback_ranges:
-                logger.warning(
-                    "Extraction job retry split stage=%s job_id=%s file_id=%s filename=%s pages=%s-%s dpi=%s "
-                    "fallback_ranges=%s duration=%.2fs error=%s",
-                    stage_name,
-                    job.id,
-                    file.id,
-                    file.filename,
-                    start_page + 1,
-                    stop_page,
-                    dpi,
-                    [
-                        (fallback_start + 1, fallback_stop, fallback_dpi)
-                        for fallback_start, fallback_stop, fallback_dpi in fallback_ranges
-                    ],
-                    time.perf_counter() - started_at,
-                    exc,
-                )
-                for fallback_start, fallback_stop, fallback_dpi in fallback_ranges:
-                    if measurement_mode:
-                        await _request_measurement_extraction_batch(
-                            session, file.id, fallback_start, fallback_stop, fallback_dpi
-                        )
-                    else:
-                        await _request_text_extraction_batch(
-                            session, file.id, fallback_start, fallback_stop, fallback_dpi
-                        )
-                await job_service.mark_job_resolved(session, job, {"split": True})
-                await _request_file_ensure(session, file.id)
-                return
+        # The extraction layer already split the batch and lowered DPI before
+        # giving up, so a durable re-split here would only repeat paid requests.
         logger.error(
             "Extraction job failed stage=%s job_id=%s file_id=%s filename=%s "
             "pages=%s-%s dpi=%s duration=%.2fs error=%s",
@@ -1021,7 +1017,9 @@ async def _persist_measurement_batch(
 
         numeric_value, qualitative_value = _parse_measurement_value(raw_measurement.get("value"))
         original_unit = _normalize_optional_text(raw_measurement.get("unit"))
-        measured_at = _parse_datetime(raw_measurement.get("measured_at")) or file.lab_date
+        # Leave undated rows null: reads fall back to the file's effective report
+        # date, so later report-date edits and summary dates still apply.
+        measured_at = _parse_datetime(raw_measurement.get("measured_at"))
         page_number = _parse_int(raw_measurement.get("page_number"))
 
         session.add(
@@ -1707,19 +1705,24 @@ async def _canonize_qualitative_jobs(session: AsyncSession, jobs: list[Job]) -> 
     existing_rules = await qualitative_values.load_qualitative_rules(session, qualitative_keys)
     unresolved_keys = [key for key in qualitative_keys if key not in existing_rules]
     if unresolved_keys:
-        measurement_result = await session.execute(
-            select(Measurement)
-            .options(selectinload(Measurement.measurement_type))
+        # Qualitative keys are normalized in Python, so scan only the raw value
+        # column and load full rows for the first match of each key.
+        sample_ids_by_key: dict[str, int] = {}
+        for measurement_id, original_value in await session.execute(
+            select(Measurement.id, Measurement.original_qualitative_value)
             .where(Measurement.original_qualitative_value.is_not(None))
             .order_by(Measurement.id.asc())
+        ):
+            key = qualitative_values.normalize_qualitative_key(original_value)
+            if key in unresolved_keys and key not in sample_ids_by_key:
+                sample_ids_by_key[key] = measurement_id
+        sample_result = await session.execute(
+            select(Measurement)
+            .options(selectinload(Measurement.measurement_type))
+            .where(Measurement.id.in_(list(sample_ids_by_key.values())))
         )
-        samples_by_key: dict[str, Measurement] = {}
-        for measurement in measurement_result.scalars().all():
-            key = qualitative_values.normalize_qualitative_key(measurement.original_qualitative_value)
-            if key in unresolved_keys and key not in samples_by_key:
-                samples_by_key[key] = measurement
-                if len(samples_by_key) == len(unresolved_keys):
-                    break
+        samples_by_id = {measurement.id: measurement for measurement in sample_result.scalars().all()}
+        samples_by_key = {key: samples_by_id[measurement_id] for key, measurement_id in sample_ids_by_key.items()}
 
         requests: list[copilot_normalization.QualitativeNormalizationRequest] = []
         for qualitative_key in unresolved_keys:
@@ -1885,7 +1888,7 @@ async def _refresh_search(session: AsyncSession, job: Job) -> None:
         await search_service.remove_lab_search_document(file.id, session)
         await job_service.mark_job_resolved(session, job, {"skipped": True})
         return
-    if not await _file_needs_search_refresh(session, file):
+    if progress.search_ready:
         await job_service.mark_job_resolved(session, job, {"skipped": True})
         return
     started_at = _log_task_span_start(job, [file])
@@ -1896,49 +1899,89 @@ async def _refresh_search(session: AsyncSession, job: Job) -> None:
 
 
 async def get_file_progress(session: AsyncSession, file: LabFile) -> FileProgressSnapshot:
-    measurement_ranges = await _load_measurement_batch_ranges(session, file.id)
-    text_ranges = await _load_text_batch_ranges(session, file.id)
-    measurement_pages_done = _covered_page_count(file.page_count, measurement_ranges)
-    text_pages_done = _covered_page_count(file.page_count, text_ranges)
+    return (await get_files_progress(session, [file]))[file.id]
 
-    count_result = await session.execute(
-        select(Measurement.normalization_status, func.count(Measurement.id))
-        .where(Measurement.lab_file_id == file.id)
-        .group_by(Measurement.normalization_status)
-    )
-    counts = {status: count for status, count in count_result.all()}
-    ready_measurements = counts.get(MEASUREMENT_STATE_RESOLVED, 0)
-    total_measurements = sum(counts.values())
-    measurement_error_count = counts.get(MEASUREMENT_STATE_ERROR, 0)
-    summary_ready = file.summary_generated_at is not None
-    source_ready = file.source_resolved_at is not None
-    is_complete = (
-        measurement_pages_done >= file.page_count
-        and text_pages_done >= file.page_count
-        and file.text_assembled_at is not None
-        and summary_ready
-        and source_ready
-        and measurement_error_count == 0
-        and ready_measurements == total_measurements
-    )
-    search_ready = file.search_indexed_at is not None and not await _search_needs_refresh_by_timestamp(
-        session,
-        file,
-        is_complete=is_complete,
-    )
-    return FileProgressSnapshot(
-        measurement_pages_done=measurement_pages_done,
-        measurement_pages_total=file.page_count,
-        text_pages_done=text_pages_done,
-        text_pages_total=file.page_count,
-        ready_measurements=ready_measurements,
-        total_measurements=total_measurements,
-        summary_ready=summary_ready,
-        source_ready=source_ready,
-        search_ready=search_ready,
-        measurement_error_count=measurement_error_count,
-        is_complete=is_complete,
-    )
+
+async def refresh_file_search_projection(session: AsyncSession, file: LabFile) -> None:
+    # User edits re-index immediately so search reflects them without a pipeline round trip.
+    if (await get_file_progress(session, file)).is_complete:
+        await search_service.refresh_lab_search_document(file.id, session)
+        file.search_indexed_at = utc_now()
+    else:
+        await search_service.remove_lab_search_document(file.id, session)
+        file.search_indexed_at = None
+
+
+async def get_files_progress(session: AsyncSession, files: Sequence[LabFile]) -> dict[int, FileProgressSnapshot]:
+    # File lists are polled while processing runs, so progress for every file is
+    # derived from a fixed number of grouped queries instead of several per file.
+    if not files:
+        return {}
+    file_ids = [file.id for file in files]
+    measurement_ranges: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for file_id, start_page, stop_page in await session.execute(
+        select(MeasurementBatch.file_id, MeasurementBatch.start_page, MeasurementBatch.stop_page).where(
+            MeasurementBatch.file_id.in_(file_ids)
+        )
+    ):
+        measurement_ranges[file_id].append((start_page, stop_page))
+    text_ranges: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for file_id, start_page, stop_page in await session.execute(
+        select(TextBatch.file_id, TextBatch.start_page, TextBatch.stop_page).where(TextBatch.file_id.in_(file_ids))
+    ):
+        text_ranges[file_id].append((start_page, stop_page))
+    counts: dict[int, dict[str, int]] = defaultdict(dict)
+    latest_resolved_update: dict[int, datetime | None] = {}
+    for file_id, status, count, latest_update in await session.execute(
+        select(
+            Measurement.lab_file_id,
+            Measurement.normalization_status,
+            func.count(Measurement.id),
+            func.max(Measurement.updated_at),
+        )
+        .where(Measurement.lab_file_id.in_(file_ids))
+        .group_by(Measurement.lab_file_id, Measurement.normalization_status)
+    ):
+        counts[file_id][status] = count
+        if status == MEASUREMENT_STATE_RESOLVED:
+            latest_resolved_update[file_id] = latest_update
+
+    snapshots: dict[int, FileProgressSnapshot] = {}
+    for file in files:
+        file_counts = counts[file.id]
+        measurement_pages_done = _covered_page_count(file.page_count, measurement_ranges[file.id])
+        text_pages_done = _covered_page_count(file.page_count, text_ranges[file.id])
+        ready_measurements = file_counts.get(MEASUREMENT_STATE_RESOLVED, 0)
+        total_measurements = sum(file_counts.values())
+        measurement_error_count = file_counts.get(MEASUREMENT_STATE_ERROR, 0)
+        summary_ready = file.summary_generated_at is not None
+        source_ready = file.source_resolved_at is not None
+        is_complete = (
+            measurement_pages_done >= file.page_count
+            and text_pages_done >= file.page_count
+            and file.text_assembled_at is not None
+            and summary_ready
+            and source_ready
+            and measurement_error_count == 0
+            and ready_measurements == total_measurements
+        )
+        search_ready = file.search_indexed_at is not None and not (
+            is_complete and _search_index_is_stale(file, latest_resolved_update.get(file.id))
+        )
+        snapshots[file.id] = FileProgressSnapshot(
+            measurement_pages_done=measurement_pages_done,
+            measurement_pages_total=file.page_count,
+            text_pages_done=text_pages_done,
+            text_pages_total=file.page_count,
+            ready_measurements=ready_measurements,
+            total_measurements=total_measurements,
+            summary_ready=summary_ready,
+            source_ready=source_ready,
+            search_ready=search_ready,
+            measurement_error_count=measurement_error_count,
+            is_complete=is_complete,
+        )
+    return snapshots
 
 
 async def _refresh_file_status_projection(
@@ -2917,9 +2960,9 @@ async def _request_processing_for_qualitative_keys(session: AsyncSession, keys: 
     if not normalized_keys:
         return
     result = await session.execute(
-        select(Measurement.lab_file_id, Measurement.original_qualitative_value).where(
-            Measurement.original_qualitative_value.is_not(None)
-        )
+        select(Measurement.lab_file_id, Measurement.original_qualitative_value)
+        .where(Measurement.original_qualitative_value.is_not(None))
+        .distinct()
     )
     affected_file_ids: set[int] = set()
     for file_id, original_value in result.all():
@@ -3050,28 +3093,9 @@ async def _page_range_is_fully_covered(
     return all(page in covered for page in range(start_page, stop_page))
 
 
-async def _file_needs_search_refresh(session: AsyncSession, file: LabFile) -> bool:
-    progress = await get_file_progress(session, file)
-    return await _search_needs_refresh_by_timestamp(session, file, is_complete=progress.is_complete)
-
-
-async def _search_needs_refresh_by_timestamp(
-    session: AsyncSession,
-    file: LabFile,
-    *,
-    is_complete: bool,
-) -> bool:
-    if not is_complete:
-        return False
+def _search_index_is_stale(file: LabFile, latest_measurement_update: datetime | None) -> bool:
     if file.search_indexed_at is None:
         return True
-    latest_measurement_result = await session.execute(
-        select(func.max(Measurement.updated_at)).where(
-            Measurement.lab_file_id == file.id,
-            Measurement.normalization_status == MEASUREMENT_STATE_RESOLVED,
-        )
-    )
-    latest_measurement_update = latest_measurement_result.scalar_one_or_none()
     freshness_candidates = [
         candidate
         for candidate in [
@@ -3082,14 +3106,8 @@ async def _search_needs_refresh_by_timestamp(
         ]
         if candidate is not None
     ]
-    latest_input = max(
-        (_coerce_datetime_utc(candidate) for candidate in freshness_candidates),
-        default=_coerce_datetime_utc(file.search_indexed_at),
-    )
     indexed_at = _coerce_datetime_utc(file.search_indexed_at)
-    if latest_input is None or indexed_at is None:
-        return False
-    return latest_input > indexed_at
+    return any(_coerce_datetime_utc(candidate) > indexed_at for candidate in freshness_candidates)
 
 
 def _coerce_datetime_utc(value: datetime | None) -> datetime | None:
@@ -3209,38 +3227,6 @@ async def _load_or_create_groups(session: AsyncSession, names: list[str]) -> dic
         await session.flush()
         groups_by_name[name] = group
     return groups_by_name
-
-
-def _build_medical_payload(file: LabFile, measurements: list[Measurement]) -> dict:
-    return {
-        "lab_date": file.lab_date.isoformat() if file.lab_date else None,
-        "source": file.source_name,
-        "measurements": [
-            {
-                "marker_name": measurement.marker_name,
-                "value": measurement.original_value
-                if measurement.original_value is not None
-                else measurement.qualitative_value,
-                "unit": measurement.original_unit,
-                "reference_low": measurement.original_reference_low,
-                "reference_high": measurement.original_reference_high,
-                "measured_at": measurement.measured_at.isoformat() if measurement.measured_at else None,
-                "page_number": measurement.page_number,
-            }
-            for measurement in measurements
-            if measurement.normalization_status == MEASUREMENT_STATE_RESOLVED
-        ],
-    }
-
-
-def _fallback_batch_ranges(start_page: int, stop_page: int, dpi: int) -> list[tuple[int, int, int]]:
-    page_count = stop_page - start_page
-    if page_count > 1:
-        return [(page, page + 1, dpi) for page in range(start_page, stop_page)]
-    smaller_dpi = max(MIN_OCR_DPI, dpi - 24)
-    if smaller_dpi != dpi:
-        return [(start_page, stop_page, smaller_dpi)]
-    return []
 
 
 def _normalize_optional_text(value: object) -> str | None:

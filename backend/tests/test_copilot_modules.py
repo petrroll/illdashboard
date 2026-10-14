@@ -80,17 +80,6 @@ class WarningSession(DummySession):
         return await super().send_and_wait(*_args, **_kwargs)
 
 
-class DummyDoc:
-    def __init__(self, page_count: int):
-        self.page_count = page_count
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-
 class DummyAsyncMistralClient:
     def __init__(self, *, ocr_response=None, chat_response=None):
         self.ocr = SimpleNamespace(process_async=AsyncMock(return_value=ocr_response))
@@ -142,7 +131,7 @@ async def _wait_for(condition, *, timeout: float = 1.0):
 
 
 @pytest.mark.asyncio
-async def test_ocr_extract_splits_oversized_batches_and_preserves_page_numbers():
+async def test_measurement_batch_retries_single_page_at_lower_dpi_after_413():
     async def fake_batch(
         pdf_path: str,
         kind: copilot_ocr._ExtractionKind,
@@ -151,84 +140,7 @@ async def test_ocr_extract_splits_oversized_batches_and_preserves_page_numbers()
         stop_page: int,
         dpi: int,
         filename: str | None = None,
-        render_cache=None,
     ):
-        if kind is copilot_ocr._TEXT_EXTRACTION:
-            return {"raw_text": "text", "translated_text_english": "text"}
-        if stop_page - start_page > 1:
-            raise Exception("CAPIError: 413 failed to parse request")
-        return {
-            "lab_date": "2025-09-05",
-            "source": "synlab",
-            "measurements": [
-                {
-                    "marker_name": f"Marker {start_page + 1}",
-                    "value": start_page + 1,
-                    "unit": "mmol/l",
-                    "reference_low": None,
-                    "reference_high": None,
-                    "measured_at": None,
-                    "page_number": 1,
-                }
-            ],
-        }
-
-    with (
-        patch("illdashboard.copilot.extraction.fitz.open", return_value=DummyDoc(page_count=4)),
-        patch.object(copilot_ocr, "OCR_PDF_BATCH_SIZE", 2),
-        patch.object(copilot_ocr, "OCR_PDF_MAX_BATCH_SIZE", 2),
-        patch(
-            "illdashboard.copilot.extraction._pdf_batch_extract",
-            new=AsyncMock(side_effect=fake_batch),
-        ) as batch_mock,
-        patch(
-            "illdashboard.copilot.extraction.extract_text",
-            new=AsyncMock(return_value={"raw_text": "text", "translated_text_english": "text"}),
-        ),
-        patch("illdashboard.copilot.extraction.generate_summary", new=AsyncMock(return_value=None)),
-    ):
-        result = await copilot_ocr.ocr_extract("/tmp/report.pdf")
-
-    assert result["lab_date"] is None
-    assert result["source"] == "synlab"
-    assert [measurement["page_number"] for measurement in result["measurements"]] == [1, 2, 3, 4]
-    observed_calls = sorted(
-        [
-            (
-                args.args[0],
-                args.kwargs["start_page"],
-                args.kwargs["stop_page"],
-                args.kwargs["dpi"],
-                args.kwargs["filename"],
-            )
-            for args in _medical_calls(batch_mock)
-        ],
-        key=lambda item: (item[1], item[2], item[3]),
-    )
-    assert observed_calls == [
-        ("/tmp/report.pdf", 0, 1, 144, None),
-        ("/tmp/report.pdf", 0, 2, 144, None),
-        ("/tmp/report.pdf", 1, 2, 144, None),
-        ("/tmp/report.pdf", 2, 3, 144, None),
-        ("/tmp/report.pdf", 2, 4, 144, None),
-        ("/tmp/report.pdf", 3, 4, 144, None),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_ocr_extract_retries_single_page_at_lower_dpi_after_413():
-    async def fake_batch(
-        pdf_path: str,
-        kind: copilot_ocr._ExtractionKind,
-        *,
-        start_page: int,
-        stop_page: int,
-        dpi: int,
-        filename: str | None = None,
-        render_cache=None,
-    ):
-        if kind is copilot_ocr._TEXT_EXTRACTION:
-            return {"raw_text": "Sodium 141 mmol/l", "translated_text_english": "Sodium 141 mmol/l"}
         if dpi == copilot_ocr.OCR_PDF_RENDER_DPI:
             raise Exception("CAPIError: 413 failed to parse request")
         return {
@@ -247,56 +159,20 @@ async def test_ocr_extract_retries_single_page_at_lower_dpi_after_413():
             ],
         }
 
-    with (
-        patch("illdashboard.copilot.extraction.fitz.open", return_value=DummyDoc(page_count=1)),
-        patch(
-            "illdashboard.copilot.extraction._pdf_batch_extract",
-            new=AsyncMock(side_effect=fake_batch),
-        ) as batch_mock,
-        patch(
-            "illdashboard.copilot.extraction.extract_text",
-            new=AsyncMock(
-                return_value={
-                    "raw_text": "Sodium 141 mmol/l",
-                    "translated_text_english": "Sodium 141 mmol/l",
-                }
-            ),
-        ),
-        patch("illdashboard.copilot.extraction.generate_summary", new=AsyncMock(return_value=None)),
-    ):
-        result = await copilot_ocr.ocr_extract("/tmp/report.pdf")
-
-    assert result == {
-        "lab_date": None,
-        "source": None,
-        "raw_text": "Sodium 141 mmol/l",
-        "translated_text_english": "Sodium 141 mmol/l",
-        "measurements": [
-            {
-                "marker_name": "Sodium",
-                "value": 141,
-                "unit": "mmol/l",
-                "reference_low": 136,
-                "reference_high": 145,
-                "measured_at": None,
-                "page_number": 1,
-            }
-        ],
-    }
-    medical = _medical_calls(batch_mock)
-    assert [
-        (
-            call.args[0],
-            call.kwargs["start_page"],
-            call.kwargs["stop_page"],
-            call.kwargs["dpi"],
-            call.kwargs["filename"],
+    with patch(
+        "illdashboard.copilot.extraction._pdf_batch_extract",
+        new=AsyncMock(side_effect=fake_batch),
+    ) as batch_mock:
+        result = await copilot_ocr.extract_measurement_batch(
+            "/tmp/report.pdf", start_page=0, stop_page=1, dpi=copilot_ocr.OCR_PDF_RENDER_DPI
         )
-        for call in medical
-    ] == [
-        ("/tmp/report.pdf", 0, 1, 144, None),
-        ("/tmp/report.pdf", 0, 1, 72, None),
-    ]
+
+    assert [measurement["marker_name"] for measurement in result["measurements"]] == ["Sodium"]
+    assert [measurement["page_number"] for measurement in result["measurements"]] == [1]
+    assert [
+        (call.kwargs["start_page"], call.kwargs["stop_page"], call.kwargs["dpi"])
+        for call in batch_mock.await_args_list
+    ] == [(0, 1, 144), (0, 1, 72)]
 
 
 @pytest.mark.asyncio
@@ -935,279 +811,6 @@ async def test_normalization_ask_json_routes_to_mistral_when_configured():
 
     assert result == {"ok": True}
     ask_mock.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_extract_file_processes_page_batches_in_parallel():
-    first_batch_started = asyncio.Event()
-    allow_first_batch_finish = asyncio.Event()
-    second_batch_started = asyncio.Event()
-
-    async def fake_batch(
-        pdf_path: str,
-        kind: copilot_ocr._ExtractionKind,
-        *,
-        start_page: int,
-        stop_page: int,
-        dpi: int,
-        filename: str | None = None,
-        render_cache=None,
-    ):
-        if start_page == 0:
-            first_batch_started.set()
-            await allow_first_batch_finish.wait()
-        else:
-            await first_batch_started.wait()
-            second_batch_started.set()
-            allow_first_batch_finish.set()
-
-        return {
-            "lab_date": None,
-            "source": None,
-            "measurements": [
-                {
-                    "marker_name": f"Marker {start_page + 1}",
-                    "value": start_page + 1,
-                    "unit": "mmol/l",
-                    "reference_low": None,
-                    "reference_high": None,
-                    "measured_at": None,
-                    "page_number": 1,
-                }
-            ],
-        }
-
-    with (
-        patch("illdashboard.copilot.extraction.fitz.open", return_value=DummyDoc(page_count=4)),
-        patch.object(copilot_ocr, "OCR_PDF_BATCH_SIZE", 2),
-        patch.object(copilot_ocr, "OCR_PDF_MAX_BATCH_SIZE", 2),
-        patch.object(
-            copilot_ocr,
-            "OCR_PDF_BATCH_CONCURRENCY",
-            2,
-        ),
-        patch(
-            "illdashboard.copilot.extraction._pdf_batch_extract",
-            new=AsyncMock(side_effect=fake_batch),
-        ),
-    ):
-        result = await copilot_ocr._extract_file("/tmp/report.pdf", copilot_ocr._MEDICAL_EXTRACTION)
-
-    assert second_batch_started.is_set()
-    assert [measurement["page_number"] for measurement in result["measurements"]] == [1, 3]
-
-
-@pytest.mark.asyncio
-async def test_ocr_extract_streams_medical_batches_before_combining_result():
-    observed_batches: list[tuple[int, list[int]]] = []
-
-    async def fake_extract_batches(
-        file_path: str,
-        kind: copilot_ocr._ExtractionKind,
-        *,
-        filename: str | None = None,
-        render_cache=None,
-    ):
-        assert file_path == "/tmp/report.pdf"
-        assert kind is copilot_ocr._MEDICAL_EXTRACTION
-        yield copilot_ocr._ExtractionBatch(
-            batch_index=1,
-            start_page=2,
-            stop_page=4,
-            result={
-                "lab_date": None,
-                "source": None,
-                "measurements": [
-                    {
-                        "marker_name": "Marker 2",
-                        "value": 2,
-                        "unit": "mmol/l",
-                        "reference_low": None,
-                        "reference_high": None,
-                        "measured_at": None,
-                        "page_number": 3,
-                    }
-                ],
-            },
-        )
-        yield copilot_ocr._ExtractionBatch(
-            batch_index=0,
-            start_page=0,
-            stop_page=2,
-            result={
-                "lab_date": "2025-09-05",
-                "source": "synlab",
-                "measurements": [
-                    {
-                        "marker_name": "Marker 1",
-                        "value": 1,
-                        "unit": "mmol/l",
-                        "reference_low": None,
-                        "reference_high": None,
-                        "measured_at": None,
-                        "page_number": 1,
-                    }
-                ],
-            },
-        )
-
-    async def fake_extract_text(
-        file_path: str,
-        *,
-        filename: str | None = None,
-        render_cache=None,
-    ):
-        assert file_path == "/tmp/report.pdf"
-        return {"raw_text": "text", "translated_text_english": "text"}
-
-    async def on_medical_batch(batch_index: int, batch_result: dict) -> None:
-        observed_batches.append(
-            (
-                batch_index,
-                [measurement["page_number"] for measurement in batch_result["measurements"]],
-            )
-        )
-
-    with (
-        patch.object(copilot_ocr, "_extract_file_batches", side_effect=fake_extract_batches),
-        patch.object(
-            copilot_ocr,
-            "extract_text",
-            side_effect=fake_extract_text,
-        ),
-        patch.object(copilot_ocr, "generate_summary", new=AsyncMock(return_value=None)),
-    ):
-        result = await copilot_ocr.ocr_extract(
-            "/tmp/report.pdf",
-            on_medical_batch=on_medical_batch,
-        )
-
-    assert observed_batches == [(1, [3]), (0, [1])]
-    assert result["lab_date"] is None
-    assert result["source"] == "synlab"
-    assert [measurement["page_number"] for measurement in result["measurements"]] == [1, 3]
-
-
-@pytest.mark.asyncio
-async def test_ocr_extract_uses_summary_lab_date_from_combined_text():
-    async def fake_extract_batches(
-        file_path: str,
-        kind: copilot_ocr._ExtractionKind,
-        *,
-        filename: str | None = None,
-        render_cache=None,
-    ):
-        assert file_path == "/tmp/report.pdf"
-        assert kind is copilot_ocr._MEDICAL_EXTRACTION
-        yield copilot_ocr._ExtractionBatch(
-            batch_index=0,
-            start_page=0,
-            stop_page=2,
-            result={
-                "lab_date": "2025-09-01",
-                "source": "synlab",
-                "measurements": [
-                    {
-                        "marker_name": "CRP",
-                        "value": 15,
-                        "unit": "mg/L",
-                        "reference_low": 0,
-                        "reference_high": 5,
-                        "measured_at": None,
-                        "page_number": 1,
-                    }
-                ],
-            },
-        )
-
-    text_result = {
-        "raw_text": "Page 1 text\n\nPage 2 text",
-        "translated_text_english": "Page 1 text\n\nPage 2 text",
-    }
-    summary_mock = AsyncMock(
-        return_value={
-            "summary_english": "Inflammation marker is elevated.",
-            "lab_date": "2025-09-05",
-            "source": "summary-synlab",
-        }
-    )
-
-    with (
-        patch.object(copilot_ocr, "_extract_file_batches", side_effect=fake_extract_batches),
-        patch.object(copilot_ocr, "extract_text", new=AsyncMock(return_value=text_result)),
-        patch.object(copilot_ocr, "generate_summary", new=summary_mock),
-    ):
-        result = await copilot_ocr.ocr_extract("/tmp/report.pdf")
-
-    assert result["lab_date"] == "2025-09-05"
-    assert result["source"] == "summary-synlab"
-    assert result["summary_english"] == "Inflammation marker is elevated."
-    summary_mock.assert_awaited_once_with("Page 1 text\n\nPage 2 text", filename=None)
-
-
-@pytest.mark.asyncio
-async def test_ocr_extract_runs_text_ocr_in_parallel_with_medical_extraction():
-    medical_started = asyncio.Event()
-    text_started = asyncio.Event()
-    allow_medical_finish = asyncio.Event()
-
-    async def fake_extract_batches(
-        file_path: str,
-        kind: copilot_ocr._ExtractionKind,
-        *,
-        filename: str | None = None,
-        render_cache=None,
-    ):
-        assert file_path == "/tmp/report.pdf"
-        assert kind is copilot_ocr._MEDICAL_EXTRACTION
-        medical_started.set()
-        await text_started.wait()
-        await allow_medical_finish.wait()
-        yield copilot_ocr._ExtractionBatch(
-            batch_index=0,
-            start_page=0,
-            stop_page=1,
-            result={
-                "lab_date": None,
-                "source": None,
-                "measurements": [
-                    {
-                        "marker_name": "CRP",
-                        "value": 15,
-                        "unit": "mg/L",
-                        "reference_low": 0,
-                        "reference_high": 5,
-                        "measured_at": None,
-                        "page_number": 1,
-                    }
-                ],
-            },
-        )
-
-    async def fake_extract_text(
-        file_path: str,
-        *,
-        filename: str | None = None,
-        render_cache=None,
-    ):
-        assert file_path == "/tmp/report.pdf"
-        await medical_started.wait()
-        text_started.set()
-        return {"raw_text": "CRP 15 mg/L", "translated_text_english": "CRP 15 mg/L"}
-
-    with (
-        patch.object(copilot_ocr, "_extract_file_batches", side_effect=fake_extract_batches),
-        patch.object(copilot_ocr, "extract_text", side_effect=fake_extract_text),
-        patch.object(copilot_ocr, "generate_summary", new=AsyncMock(return_value=None)),
-    ):
-        task = asyncio.create_task(copilot_ocr.ocr_extract("/tmp/report.pdf"))
-        await _wait_for(lambda: text_started.is_set())
-        allow_medical_finish.set()
-        result = await task
-
-    assert result["raw_text"] == "CRP 15 mg/L"
-    assert result["translated_text_english"] == "CRP 15 mg/L"
-    assert [measurement["marker_name"] for measurement in result["measurements"]] == ["CRP"]
 
 
 @pytest.mark.asyncio

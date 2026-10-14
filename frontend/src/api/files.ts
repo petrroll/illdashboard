@@ -8,7 +8,7 @@ import {
   isShareExportMode,
   throwUnavailableInShareExport,
 } from "../export/runtime";
-import type { FilePatchPayload, LabFile, Measurement } from "../types";
+import type { FilePatchPayload, LabFile, LabFileSummary, Measurement } from "../types";
 
 export interface PageInfo {
   page_count: number;
@@ -27,11 +27,11 @@ function buildTagQueryParams(tags: string[]) {
   return params;
 }
 
-export async function fetchFiles(tags: string[] = []) {
+export async function fetchFiles(tags: string[] = []): Promise<LabFileSummary[]> {
   if (isShareExportMode()) {
     return getShareExportFiles(tags);
   }
-  const response = await apiClient.get<LabFile[]>("/files", {
+  const response = await apiClient.get<LabFileSummary[]>("/files", {
     params: buildTagQueryParams(tags),
   });
   return response.data;
