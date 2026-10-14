@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, create_autospec, patch
 
 import fitz
 import pytest
-from copilot import CopilotClient, CopilotSession
+from copilot import CopilotClient, CopilotSession, RemoteSessionMode
 from copilot.generated.rpc import PermissionDecisionReject
 
 from illdashboard.copilot import client as copilot_client
@@ -1144,9 +1144,10 @@ async def test_ask_adds_observed_premium_usage_cost():
 
 
 @pytest.mark.asyncio
-async def test_get_client_uses_empty_sdk_mode(monkeypatch):
+async def test_get_client_uses_empty_sdk_mode(monkeypatch, tmp_path):
     monkeypatch.setattr(copilot_client, "_client", None)
     monkeypatch.setattr(copilot_client, "_client_storage", None)
+    monkeypatch.setenv("COPILOT_HOME", str(tmp_path))
     with (
         patch.object(CopilotClient, "start", new_callable=AsyncMock) as start,
         patch.object(CopilotClient, "stop", new_callable=AsyncMock) as stop,
@@ -1167,9 +1168,32 @@ async def test_get_client_uses_empty_sdk_mode(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_failed_client_start_cleans_private_storage(monkeypatch):
+async def test_get_client_seeds_cli_login_without_token(monkeypatch, tmp_path):
     monkeypatch.setattr(copilot_client, "_client", None)
     monkeypatch.setattr(copilot_client, "_client_storage", None)
+    monkeypatch.setattr(copilot_client.settings, "GITHUB_TOKEN", "")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    cli_home = tmp_path / "cli-home"
+    cli_home.mkdir()
+    (cli_home / "config.json").write_text('{"authTokens": {}}')
+    monkeypatch.setenv("COPILOT_HOME", str(cli_home))
+    with (
+        patch.object(CopilotClient, "start", new_callable=AsyncMock),
+        patch.object(CopilotClient, "stop", new_callable=AsyncMock),
+    ):
+        try:
+            await copilot_client._get_client()
+            seeded = Path(copilot_client._client_storage.name) / "config.json"
+            assert seeded.read_text() == '{"authTokens": {}}'
+        finally:
+            await copilot_client.shutdown_client()
+
+
+@pytest.mark.asyncio
+async def test_failed_client_start_cleans_private_storage(monkeypatch, tmp_path):
+    monkeypatch.setattr(copilot_client, "_client", None)
+    monkeypatch.setattr(copilot_client, "_client_storage", None)
+    monkeypatch.setenv("COPILOT_HOME", str(tmp_path))
     with (
         patch.object(CopilotClient, "start", new=AsyncMock(side_effect=RuntimeError("startup failed"))),
         patch.object(CopilotClient, "stop", new_callable=AsyncMock) as stop,
@@ -1204,6 +1228,7 @@ async def test_ask_uses_sdk_contract_and_deletes_ephemeral_session():
     assert session_config["available_tools"] == []
     assert session_config["enable_skills"] is False
     assert session_config["enable_session_store"] is False
+    assert session_config["remote_session"] is RemoteSessionMode.OFF
     denied = session_config["on_permission_request"](None, None)
     assert isinstance(denied, PermissionDecisionReject)
     assert denied.kind == "reject"

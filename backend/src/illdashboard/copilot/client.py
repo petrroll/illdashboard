@@ -6,13 +6,15 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 import uuid
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from copilot import CopilotClient, PermissionRequest, PermissionRequestResult
+from copilot import CopilotClient, PermissionRequest, PermissionRequestResult, RemoteSessionMode
 from copilot.generated.rpc import PermissionDecisionReject
 from copilot.session import Attachment, PermissionInvocation, ReasoningEffort
 from copilot.session_events import SessionEventType
@@ -203,10 +205,19 @@ async def _get_client() -> CopilotClient:
         # runtime state private to this process, outside the user's Copilot home.
         storage = TemporaryDirectory(prefix="illdashboard-copilot-")
         client = None
+        seeded_cli_login = False
+        if not token:
+            # Empty mode disables keychain lookup and hides ~/.copilot, so copy only the
+            # CLI's login config (plaintext authTokens) into the private storage.
+            cli_config = Path(os.environ.get("COPILOT_HOME") or "~/.copilot").expanduser() / "config.json"
+            if cli_config.is_file():
+                shutil.copyfile(cli_config, Path(storage.name) / "config.json")
+                seeded_cli_login = True
         logger.info(
-            "Copilot client starting models=%s token_configured=%s",
+            "Copilot client starting models=%s token_configured=%s cli_login_seeded=%s",
             _configured_model_summary(),
             bool(token),
+            seeded_cli_login,
         )
         try:
             client = CopilotClient(
@@ -408,6 +419,8 @@ async def _ask(
                             "on_permission_request": deny_permission,
                             "enable_skills": False,
                             "enable_session_store": False,
+                            # Medical content must never be exported to or steered from GitHub.
+                            "remote_session": RemoteSessionMode.OFF,
                             "skill_directories": [],
                             "disabled_skills": ["*"],
                         }
