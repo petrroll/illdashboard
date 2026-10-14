@@ -2,19 +2,29 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import io
 import json
 import re
+import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from threading import Event
 from unittest.mock import AsyncMock, patch
+from zipfile import ZipFile
 
+import aiosqlite
 import pytest
 from fastapi.responses import Response
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import selectinload
 
 from illdashboard.config import settings
+from illdashboard.medications_models import Medication, MedicationsBase, TimelineEvent
 from illdashboard.models import (
+    Base,
     BiomarkerInsight,
     Job,
     LabFile,
@@ -34,6 +44,358 @@ from illdashboard.services import search as search_service
 from illdashboard.services.insights import marker_signature
 from illdashboard.services.markers import normalize_marker_alias_key
 from illdashboard.services.upload_metadata import original_name_sidecar_path
+
+
+@pytest.mark.parametrize(
+    ("method", "url", "payload"),
+    [
+        ("patch", "/api/measurements/123", {"canonical_value": 0.004, "marker_name": "ignored before"}),
+        ("patch", "/api/files/123", {"filename": "report", "unexpected": True}),
+        ("patch", "/api/markers/CRP", {"name": "CRP", "unexpected": True}),
+        ("put", "/api/files/123/tags", {"tags": [], "unexpected": True}),
+        ("post", "/api/files/ocr/batch", {"file_ids": [], "unexpected": True}),
+        ("post", "/api/explain", {"marker_name": "CRP", "unexpected": True}),
+        ("post", "/api/medications", {"name": "Test", "episodes": [
+            {"start_on": "2026-01", "still_taking": True, "dose": "1 mg", "id": 123},
+        ]}),
+        ("post", "/api/events", {"name": "Test", "occurrences": [{"start_on": "2026-01", "id": 123}]}),
+    ],
+)
+async def test_api_rejects_unknown_write_fields(client, method, url, payload):
+    response = await client.request(method, url, json=payload)
+    assert response.status_code == 422
+    assert any(error["type"] == "extra_forbidden" for error in response.json()["detail"])
+
+
+@pytest.mark.parametrize(
+    ("url", "payload"),
+    [
+        ("/api/files/123", {"lab_date": None, "reset_fields": ["lab_date"]}),
+        ("/api/measurements/123", {"canonical_value": 1, "reset_fields": ["canonical_value"]}),
+        ("/api/measurements/123", {"qualitative_expression": "true", "reset_fields": ["qualitative"]}),
+    ],
+)
+async def test_api_rejects_ambiguous_override_updates(client, url, payload):
+    response = await client.patch(url, json=payload)
+    assert response.status_code == 422
+    assert "Cannot update and reset" in response.text
+
+
+async def test_openapi_describes_operations_errors_and_strict_writes(client):
+    response = await client.get("/openapi.json")
+    assert response.status_code == 200
+    schema = response.json()
+    for path, methods in schema["paths"].items():
+        for method, operation in methods.items():
+            if method in {"get", "post", "put", "patch", "delete"}:
+                assert operation.get("description"), (path, method)
+    assert "409" in schema["paths"]["/api/files/{file_id}/ocr"]["post"]["responses"]
+    export_responses = schema["paths"]["/api/export/full"]["get"]["responses"]
+    assert "application/zip" in export_responses["200"]["content"]
+    assert export_responses["409"]["content"]["application/json"]["schema"]["$ref"].endswith("/ApiError")
+    for name in (
+        "MeasurementPatchRequest", "FilePatchRequest", "MedicationWrite", "MedicationEpisodeWrite",
+        "TimelineEventWrite", "TimelineEventOccurrenceWrite", "TagsUpdate", "BatchOcrRequest",
+        "MarkerPatchRequest", "ExplainRequest", "MultiExplainRequest",
+    ):
+        assert schema["components"]["schemas"][name]["additionalProperties"] is False
+
+
+@pytest.mark.parametrize("resource", ["medications", "events"])
+async def test_timeline_conditional_write_protects_child_edits_and_deletion(client, resource):
+    history_field = "episodes" if resource == "medications" else "occurrences"
+    child = {"start_on": "2026-01", "notes": "original"}
+    if resource == "medications":
+        child.update(still_taking=True, dose="1 mg")
+    payload = {"name": "Test", history_field: [child]}
+    created = (await client.post(f"/api/{resource}", json=payload)).json()
+    url = f"/api/{resource}/{created['id']}"
+    token = {"expected_updated_at": created["updated_at"]}
+    child["notes"] = "newer history, same parent name"
+    response = await client.put(url, json=payload, params=token)
+    assert response.status_code == 200
+    updated = response.json()
+    assert updated["updated_at"] != created["updated_at"]
+    child["notes"] = "stale replacement"
+    assert (await client.put(url, json=payload, params=token)).status_code == 409
+    assert (await client.delete(url, params=token)).status_code == 409
+    current = (await client.get(url)).json()
+    assert current[history_field][0]["notes"] == "newer history, same parent name"
+    updated_at = datetime.fromisoformat(updated["updated_at"]).replace(tzinfo=UTC)
+    assert datetime.fromisoformat(current["updated_at"]).replace(tzinfo=UTC) == updated_at
+    latest_token = {"expected_updated_at": updated_at.isoformat()}
+    assert (await client.delete(url, params=latest_token)).status_code == 200
+    assert (await client.get(url)).status_code == 404
+
+
+@pytest.mark.parametrize("resource", ["medications", "events"])
+async def test_timeline_concurrent_conditional_replacements_have_one_winner(client, resource):
+    history_field = "episodes" if resource == "medications" else "occurrences"
+    child = {"start_on": "2026-01"}
+    if resource == "medications":
+        child.update(still_taking=True, dose="1 mg")
+    payload = {"name": "Test", history_field: [child]}
+    created = (await client.post(f"/api/{resource}", json=payload)).json()
+    url = f"/api/{resource}/{created['id']}"
+    token = {"expected_updated_at": created["updated_at"]}
+    results = await asyncio.gather(
+        client.put(url, json={**payload, "name": "First"}, params=token),
+        client.put(url, json={**payload, "name": "Second"}, params=token),
+    )
+    assert sorted(response.status_code for response in results) == [200, 409]
+    winner = next(response.json() for response in results if response.status_code == 200)
+    assert (await client.get(url)).json()["name"] == winner["name"]
+
+
+@pytest.mark.parametrize("resource", ["medications", "events"])
+async def test_timeline_revision_advances_even_when_clock_is_frozen(client, monkeypatch, resource):
+    history_field = "episodes" if resource == "medications" else "occurrences"
+    child = {"start_on": "2026-01"}
+    if resource == "medications":
+        child.update(still_taking=True, dose="1 mg")
+    payload = {"name": "Original", history_field: [child]}
+    created = (await client.post(f"/api/{resource}", json=payload)).json()
+    previous = datetime.fromisoformat(created["updated_at"]).replace(tzinfo=UTC)
+    model = Medication if resource == "medications" else TimelineEvent
+    monkeypatch.setattr(model.__table__.c.updated_at.onupdate, "arg", lambda _context: previous)
+    monkeypatch.setattr("illdashboard.api.preconditions.utc_now", lambda: previous)
+    url = f"/api/{resource}/{created['id']}"
+    token = {"expected_updated_at": created["updated_at"]}
+    response = await client.put(url, json={**payload, "name": "Renamed"}, params=token)
+    assert response.status_code == 200
+    assert datetime.fromisoformat(response.json()["updated_at"]).replace(tzinfo=UTC) > previous
+    assert (await client.put(url, json=payload, params=token)).status_code == 409
+
+
+@pytest.mark.parametrize("resource", ["medications", "events"])
+async def test_timeline_unconditional_replace_reloads_history_after_claim(client, monkeypatch, resource):
+    from illdashboard.api import events, medications
+
+    history_field = "episodes" if resource == "medications" else "occurrences"
+    child = {"start_on": "2026-01", "notes": "original"}
+    if resource == "medications":
+        child.update(still_taking=True, dose="1 mg")
+    payload = {"name": "Original", history_field: [child]}
+    created = (await client.post(f"/api/{resource}", json=payload)).json()
+    url = f"/api/{resource}/{created['id']}"
+    module = medications if resource == "medications" else events
+    getter_name = "get_medication_or_404" if resource == "medications" else "get_event_or_404"
+    original_getter = getattr(module, getter_name)
+    first_read = asyncio.Event()
+    release = asyncio.Event()
+
+    async def pause_first_read(*args, **kwargs):
+        record = await original_getter(*args, **kwargs)
+        if not first_read.is_set():
+            first_read.set()
+            await release.wait()
+        return record
+
+    monkeypatch.setattr(module, getter_name, pause_first_read)
+    pending = asyncio.create_task(client.put(url, json=payload))
+    try:
+        await asyncio.wait_for(first_read.wait(), timeout=5)
+        intervening = await client.put(url, json={**payload, history_field: [{**child, "notes": "intervening"}]})
+        assert intervening.status_code == 200
+    finally:
+        release.set()
+    assert (await asyncio.wait_for(pending, timeout=5)).status_code == 200
+    current = (await client.get(url)).json()
+    assert [entry["notes"] for entry in current[history_field]] == ["original"]
+
+
+async def test_full_export_preserves_databases_originals_and_all_records(client, session_factory, tmp_path):
+    original = b"# Original report\nCRP: 0.004 mg/L\n"
+    upload = await client.post("/api/files/upload", files={"file": ("report.md", original, "text/markdown")})
+    file_id = upload.json()["id"]
+    async with session_factory() as session:
+        await session.execute(text("PRAGMA journal_mode=WAL"))
+        lab = await session.get(LabFile, file_id)
+        lab.ocr_raw = '{"private": "raw extraction"}'
+        lab.ocr_summary_english = "Stored summary"
+        session.add(Measurement(
+            lab_file_id=file_id, raw_marker_name="CRP", normalized_marker_key="crp",
+            original_value=4, user_canonical_value=0.004, user_canonical_value_override=True,
+            normalization_status="pending",
+        ))
+        await session.commit()
+    medication = await client.post("/api/medications", json={
+        "name": "Test medication", "episodes": [{"start_on": "2026-01", "still_taking": True, "dose": "1 mg"}],
+    })
+    event = await client.post("/api/events", json={
+        "name": "Test event", "occurrences": [{"start_on": "2026-01-02"}],
+    })
+    assert medication.status_code == event.status_code == 201
+    temporary_paths = []
+
+    def create_directory(**kwargs):
+        directory = TemporaryDirectory(dir=tmp_path, **kwargs)
+        temporary_paths.append(Path(directory.name))
+        return directory
+
+    with patch("illdashboard.api.export.TemporaryDirectory", side_effect=create_directory):
+        response = await client.get("/api/export/full")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    assert response.headers["cache-control"] == "no-store"
+    assert "attachment" in response.headers["content-disposition"]
+    assert all(not path.exists() for path in temporary_paths)
+    with ZipFile(io.BytesIO(response.content)) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        records = json.loads(archive.read("data.json"))
+        assert manifest["format"] == "illdashboard-full-export"
+        assert manifest["version"] == 1
+        assert set(records["main"]) == set(Base.metadata.tables)
+        assert set(records["medications"]) == set(MedicationsBase.metadata.tables)
+        assert records["main"]["lab_files"][0]["ocr_summary_english"] == "Stored summary"
+        assert records["main"]["lab_files"][0]["ocr_raw"] == '{"private": "raw extraction"}'
+        measurement = records["main"]["measurements"][0]
+        assert measurement["normalization_status"] == "pending"
+        assert measurement["original_value"] == 4
+        assert measurement["user_canonical_value"] == 0.004
+        assert measurement["user_canonical_value_override"] == 1
+        assert len(records["medications"]["medication_episodes"]) == 1
+        assert len(records["medications"]["timeline_event_occurrences"]) == 1
+        entry = manifest["files"][0]
+        assert entry["file_id"] == file_id
+        assert entry["size_bytes"] == len(original)
+        assert entry["sha256"] == hashlib.sha256(original).hexdigest()
+        assert archive.read(entry["archive_path"]) == original
+        assert archive.read(entry["name_sidecar_path"]) == b"report.md"
+        for name, member in manifest["databases"].items():
+            snapshot_path = tmp_path / f"{name}.sqlite"
+            snapshot_path.write_bytes(archive.read(member))
+            with closing(sqlite3.connect(snapshot_path)) as snapshot:
+                assert snapshot.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+                assert snapshot.execute("PRAGMA foreign_key_check").fetchall() == []
+                if name == "main":
+                    assert snapshot.execute("SELECT user_canonical_value FROM measurements").fetchone() == (0.004,)
+
+
+@pytest.mark.parametrize("missing_original", [False, True])
+async def test_full_export_empty_database_and_missing_original(client, tmp_path, missing_original):
+    if missing_original:
+        upload = await client.post("/api/files/upload", files={"file": ("report.md", b"original", "text/markdown")})
+        Path(upload.json()["filepath"]).unlink()
+    temporary_paths = []
+
+    def create_directory(**kwargs):
+        directory = TemporaryDirectory(dir=tmp_path, **kwargs)
+        temporary_paths.append(Path(directory.name))
+        return directory
+
+    with patch("illdashboard.api.export.TemporaryDirectory", side_effect=create_directory):
+        response = await client.get("/api/export/full")
+    assert response.status_code == (409 if missing_original else 200)
+    assert all(not path.exists() for path in temporary_paths)
+    if missing_original:
+        assert "missing or unreadable" in response.json()["detail"]
+    else:
+        with ZipFile(io.BytesIO(response.content)) as archive:
+            assert json.loads(archive.read("manifest.json"))["files"] == []
+            assert json.loads(archive.read("data.json"))["main"]["measurements"] == []
+
+
+async def test_full_export_cancelled_snapshot_finishes_before_cleanup(
+    session_factory, medications_session_factory, tmp_path,
+):
+    from illdashboard.api.export import export_full
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+    original_backup = aiosqlite.Connection.backup
+    temporary_paths = []
+
+    def create_directory(**kwargs):
+        directory = TemporaryDirectory(dir=tmp_path, **kwargs)
+        temporary_paths.append(Path(directory.name))
+        return directory
+
+    async def paused_backup(connection, target, **kwargs):
+        started.set()
+        await release.wait()
+        await original_backup(connection, target, **kwargs)
+        completed.set()
+
+    async with session_factory() as db, medications_session_factory() as medications_db:
+        with (
+            patch("illdashboard.api.export.TemporaryDirectory", side_effect=create_directory),
+            patch.object(aiosqlite.Connection, "backup", new=paused_backup),
+        ):
+            task = asyncio.create_task(export_full(db=db, medications_db=medications_db))
+            await asyncio.wait_for(started.wait(), timeout=5)
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+    assert completed.is_set()
+    assert all(not path.exists() for path in temporary_paths)
+
+
+async def test_full_export_cancelled_archive_finishes_before_cleanup(
+    session_factory, medications_session_factory, tmp_path,
+):
+    from illdashboard.api.export import _write_full_archive, export_full
+
+    started = Event()
+    release = Event()
+    completed = Event()
+    temporary_paths = []
+
+    def create_directory(**kwargs):
+        directory = TemporaryDirectory(dir=tmp_path, **kwargs)
+        temporary_paths.append(Path(directory.name))
+        return directory
+
+    def paused_archive(directory, exported_at):
+        started.set()
+        assert release.wait(timeout=5)
+        result = _write_full_archive(directory, exported_at)
+        completed.set()
+        return result
+
+    async with session_factory() as db, medications_session_factory() as medications_db:
+        with (
+            patch("illdashboard.api.export.TemporaryDirectory", side_effect=create_directory),
+            patch("illdashboard.api.export._write_full_archive", side_effect=paused_archive),
+        ):
+            task = asyncio.create_task(export_full(db=db, medications_db=medications_db))
+            try:
+                assert await asyncio.to_thread(started.wait, 5)
+                task.cancel()
+                await asyncio.sleep(0)
+                task.cancel()
+                await asyncio.sleep(0)
+            finally:
+                release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+    assert completed.is_set()
+    assert all(not path.exists() for path in temporary_paths)
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_full_export_failed_download_cleans_up(session_factory, medications_session_factory, tmp_path, failure):
+    from illdashboard.api.export import export_full
+
+    directory = TemporaryDirectory(dir=tmp_path)
+    async with session_factory() as db, medications_session_factory() as medications_db:
+        with patch("illdashboard.api.export.TemporaryDirectory", return_value=directory):
+            response = await export_full(db=db, medications_db=medications_db)
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        raise failure("simulated failed download")
+
+    with pytest.raises(failure):
+        await response({"type": "http", "method": "GET", "headers": []}, receive, send)
+    assert not Path(directory.name).exists()
 
 
 async def _wait_for_file_complete(session_factory, file_id: int, *, timeout_seconds: float = 10.0) -> LabFile:

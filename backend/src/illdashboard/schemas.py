@@ -222,7 +222,15 @@ class MarkerInsightResponse(BaseModel):
     explanation_cached: bool
 
 
-class ExplainRequest(BaseModel):
+class ApiRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+
+class ApiError(BaseModel):
+    detail: str
+
+
+class ExplainRequest(ApiRequest):
     marker_name: str
     value: float | None = None
     qualitative_value: str | None = None
@@ -231,13 +239,15 @@ class ExplainRequest(BaseModel):
     reference_high: float | None = None
 
 
-class MultiExplainRequest(BaseModel):
+class MultiExplainRequest(ApiRequest):
     measurements: list[ExplainRequest]
 
 
-class BatchOcrRequest(BaseModel):
-    file_ids: list[int]
-    discard_user_edits: bool = False
+class BatchOcrRequest(ApiRequest):
+    file_ids: list[int] = Field(description="IDs to reprocess; duplicate IDs are processed once.")
+    discard_user_edits: bool = Field(
+        default=False, description="Explicitly permit deleting manual measurement edits during reprocessing."
+    )
 
 
 class QueueFilesResponse(BaseModel):
@@ -291,7 +301,7 @@ def parse_qualitative_expression(value: str | None) -> tuple[str | None, bool | 
     return (normalized or None, None)
 
 
-class MedicationEpisodeWrite(BaseModel):
+class MedicationEpisodeWrite(ApiRequest):
     start_on: str = Field(description=EPISODE_DATE_FORMAT_HINT)
     end_on: str | None = Field(default=None, description=EPISODE_DATE_FORMAT_HINT)
     still_taking: bool = False
@@ -341,9 +351,11 @@ class MedicationEpisodeWrite(BaseModel):
         return self
 
 
-class MedicationWrite(BaseModel):
+class MedicationWrite(ApiRequest):
     name: str
-    episodes: list[MedicationEpisodeWrite] = Field(min_length=1)
+    episodes: list[MedicationEpisodeWrite] = Field(
+        min_length=1, description="Complete replacement history, not an append. Omitted existing episodes are deleted."
+    )
 
     @field_validator("name", mode="before")
     @classmethod
@@ -370,10 +382,12 @@ class MedicationOut(BaseModel):
     name: str
     episodes: list[MedicationEpisodeOut] = Field(default_factory=list)
     created_at: datetime
-    updated_at: datetime
+    updated_at: datetime = Field(
+        description="UTC revision; send as expected_updated_at on PUT/DELETE for conflict checks."
+    )
 
 
-class TimelineEventOccurrenceWrite(BaseModel):
+class TimelineEventOccurrenceWrite(ApiRequest):
     start_on: str = Field(description=EPISODE_DATE_FORMAT_HINT)
     end_on: str | None = Field(default=None, description=EPISODE_DATE_FORMAT_HINT)
     is_ongoing: bool = False
@@ -409,9 +423,11 @@ class TimelineEventOccurrenceWrite(BaseModel):
         return self
 
 
-class TimelineEventWrite(BaseModel):
+class TimelineEventWrite(ApiRequest):
     name: str
-    occurrences: list[TimelineEventOccurrenceWrite] = Field(min_length=1)
+    occurrences: list[TimelineEventOccurrenceWrite] = Field(
+        min_length=1, description="Complete replacement history. Omitted existing occurrences are deleted."
+    )
 
     @field_validator("name", mode="before")
     @classmethod
@@ -436,17 +452,24 @@ class TimelineEventOut(BaseModel):
     name: str
     occurrences: list[TimelineEventOccurrenceOut] = Field(default_factory=list)
     created_at: datetime
-    updated_at: datetime
+    updated_at: datetime = Field(
+        description="UTC revision; send as expected_updated_at on PUT/DELETE for conflict checks."
+    )
 
 
-class TagsUpdate(BaseModel):
-    tags: list[str]
+class TagsUpdate(ApiRequest):
+    tags: list[str] = Field(
+        description="Replace all editable tags; an empty list removes them. Derived tags may remain."
+    )
 
 
-class FilePatchRequest(BaseModel):
+class FilePatchRequest(ApiRequest):
     filename: str | None = None
-    lab_date: datetime | None = None
-    reset_fields: list[Literal["lab_date"]] = Field(default_factory=list)
+    lab_date: datetime | None = Field(default=None, description="Override the report date; null explicitly clears it.")
+    reset_fields: list[Literal["lab_date"]] = Field(
+        default_factory=list,
+        description="Remove overrides and use extracted values again; cannot also set these fields.",
+    )
 
     @field_validator("filename", mode="before")
     @classmethod
@@ -460,6 +483,8 @@ class FilePatchRequest(BaseModel):
         changed_fields = set(self.model_fields_set) - {"reset_fields"}
         if not changed_fields and not self.reset_fields:
             raise ValueError("Provide at least one field to update or reset.")
+        if changed_fields.intersection(self.reset_fields):
+            raise ValueError("Cannot update and reset the same field.")
         return self
 
 
@@ -474,15 +499,22 @@ MeasurementResetField = Literal[
 ]
 
 
-class MeasurementPatchRequest(BaseModel):
-    canonical_value: float | None = None
-    canonical_unit: str | None = None
+class MeasurementPatchRequest(ApiRequest):
+    canonical_value: float | None = Field(default=None, description="Override the numeric value; null clears it.")
+    canonical_unit: str | None = Field(
+        default=None, description="Override this result's unit label only; does not convert its numeric value."
+    )
     original_unit: str | None = None
     canonical_reference_low: float | None = None
     canonical_reference_high: float | None = None
     measured_at: datetime | None = None
-    qualitative_expression: str | None = None
-    reset_fields: list[MeasurementResetField] = Field(default_factory=list)
+    qualitative_expression: str | None = Field(
+        default=None,
+        description="Text, true/false, or true('label')/false('label'); null clears the qualitative override value.",
+    )
+    reset_fields: list[MeasurementResetField] = Field(
+        default_factory=list, description="Remove overrides; use 'qualitative' to reset both qualitative fields."
+    )
 
     @field_validator("canonical_unit", "original_unit", "qualitative_expression", mode="before")
     @classmethod
@@ -494,12 +526,18 @@ class MeasurementPatchRequest(BaseModel):
         changed_fields = set(self.model_fields_set) - {"reset_fields"}
         if not changed_fields and not self.reset_fields:
             raise ValueError("Provide at least one field to update or reset.")
+        reset_targets = {"qualitative" if field == "qualitative_expression" else field for field in changed_fields}
+        if reset_targets.intersection(self.reset_fields):
+            raise ValueError("Cannot update and reset the same field.")
         return self
 
 
-class MarkerPatchRequest(BaseModel):
+class MarkerPatchRequest(ApiRequest):
     name: str | None = None
-    canonical_unit: str | None = None
+    canonical_unit: str | None = Field(
+        default=None,
+        description="Change the marker-wide unit and recalculate resolved history using known conversions.",
+    )
 
     @field_validator("name", mode="before")
     @classmethod

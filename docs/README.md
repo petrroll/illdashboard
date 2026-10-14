@@ -4,6 +4,7 @@ This directory tracks the current architecture plus one historical pipeline refe
 
 ## Read these first
 
+- [`agent-api.md`](./agent-api.md) - HTTP workflows, full exports, strict request contracts, and conditional timeline writes
 - [`artifact-first-pipeline.md`](./artifact-first-pipeline.md) — the current source of truth for the live pipeline, worker topology, and derived progress model
 - [`legacy-queue-backed-ocr-request-flow.md`](./legacy-queue-backed-ocr-request-flow.md) — the pre-artifact-first reconcile/publish design, kept only as historical background
 
@@ -15,6 +16,7 @@ This directory tracks the current architecture plus one historical pipeline refe
 - **Pipeline tasks:** `ensure.file`, `ensure.measurement-extraction`, `ensure.text`, `extract.measurements`, `extract.text`, `assemble.text`, `process.measurements`, `generate.summary`, `refresh.search`, `canonize.*`, and `review.anomalous-rescaling`
 - **Search surface:** complete files only, indexed across filename, tags, summaries, OCR text, and measurement text
 - **Share export:** a read-only HTML snapshot that bundles sanitized file data, previews, OCR text, measurement views, biomarker pages, and search documents; uploads, reprocessing, admin actions, and generated summaries stay disabled there
+- **Full export:** `GET /api/export/full` downloads both SQLite snapshots, raw JSON records, and exact tracked originals without requiring the frontend build or AI calls
 - **Build dependency:** run `just build` or `just build-frontend` before using `/api/export/share-html`, because the endpoint serves the built share-export shell from `frontend/dist`
 
 ## Learned canonical artifacts

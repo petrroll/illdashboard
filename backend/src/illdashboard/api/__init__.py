@@ -11,8 +11,13 @@ from illdashboard.api.measurements import router as measurements_router
 from illdashboard.api.medications import router as medications_router
 from illdashboard.api.search import router as search_router
 from illdashboard.api.tags import router as tags_router
+from illdashboard.schemas import ApiError
 
-router = APIRouter()
+router = APIRouter(responses={
+	400: {"model": ApiError, "description": "Invalid operation or unsupported input."},
+	404: {"model": ApiError, "description": "The requested resource does not exist."},
+	409: {"model": ApiError, "description": "Conflicting state; inspect detail before retrying or discarding edits."},
+})
 router.include_router(events_router)
 router.include_router(files_router)
 router.include_router(medications_router)

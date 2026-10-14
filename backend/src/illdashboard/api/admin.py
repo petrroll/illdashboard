@@ -29,22 +29,26 @@ def _session_engine(db: AsyncSession) -> AsyncEngine:
 
 @router.get("/admin/stats", tags=["admin"])
 async def get_stats():
+    """Read process-local premium request usage, not a billing statement or persistent audit log."""
     return {"premium_requests_used": get_premium_requests_used()}
 
 
 @router.get("/admin/rescaling-rules", response_model=list[RescalingRuleOut], tags=["admin"])
 async def get_rescaling_rules(db: AsyncSession = Depends(get_db)):
+    """Read learned unit-conversion rules and scale factors without generating new ones."""
     return await admin_service.list_rescaling_rules(db)
 
 
 @router.delete("/admin/cache/explanations", tags=["admin"])
 async def purge_explanation_cache(db: AsyncSession = Depends(get_db)):
+    """Delete cached biomarker insights; later generation requests can incur new AI costs."""
     deleted = await admin_service.purge_explanation_cache(db)
     return {"deleted_explanations": deleted}
 
 
 @router.delete("/admin/cache/all", tags=["admin"])
 async def purge_all_caches(db: AsyncSession = Depends(get_db)):
+    """Delete insight and sparkline caches, not original files or measurements."""
     explanation_count = await admin_service.purge_explanation_cache(db)
     sparkline_count = admin_service.purge_sparkline_cache()
     return {"deleted_explanations": explanation_count, "deleted_sparklines": sparkline_count}
@@ -52,5 +56,10 @@ async def purge_all_caches(db: AsyncSession = Depends(get_db)):
 
 @router.delete("/admin/database", tags=["admin"])
 async def drop_database(db: AsyncSession = Depends(get_db)):
+    """Destructively reset both lab and medication/event databases and stop/restart workers.
+
+    Original uploaded files remain and are re-registered, but extracted results,
+    manual edits, tags, medications, and events are lost. Export a full backup first.
+    """
     sparkline_count = await admin_service.reset_database(_session_engine(db))
     return {"status": "database_reset", "deleted_sparklines": sparkline_count}

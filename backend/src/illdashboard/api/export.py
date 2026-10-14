@@ -2,22 +2,34 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import hashlib
+import json
+import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from urllib.parse import quote
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import fitz
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.types import Receive, Scope, Send
 
 import illdashboard.api.files as files_api
 import illdashboard.api.measurements as measurements_api
 import illdashboard.api.tags as tags_api
 from illdashboard.config import settings
 from illdashboard.database import get_db
+from illdashboard.medications_database import get_medications_db
+from illdashboard.medications_models import MedicationsBase
+from illdashboard.models import Base
 from illdashboard.schemas import (
+    ApiError,
     LabFileOut,
     MarkerDetailResponse,
     MeasurementOut,
@@ -27,6 +39,7 @@ from illdashboard.schemas import (
 )
 from illdashboard.services import file_types
 from illdashboard.services import search as search_service
+from illdashboard.services.upload_metadata import original_name_sidecar_path
 
 router = APIRouter(prefix="")
 
@@ -35,6 +48,153 @@ EXPORT_SHELL_FILENAME = "share-export-shell.html"
 EXPORT_PREVIEW_DPI = 96
 EXPORT_PREVIEW_MAX_EDGE_PX = 1400
 EXPORT_PREVIEW_JPEG_QUALITY = 70
+
+
+class FullExportResponse(FileResponse):
+    """Keep the private archive alive through sending, and clean it even if sending fails."""
+
+    def __init__(self, archive: Path, directory: TemporaryDirectory, filename: str):
+        self.directory = directory
+        super().__init__(
+            archive, media_type="application/zip", filename=filename, headers={"Cache-Control": "no-store"}
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.directory.cleanup()
+
+
+async def _finish_export_task(task: asyncio.Task) -> None:
+    """Drain uncancellable worker work before releasing files, even after repeated cancellation."""
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            break
+    if not task.cancelled():
+        task.exception()
+
+
+async def _backup_database(db: AsyncSession, destination: Path) -> None:
+    connection = await db.connection()
+    if connection.dialect.name != "sqlite":
+        raise HTTPException(501, "Full export requires SQLite databases.")
+    raw_connection = await connection.get_raw_connection()
+    # SQLite's backup API includes committed WAL pages; copying the .db file alone does not.
+    with closing(sqlite3.connect(destination)) as snapshot:
+        backup_task = asyncio.create_task(raw_connection.driver_connection.backup(snapshot, pages=-1))
+        try:
+            await asyncio.shield(backup_task)
+        except asyncio.CancelledError:
+            # The SQLite worker must finish before its destination connection is closed.
+            await _finish_export_task(backup_task)
+            raise
+
+
+def _write_full_archive(directory: Path, exported_at: str) -> Path:
+    records = {}
+    for name, metadata in (("main", Base.metadata), ("medications", MedicationsBase.metadata)):
+        with closing(sqlite3.connect(directory / f"{name}.sqlite")) as snapshot:
+            snapshot.row_factory = sqlite3.Row
+            records[name] = {
+                table.name: [dict(row) for row in snapshot.execute(f'SELECT * FROM "{table.name}"')]
+                for table in metadata.sorted_tables
+            }
+
+    archive_path = directory / "full-export.zip"
+    files = []
+    with ZipFile(archive_path, "w", compression=ZIP_DEFLATED) as archive:
+        for name in records:
+            archive.write(directory / f"{name}.sqlite", f"databases/{name}.sqlite")
+        archive.writestr("data.json", json.dumps(records, ensure_ascii=False, allow_nan=False))
+        for lab_file in records["main"]["lab_files"]:
+            source = Path(lab_file["filepath"])
+            member_name = f"uploads/{lab_file['id']}/original{source.suffix}"
+            digest = hashlib.sha256()
+            size = 0
+            try:
+                with source.open("rb") as original, archive.open(member_name, "w", force_zip64=True) as member:
+                    while chunk := original.read(1024 * 1024):
+                        digest.update(chunk)
+                        size += len(chunk)
+                        member.write(chunk)
+                sidecar = original_name_sidecar_path(source)
+                sidecar_member = None
+                if sidecar.exists():
+                    sidecar_member = f"uploads/{lab_file['id']}/original-name.txt"
+                    archive.write(sidecar, sidecar_member)
+            except OSError as exc:
+                raise HTTPException(
+                    409, f"Original document or name sidecar for file {lab_file['id']} is missing or unreadable."
+                ) from exc
+            files.append({
+                "file_id": lab_file["id"],
+                "filename": lab_file["filename"],
+                "archive_path": member_name,
+                "name_sidecar_path": sidecar_member,
+                "size_bytes": size,
+                "sha256": digest.hexdigest(),
+            })
+        archive.writestr("manifest.json", json.dumps({
+            "format": "illdashboard-full-export",
+            "version": 1,
+            "exported_at": exported_at,
+            "databases": {name: f"databases/{name}.sqlite" for name in records},
+            "records": "data.json",
+            "files": files,
+        }, ensure_ascii=False))
+    return archive_path
+
+
+@router.get(
+    "/export/full", response_class=FileResponse, tags=["export"],
+    responses={
+        200: {"content": {"application/zip": {"schema": {"type": "string", "format": "binary"}}}},
+        409: {"model": ApiError, "description": "A tracked original or its sidecar is missing or unreadable."},
+        501: {"model": ApiError, "description": "The configured database backend is not SQLite."},
+    },
+)
+async def export_full(
+    db: AsyncSession = Depends(get_db),
+    medications_db: AsyncSession = Depends(get_medications_db),
+):
+    """Download a full ZIP backup: both SQLite databases, JSON records, and tracked original documents.
+
+    Includes unresolved results, extraction artifacts, overrides, tags, rules,
+    summaries/insights, jobs, medications, and events. Contains sensitive health
+    data. No AI, frontend build, or writes to application data are required.
+
+    Each database is snapshotted consistently, including committed WAL content;
+    the pair is not a cross-database atomic snapshot. Avoid concurrent edits for
+    a stable whole-application backup. Missing originals fail with 409, not a
+    partial archive. Excludes credentials/configuration, logs, untracked upload
+    files, and regenerable filesystem caches. Original database paths are retained;
+    restoring elsewhere requires offline path remapping. There is no restore API.
+    """
+    directory = TemporaryDirectory(prefix="illdashboard-export-")
+    archive_task = None
+    try:
+        root = Path(directory.name)
+        await _backup_database(db, root / "main.sqlite")
+        await _backup_database(medications_db, root / "medications.sqlite")
+        exported_at = datetime.now(UTC)
+        archive_task = asyncio.create_task(asyncio.to_thread(_write_full_archive, root, exported_at.isoformat()))
+        archive = await asyncio.shield(archive_task)
+        return FullExportResponse(
+            archive,
+            directory,
+            filename=f"illdashboard-full-{exported_at.strftime('%Y-%m-%d')}.zip",
+        )
+    except BaseException:
+        # A cancelled request must not remove files while the archive thread still writes them.
+        if archive_task is not None:
+            await _finish_export_task(archive_task)
+        directory.cleanup()
+        raise
 
 
 def _encode_data_url(content: bytes, mime_type: str) -> str:
@@ -175,6 +335,12 @@ async def build_share_export_bundle(db: AsyncSession) -> ShareExportBundle:
 
 @router.get("/export/share-html", tags=["export"])
 async def export_share_html(db: AsyncSession = Depends(get_db)):
+    """Download a reduced read-only HTML snapshot with display-quality previews.
+
+    Omits original binaries, raw extraction JSON, generated summaries/insights,
+    unresolved data, and the medication/event database. This is not a full backup.
+    Requires the built frontend share-export shell; missing builds return 503.
+    """
     bundle = await build_share_export_bundle(db)
     shell_html = get_share_export_shell_html()
     if EXPORT_BUNDLE_PLACEHOLDER not in shell_html:

@@ -182,6 +182,11 @@ async def list_measurements(
     marker_name: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
+    """List resolved measurements in effective date order, optionally by exact marker name.
+
+    Returns effective edited values with original values and override field names.
+    Unresolved extraction rows are omitted. No pagination or date-range filter.
+    """
     query = (
         select(Measurement)
         .join(Measurement.measurement_type)
@@ -206,6 +211,13 @@ async def list_measurements(
 
 @router.patch("/measurements/{measurement_id}", response_model=MeasurementOut, tags=["measurements"])
 async def update_measurement(measurement_id: int, body: MeasurementPatchRequest, db: AsyncSession = Depends(get_db)):
+    """Patch supplied fields as manual overrides without changing extraction originals.
+
+    Null explicitly clears a value; reset_fields removes the override and restores
+    the extracted value. Use 'qualitative' to reset qualitative text and boolean.
+    Unit edits here change labels only, not numeric values. Marker identity cannot
+    be changed here. Unknown fields and simultaneous set/reset operations are 422.
+    """
     measurement = await get_measurement_or_404(measurement_id, db)
 
     reset_fields = set(body.reset_fields)
@@ -292,6 +304,10 @@ async def measurement_overview(
     tags: list[str] | None = Query(None, description="Filter markers having ALL of these tags"),
     db: AsyncSession = Depends(get_db),
 ):
+    """Read resolved marker summaries grouped by category, with latest results and trends.
+
+    Repeated tags require all tags, including derived marker/file tags. No AI is run.
+    """
     result = await db.execute(
         select(Measurement)
         .join(Measurement.measurement_type)
@@ -360,6 +376,12 @@ async def measurement_overview(
 
 @router.patch("/markers/{marker_name:path}", response_model=MarkerDetailResponse, tags=["measurements"])
 async def update_marker(marker_name: str, body: MarkerPatchRequest, db: AsyncSession = Depends(get_db)):
+    """Rename a marker or change its canonical unit across its resolved history.
+
+    Unlike a measurement unit-label edit, changing this unit recalculates values
+    using known conversions. Renaming retains the old name as an alias; a name
+    collision returns 409. Cached insights are invalidated. URL-encode the name.
+    """
     measurement_type = await marker_service.get_measurement_type_by_name(db, marker_name)
     if measurement_type is None:
         raise HTTPException(404, "Marker not found")
@@ -415,6 +437,7 @@ async def update_marker(marker_name: str, body: MarkerPatchRequest, db: AsyncSes
 
 @router.get("/measurements/markers", response_model=list[str], tags=["measurements"])
 async def list_marker_names(db: AsyncSession = Depends(get_db)):
+    """List canonical marker names with at least one resolved measurement, sorted alphabetically."""
     result = await db.execute(
         select(MeasurementType.name)
         .join(MeasurementType.measurements)
@@ -430,6 +453,10 @@ async def measurement_detail(
     marker_name: str = Query(...),
     db: AsyncSession = Depends(get_db),
 ):
+    """Read resolved history, tags, and an existing cached insight; never generate AI content.
+
+    Accepts canonical names or known aliases. Returns 404 if no resolved history exists.
+    """
     measurement_type = await marker_service.get_measurement_type_by_name(db, marker_name)
     if measurement_type is None:
         raise HTTPException(404, "Marker not found")
@@ -476,6 +503,10 @@ async def measurement_insight(
     marker_name: str = Query(...),
     db: AsyncSession = Depends(get_db),
 ):
+    """Return a cached insight or generate and cache one, potentially incurring AI costs.
+
+    For read-only access to an existing insight, use GET /api/measurements/detail.
+    """
     measurement_type = await marker_service.get_measurement_type_by_name(db, marker_name)
     if measurement_type is None:
         raise HTTPException(404, "Marker not found")
@@ -504,6 +535,7 @@ async def measurement_insight(
 
 @router.get("/files/{file_id}/measurements", response_model=list[MeasurementOut], tags=["measurements"])
 async def file_measurements(file_id: int, db: AsyncSession = Depends(get_db)):
+    """List this file's resolved measurements with effective overrides; missing files return 404."""
     file = await db.get(LabFile, file_id)
     if file is None:
         raise HTTPException(404, "File not found")
@@ -531,6 +563,7 @@ async def measurement_sparkline(
     marker_name: str = Query(...),
     db: AsyncSession = Depends(get_db),
 ):
+    """Render a marker's numeric history as a PNG sparkline without AI generation."""
     measurements = [
         measurement
         for measurement in await marker_service.load_measurements_for_marker(db, marker_name)

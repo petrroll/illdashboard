@@ -20,12 +20,14 @@ VISIBLE_MEASUREMENT_STATUS = "resolved"
 
 @router.get("/tags/files", response_model=list[str], tags=["tags"])
 async def list_file_tags(db: AsyncSession = Depends(get_db)):
+    """List distinct file tags in alphabetical order."""
     result = await db.execute(select(LabFileTag.tag).distinct().order_by(LabFileTag.tag))
     return result.scalars().all()
 
 
 @router.get("/tags/markers", response_model=list[str], tags=["tags"])
 async def list_marker_tags(db: AsyncSession = Depends(get_db)):
+    """List tags for visible markers, including derived group/status tags and file tags."""
     result = await db.execute(
         select(Measurement)
         .join(Measurement.measurement_type)
@@ -61,6 +63,10 @@ async def list_marker_tags(db: AsyncSession = Depends(get_db)):
 
 @router.put("/files/{file_id}/tags", response_model=list[str], tags=["tags"])
 async def set_file_tags(file_id: int, body: TagsUpdate, db: AsyncSession = Depends(get_db)):
+    """Replace the full file tag set; [] removes all tags. Tags are trimmed and deduplicated.
+
+    Read existing tags and include those to retain. Updates the search projection.
+    """
     lab = await db.get(LabFile, file_id)
     if not lab:
         raise HTTPException(404, "File not found")
@@ -87,6 +93,11 @@ async def set_file_tags(file_id: int, body: TagsUpdate, db: AsyncSession = Depen
 
 @router.put("/markers/{marker_name:path}/tags", response_model=list[str], tags=["tags"])
 async def set_marker_tags(marker_name: str, body: TagsUpdate, db: AsyncSession = Depends(get_db)):
+    """Replace editable marker tags, not append. [] removes stored editable tags.
+
+    Reserved/derived tags cannot be assigned or removed here and can still appear
+    in the returned combined tag list. URL-encode the marker name.
+    """
     measurement_type = await marker_service.get_measurement_type_by_name(db, marker_name)
     if measurement_type is None:
         raise HTTPException(404, "Marker not found")

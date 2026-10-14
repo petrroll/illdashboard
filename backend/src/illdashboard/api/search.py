@@ -19,4 +19,9 @@ async def search_files(
     limit: int = Query(25, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
+    """Search indexed complete files across OCR text, tags, filenames, and measurements.
+
+    Incomplete files are not indexed. Repeated tags use AND matching. Returns at
+    most limit results (1-100), not a complete database export.
+    """
     return await search_service.search_lab_files(q, tags or [], db, limit=limit)

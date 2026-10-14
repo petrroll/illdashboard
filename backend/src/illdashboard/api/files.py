@@ -135,6 +135,12 @@ async def upload_file(
     lab_date: datetime | None = Query(None, description="Date of the lab report"),
     db: AsyncSession = Depends(get_db),
 ):
+    """Store a PDF, PNG, JPEG, WebP, text, or Markdown original without running AI.
+
+    Send multipart field `file`; `lab_date` is an optional query parameter retained
+    as a manual override. Returns a file ID. Queue OCR separately. Repeated uploads
+    create separate files; do not blindly retry after an ambiguous timeout.
+    """
     mime_type = file_types.canonical_upload_mime_type(file.filename, file.content_type)
     if mime_type is None:
         unsupported_type = file.content_type or Path(file.filename or "file").suffix or "unknown"
@@ -182,6 +188,10 @@ async def list_files(
     tags: list[str] | None = Query(None, description="Filter files having ALL of these tags"),
     db: AsyncSession = Depends(get_db),
 ):
+    """List all files newest first, including OCR text, errors, and processing progress.
+
+    Repeated `tags` parameters use AND matching. There is no pagination.
+    """
     query = select(LabFile).options(selectinload(LabFile.tags)).order_by(LabFile.uploaded_at.desc())
     if tags:
         for tag in tags:
@@ -193,11 +203,21 @@ async def list_files(
 
 @router.get("/files/{file_id}", response_model=LabFileOut, tags=["files"])
 async def get_file(file_id: int, db: AsyncSession = Depends(get_db)):
+    """Read a file and poll processing status/progress without starting AI work.
+
+    Status is uploaded, queued, processing, complete, or error. Measurement edits
+    and file-metadata edits are reported separately.
+    """
     return await serialize_lab_file(await get_lab_file_or_404(file_id, db), db)
 
 
 @router.patch("/files/{file_id}", response_model=LabFileOut, tags=["files"])
 async def update_file(file_id: int, body: FilePatchRequest, db: AsyncSession = Depends(get_db)):
+    """Patch only supplied metadata fields. A null lab_date explicitly clears the date.
+
+    To restore the extracted date, send `reset_fields: ["lab_date"]` instead.
+    Renaming changes the display name, not the stored original's filesystem path.
+    """
     lab = await get_lab_file_or_404(file_id, db)
 
     if "filename" in body.model_fields_set:
@@ -220,6 +240,10 @@ async def update_file(file_id: int, body: FilePatchRequest, db: AsyncSession = D
 
 @router.delete("/files/{file_id}", tags=["files"])
 async def delete_file(file_id: int, db: AsyncSession = Depends(get_db)):
+    """Permanently delete the file, its measurements, processing artifacts, and original.
+
+    There is no undo. A repeated deletion returns 404.
+    """
     lab = await get_lab_file_or_404(file_id, db)
     file_path = Path(lab.filepath)
     await search_service.remove_lab_search_document(lab.id, db)
@@ -234,12 +258,14 @@ async def delete_file(file_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.get("/files/{file_id}/pages", tags=["files"])
 async def get_file_pages(file_id: int, db: AsyncSession = Depends(get_db)):
+    """Return page count and MIME type; page numbers start at 1."""
     lab = await get_lab_file_or_404(file_id, db)
     return {"page_count": lab.page_count, "mime_type": lab.mime_type}
 
 
 @router.get("/files/{file_id}/pages/{page_num}", tags=["files"])
 async def get_file_page_image(file_id: int, page_num: int, db: AsyncSession = Depends(get_db)):
+    """Read a 1-based PDF page as PNG, an original image, or original text/Markdown."""
     lab = await get_lab_file_or_404(file_id, db)
     file_path = get_file_path_or_404(lab)
 
@@ -270,9 +296,15 @@ async def validate_reprocessing(file_ids: list[int], discard_user_edits: bool, d
 @router.post("/files/{file_id}/ocr", response_model=QueueFilesResponse, tags=["ocr"])
 async def run_ocr(
     file_id: int,
-    discard_user_edits: bool = Query(False),
+    discard_user_edits: bool = Query(False, description="Explicitly allow deleting manual measurement edits."),
     db: AsyncSession = Depends(get_db),
 ):
+    """Reset and queue extraction/normalization, which can incur AI costs.
+
+    Returns queued file IDs, not completed results; poll GET /api/files/{file_id}.
+    Returns 409 if measurements have manual edits unless discard_user_edits=true.
+    File-metadata overrides survive. Repeating this call restarts processing.
+    """
     await validate_reprocessing([file_id], discard_user_edits, db)
     file = await pipeline.queue_file(db, file_id)
     await db.commit()
@@ -281,6 +313,11 @@ async def run_ocr(
 
 @router.post("/files/ocr/batch", response_model=QueueFilesResponse, tags=["ocr"])
 async def batch_ocr(req: BatchOcrRequest, db: AsyncSession = Depends(get_db)):
+    """Validate all IDs and edit-discard consent, then reset and queue the selected files.
+
+    Stops/restarts the shared worker runtime, potentially interrupting other work.
+    Can incur AI costs; poll individual files. Unknown IDs reject the entire batch.
+    """
     # Validate the entire selection before stopping workers or deleting data,
     # including files hidden by the browser's current filter.
     await validate_reprocessing(req.file_ids, req.discard_user_edits, db)
@@ -289,7 +326,15 @@ async def batch_ocr(req: BatchOcrRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/files/ocr/unprocessed", response_model=QueueFilesResponse, tags=["ocr"])
-async def ocr_unprocessed(discard_user_edits: bool = Query(False), db: AsyncSession = Depends(get_db)):
+async def ocr_unprocessed(
+    discard_user_edits: bool = Query(False, description="Explicitly allow deleting manual measurement edits."),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reset incomplete processing globally and queue eligible files; can incur AI costs.
+
+    Checks measurement-edit consent across all non-complete files before changing
+    anything. Stops/restarts the shared worker runtime. Poll files for completion.
+    """
     file_ids = list((await db.scalars(select(LabFile.id).where(LabFile.status != pipeline.FILE_STATUS_COMPLETE))).all())
     await validate_reprocessing(file_ids, discard_user_edits, db)
     queued_file_ids = await pipeline.queue_unprocessed_files_from_clean_runtime(db)
@@ -298,5 +343,10 @@ async def ocr_unprocessed(discard_user_edits: bool = Query(False), db: AsyncSess
 
 @router.post("/files/ocr/cancel", tags=["ocr"])
 async def cancel_ocr(db: AsyncSession = Depends(get_db)):
+    """Cancel processing globally, not just one file, and reset incomplete artifacts.
+
+    Keeps manually edited measurements and settles those files without resuming
+    them automatically. Other unfinished extraction artifacts are discarded.
+    """
     await pipeline.cancel_processing_from_clean_runtime(db)
     return {"ok": True}

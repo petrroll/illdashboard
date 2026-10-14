@@ -316,6 +316,7 @@ Unset reasoning-effort overrides (`None`) preserve the selected model's default 
 
 ## Docs and developer tools
 
+- [Agent API guide](docs/agent-api.md) covers full data export, strict write contracts, and optional stale-write protection for medications/events.
 - [2026-10-13 review and validation](docs/validation-review-2026-10-13.md) records fixes, checks, and remaining limitations.
 - [`docs/README.md`](docs/README.md) maps the current documentation set.
 - [`docs/artifact-first-pipeline.md`](docs/artifact-first-pipeline.md) describes the live runtime and worker topology.

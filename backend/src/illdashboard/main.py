@@ -93,6 +93,14 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Health Dashboard API",
     version="0.1.0",
+    description=(
+        "Local health-data API for UI and agent clients. JSON write bodies reject unknown fields. "
+        "Read operation descriptions before replacing histories, changing marker units, or reprocessing files. "
+        "Null overrides and reset_fields have different meanings. Medication/event PUT and DELETE support "
+        "optional expected_updated_at conflict checks; creates do not support idempotency keys. "
+        "GET /api/export/full downloads a complete data backup without AI calls; share-html is a reduced snapshot. "
+        "OCR and insight/explanation POST requests can incur AI costs. Use only in a trusted local environment."
+    ),
     lifespan=lifespan,
 )
 
