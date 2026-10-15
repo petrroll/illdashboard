@@ -50,7 +50,7 @@ function loadHandler(relativePath, name, globals, effectDependency = null) {
   const { outputText } = ts.transpileModule(`globalThis.handler = ${initializer.getText(source)};`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
   });
-  const context = vm.createContext({ Error, ...globals });
+  const context = vm.createContext({ Error, AbortController, ...globals });
   vm.runInContext(outputText, context);
   return context.handler;
 }
@@ -158,6 +158,7 @@ test("marker canonicalization preserves other query parameters and settles after
       fetchMarkerDetail: async () => ({ marker_name: "canonical" }),
       refreshMarkerInsight: () => {}, cancelPendingInsightRefresh: () => {},
       setDetail: () => loaded.push(selectedMarker), setLoadedDetailMarker: () => {},
+      setDetailError: () => {}, setInsightResult: () => {},
     }, "syncMarkerQuery");
     const cleanup = effect();
     await new Promise((resolve) => setImmediate(resolve));
@@ -170,14 +171,17 @@ test("marker canonicalization preserves other query parameters and settles after
 
 test("cancelled marker detail loads cannot redirect a newer selection", async () => {
   let resolveDetail;
+  let signal;
   const pending = new Promise((resolve) => { resolveDetail = resolve; });
   const unexpected = () => assert.fail("cancelled detail changed state or URL");
   const effect = loadHandler("pages/MarkerChart.tsx", "detail effect", {
-    selectedMarker: "old", fetchMarkerDetail: () => pending,
-    refreshMarkerInsight: () => {}, cancelPendingInsightRefresh: () => {},
+    selectedMarker: "old", fetchMarkerDetail: (_marker, requestSignal) => { signal = requestSignal; return pending; },
+    refreshMarkerInsight: unexpected, cancelPendingInsightRefresh: () => {},
     syncMarkerQuery: unexpected, setDetail: unexpected, setLoadedDetailMarker: unexpected,
+    setDetailError: () => {}, setInsightResult: unexpected,
   }, "syncMarkerQuery");
   effect()();
+  assert.equal(signal.aborted, true);
   resolveDetail({ marker_name: "old canonical" });
   await new Promise((resolve) => setImmediate(resolve));
 });
@@ -189,10 +193,18 @@ test("marker insights reject superseded responses and skip requests in share exp
     const displayed = [];
     let calls = 0;
     const latestInsightRequestRef = { current: 0 };
+    const insightAbortRef = { current: null };
+    const signals = [];
+    const cancelPendingInsightRefresh = loadHandler("pages/MarkerChart.tsx", "cancelPendingInsightRefresh", {
+      useCallback: (callback) => callback, latestInsightRequestRef, insightAbortRef,
+    });
     const refresh = loadHandler("pages/MarkerChart.tsx", "refreshMarkerInsight", {
-      useCallback: (callback) => callback, shareExportMode, latestInsightRequestRef,
-      cancelPendingInsightRefresh: () => { latestInsightRequestRef.current += 1; },
-      fetchMarkerInsight: () => ++calls === 1 ? pending : Promise.resolve({ explanation: "fresh", explanation_cached: false }),
+      useCallback: (callback) => callback, shareExportMode, latestInsightRequestRef, insightAbortRef,
+      cancelPendingInsightRefresh,
+      fetchMarkerInsight: (_marker, signal) => {
+        signals.push(signal);
+        return ++calls === 1 ? pending : Promise.resolve({ explanation: "fresh", explanation_cached: false });
+      },
       setInsightResult: (result) => displayed.push(result.explanation),
     });
     const first = refresh("old");
@@ -201,7 +213,99 @@ test("marker insights reject superseded responses and skip requests in share exp
     await first;
     assert.deepEqual(displayed, shareExportMode ? [] : ["fresh"]);
     assert.equal(calls, shareExportMode ? 0 : 2);
+    assert.equal(insightAbortRef.current, null);
+    if (!shareExportMode) {
+      assert.equal(signals[0].aborted, true);
+      assert.equal(signals[1].aborted, false);
+    }
   }
+});
+
+test("history loads before optional insights and cached insights never issue a POST", async () => {
+  for (const cached of [false, true]) {
+    let resolveDetail;
+    const pending = new Promise((resolve) => { resolveDetail = resolve; });
+    const events = [];
+    const effect = loadHandler("pages/MarkerChart.tsx", "detail effect", {
+      selectedMarker: "marker", fetchMarkerDetail: () => pending,
+      setDetail: () => events.push("history"),
+      setInsightResult: (value) => {
+        events.push("insight state");
+        assert.equal(value.cached, cached);
+        assert.equal(value.explanation, cached ? "cached explanation" : null);
+      },
+      refreshMarkerInsight: () => events.push("generate"),
+      cancelPendingInsightRefresh: () => {}, syncMarkerQuery: () => {},
+      setDetailError: () => {}, setLoadedDetailMarker: () => events.push("loaded"),
+    }, "syncMarkerQuery");
+    const cleanup = effect();
+    assert.deepEqual(events, []);
+    resolveDetail({ marker_name: "marker", explanation_cached: cached, explanation: cached ? "cached explanation" : null });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(events, cached ? ["history", "insight state", "loaded"] : ["history", "insight state", "generate", "loaded"]);
+    cleanup();
+  }
+});
+
+test("history and insight failures are visible but aborted loads stay silent", async () => {
+  const historyErrors = [];
+  const effect = loadHandler("pages/MarkerChart.tsx", "detail effect", {
+    selectedMarker: "marker", fetchMarkerDetail: async () => { throw new Error("History offline"); },
+    setDetailError: (value) => { if (value) historyErrors.push(value.message); },
+    setLoadedDetailMarker: () => {}, cancelPendingInsightRefresh: () => {},
+  }, "syncMarkerQuery");
+  effect();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(historyErrors, ["History offline"]);
+
+  for (const abort of [false, true]) {
+    const latestInsightRequestRef = { current: 0 };
+    const insightAbortRef = { current: null };
+    let result;
+    const refresh = loadHandler("pages/MarkerChart.tsx", "refreshMarkerInsight", {
+      useCallback: (callback) => callback, shareExportMode: false, latestInsightRequestRef, insightAbortRef,
+      cancelPendingInsightRefresh: () => { latestInsightRequestRef.current += 1; },
+      fetchMarkerInsight: async () => { throw new Error("Insight offline"); },
+      setInsightResult: (update) => { result = update(null); },
+    });
+    const pending = refresh("marker");
+    if (abort) insightAbortRef.current.abort();
+    await pending;
+    if (abort) assert.equal(result, undefined);
+    else {
+      assert.equal(result.loading, false);
+      assert.match(result.error, /could not be loaded/);
+    }
+  }
+});
+
+test("marker API requests forward abort signals without changing offline reads", async () => {
+  const calls = [];
+  let shareExportMode = false;
+  const api = loadSource("api/measurements.ts", {
+    imports: {
+      "./client": {
+        apiClient: {
+          get: async (url, options) => { calls.push({ url, options }); return { data: "detail" }; },
+          post: async (url, _body, options) => { calls.push({ url, options }); return { data: "insight" }; },
+        },
+      },
+      "../export/runtime": {
+        isShareExportMode: () => shareExportMode, getShareExportMarkerDetail: () => "offline",
+      },
+    },
+  });
+  const { signal } = new AbortController();
+  assert.equal(await api.fetchMarkerDetail("marker", signal), "detail");
+  assert.equal(await api.fetchMarkerInsight("marker", signal), "insight");
+  assert.deepEqual(calls.map((call) => call.url), ["/measurements/detail", "/measurements/insight"]);
+  for (const call of calls) {
+    assert.equal(call.options.signal, signal);
+    assert.equal(call.options.params.marker_name, "marker");
+  }
+  shareExportMode = true;
+  assert.equal(await api.fetchMarkerDetail("marker", signal), "offline");
+  assert.equal(calls.length, 2);
 });
 
 test("text preview effects handle success, failure, cancellation and non-text files", async () => {

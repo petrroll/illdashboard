@@ -50,12 +50,13 @@ export async function fetchMarkerOverview(tags: string[] = []) {
   return response.data;
 }
 
-export async function fetchMarkerDetail(markerName: string) {
+export async function fetchMarkerDetail(markerName: string, signal?: AbortSignal) {
   if (isShareExportMode()) {
     return getShareExportMarkerDetail(markerName);
   }
   const response = await apiClient.get<MarkerDetailResponse>("/measurements/detail", {
     params: { marker_name: markerName },
+    signal,
   });
   return response.data;
 }
@@ -82,12 +83,13 @@ export async function patchMarkerCanonicalUnit(markerName: string, canonicalUnit
   return response.data;
 }
 
-export async function fetchMarkerInsight(markerName: string) {
+export async function fetchMarkerInsight(markerName: string, signal?: AbortSignal) {
   if (isShareExportMode()) {
     throwUnavailableInShareExport("Generating biomarker interpretations");
   }
   const response = await apiClient.post<MarkerInsightResponse>("/measurements/insight", undefined, {
     params: { marker_name: markerName },
+    signal,
   });
   return response.data;
 }

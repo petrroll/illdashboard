@@ -299,6 +299,7 @@ export default function MarkerChart() {
   const [defaultMarker, setDefaultMarker] = useState("");
   const selectedMarker = requestedMarker || defaultMarker;
   const [detail, setDetail] = useState<MarkerDetailResponse | null>(null);
+  const [detailError, setDetailError] = useState<{ markerName: string; message: string } | null>(null);
   const [loadingOverview, setLoadingOverview] = useState(true);
   const [loadedDetailMarker, setLoadedDetailMarker] = useState("");
   const loadingDetail = !!selectedMarker && loadedDetailMarker !== selectedMarker;
@@ -307,6 +308,7 @@ export default function MarkerChart() {
     explanation: string | null;
     cached: boolean;
     loading: boolean;
+    error?: string;
   } | null>(null);
   // Results belong to a marker; a route change must not reuse another marker's insight.
   const currentInsight = insightResult?.markerName === selectedMarker ? insightResult : null;
@@ -325,6 +327,7 @@ export default function MarkerChart() {
   const [timeWeightedAxis, setTimeWeightedAxis] = useState(getStoredTimeWeightedAxis);
   const [collapsedGroups, setCollapsedGroups] = useState(getStoredCollapsedGroups);
   const latestInsightRequestRef = useRef(0);
+  const insightAbortRef = useRef<AbortController | null>(null);
 
   const syncMarkerQuery = useCallback((markerName: string) => {
     if (searchParams.get("marker") === markerName) return;
@@ -344,29 +347,37 @@ export default function MarkerChart() {
 
   const cancelPendingInsightRefresh = useCallback(() => {
     latestInsightRequestRef.current += 1;
+    insightAbortRef.current?.abort();
+    insightAbortRef.current = null;
   }, []);
 
   const refreshMarkerInsight = useCallback((markerName: string) => {
+    cancelPendingInsightRefresh();
     if (shareExportMode) {
-      cancelPendingInsightRefresh();
       return;
     }
 
-    const requestId = latestInsightRequestRef.current + 1;
-    latestInsightRequestRef.current = requestId;
+    const requestId = latestInsightRequestRef.current;
+    const controller = new AbortController();
+    insightAbortRef.current = controller;
 
-    return fetchMarkerInsight(markerName).then((response) => {
+    return fetchMarkerInsight(markerName, controller.signal).then((response) => {
       if (latestInsightRequestRef.current !== requestId) {
         return;
       }
       setInsightResult({ markerName, explanation: response.explanation, cached: response.explanation_cached, loading: false });
     }).catch(() => {
-      if (latestInsightRequestRef.current !== requestId) {
+      if (controller.signal.aborted || latestInsightRequestRef.current !== requestId) {
         return;
       }
+      const error = "Interpretation could not be loaded.";
       setInsightResult((current) => current?.markerName === markerName
-        ? { ...current, loading: false }
-        : { markerName, explanation: null, cached: false, loading: false });
+        ? { ...current, loading: false, error }
+        : { markerName, explanation: null, cached: false, loading: false, error });
+    }).finally(() => {
+      if (insightAbortRef.current === controller) {
+        insightAbortRef.current = null;
+      }
     });
   }, [cancelPendingInsightRefresh, shareExportMode]);
 
@@ -430,14 +441,31 @@ export default function MarkerChart() {
       return;
     }
     let cancelled = false;
+    const controller = new AbortController();
 
-    void fetchMarkerDetail(selectedMarker)
+    void fetchMarkerDetail(selectedMarker, controller.signal)
       .then((response) => {
         if (!cancelled) {
+          setDetailError(null);
           setDetail(response);
+          setInsightResult({
+            markerName: response.marker_name,
+            explanation: response.explanation,
+            cached: response.explanation_cached,
+            loading: !response.explanation_cached,
+          });
           if (response.marker_name !== selectedMarker) {
             syncMarkerQuery(response.marker_name);
+          } else if (!response.explanation_cached) {
+            void refreshMarkerInsight(response.marker_name);
           }
+        }
+      }).catch((error: unknown) => {
+        if (!cancelled) {
+          setDetailError({
+            markerName: selectedMarker,
+            message: error instanceof Error ? error.message : "Biomarker history could not be loaded.",
+          });
         }
       }).finally(() => {
         if (!cancelled) {
@@ -445,10 +473,9 @@ export default function MarkerChart() {
         }
       });
 
-    void refreshMarkerInsight(selectedMarker);
-
     return () => {
       cancelled = true;
+      controller.abort();
       cancelPendingInsightRefresh();
     };
   }, [cancelPendingInsightRefresh, refreshMarkerInsight, selectedMarker, syncMarkerQuery]);
@@ -588,7 +615,7 @@ export default function MarkerChart() {
         .find((item) => item.marker_name === selectedMarker),
     [overview, selectedMarker],
   );
-  const summarySource = detail ?? selectedOverviewItem ?? null;
+  const summarySource = currentDetail ?? selectedOverviewItem ?? null;
   const refLow = summarySource?.reference_low ?? null;
   const refHigh = summarySource?.reference_high ?? null;
   const refLowLabel = refLow == null ? undefined : `Low ${formatSignificantValue(refLow)}`;
@@ -988,6 +1015,8 @@ export default function MarkerChart() {
       <aside className="marker-detail-panel card">
         {!selectedMarker ? (
           <div className="card-empty">Select a biomarker to inspect its history.</div>
+        ) : !loadingDetail && detailError?.markerName === selectedMarker ? (
+          <div className="card-empty" role="alert">{detailError.message}</div>
         ) : !summarySource ? (
           <div className="card-empty">
             <span className="spinner" /> Loading {selectedMarker}…
@@ -1461,7 +1490,9 @@ export default function MarkerChart() {
                     </span>
                   )}
                 </div>
-                {insight ? (
+                {currentInsight?.error ? (
+                  <p className="marker-subtitle" role="alert">{currentInsight.error}</p>
+                ) : insight ? (
                   <ReactMarkdown disallowedElements={["img"]}>{insight}</ReactMarkdown>
                 ) : loadingInsight ? (
                   <div className="card-empty detail-loading-block">

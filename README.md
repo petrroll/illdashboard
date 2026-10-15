@@ -264,6 +264,10 @@ Files stay on disk under the configured `UPLOAD_DIR`, and derived artifacts, job
 Biomarker selection reuses unchanged overview row content rather than reformatting the entire list
 when history or insights finish loading. Initial loading still fetches the overview and lazy-loaded
 sparklines; uncached AI interpretations load separately from the chart and history.
+History loads before requesting an uncached interpretation, and cached interpretations are reused
+without a generation request. Changing markers aborts superseded history and interpretation HTTP
+requests so they do not occupy browser connections needed by the new selection; an AI job already
+started on the server may still finish.
 
 ## Pipeline at a glance
 
