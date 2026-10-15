@@ -303,6 +303,27 @@ test("measurement and reference exports preserve small nonzero values", () => {
   assert.equal(measurements.formatReferenceRange(0.004, 0.008), "0.004\u20130.008");
 });
 
+test("censored results keep their comparator unless the user replaced the value", () => {
+  const bounded = {
+    canonical_value: 0.1,
+    canonical_unit: "kU/l",
+    original_value: 0.1,
+    original_unit: "kUA/l",
+    original_value_comparator: "<=",
+    qualitative_value: null,
+    unit_conversion_missing: false,
+    user_edited_fields: [],
+  };
+  assert.equal(measurements.formatPreferredMeasurementScalarValue(bounded), "\u22640.1");
+  assert.equal(measurements.formatPreferredMeasurementValue(bounded), "\u22640.1 kU/l");
+  assert.equal(
+    measurements.formatPreferredMeasurementScalarValue({ ...bounded, user_edited_fields: ["canonical_value"] }),
+    "0.1",
+  );
+  assert.equal(measurements.getSourceValueComparator({ ...bounded, user_edited_fields: ["canonical_value"] }), "\u2264");
+  assert.equal(measurements.formatPreferredMeasurementScalarValue({ ...bounded, original_value_comparator: null }), "0.1");
+});
+
 test("Markdown trends use the full scale for positive spans below one", () => {
   const reports = loadSource("export/reports.ts", {
     imports: { "../api": {}, "../utils/measurements": measurements, "./runtime": {} },

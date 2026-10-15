@@ -154,7 +154,8 @@ async def upload_file(
             filepath=str(destination),
             mime_type=mime_type,
             page_count=page_count,
-            lab_date=lab_date,
+            # Until the summary runs, a dated filename beats falling back to upload time.
+            lab_date=lab_date or upload_metadata.filename_date(file.filename),
             user_lab_date=lab_date,
             user_lab_date_override=lab_date is not None,
         )

@@ -69,7 +69,9 @@ function renderPreferredMeasurementValue(
     | "canonical_unit"
     | "qualitative_value"
     | "original_value"
+    | "original_value_comparator"
     | "original_unit"
+    | "user_edited_fields"
   >,
 ) {
   const renderedValue = formatPreferredMeasurementScalarValue(measurement);

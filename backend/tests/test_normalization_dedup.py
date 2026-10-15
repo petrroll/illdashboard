@@ -827,8 +827,12 @@ def test_infer_threshold_qualitative_result_uses_unambiguous_numeric_range_direc
 
 
 @pytest.mark.asyncio
-async def test_qualitative_rule_upsert_deduplicates_equivalent_values(session_factory):
+async def test_qualitative_rule_upsert_deduplicates_equivalent_values_per_marker(session_factory):
     async with session_factory() as session:
+        serology = MeasurementType(name="Serology", normalized_key="serology")
+        culture = MeasurementType(name="Throat culture", normalized_key="throat-culture")
+        session.add_all([serology, culture])
+        await session.flush()
         await qualitative_values.upsert_qualitative_rules(
             session,
             [
@@ -836,21 +840,34 @@ async def test_qualitative_rule_upsert_deduplicates_equivalent_values(session_fa
                     "original_value": "Positive",
                     "canonical_value": "Positive",
                     "boolean_value": True,
+                    "measurement_type_id": serology.id,
                 },
                 {
                     "original_value": " positive ",
                     "canonical_value": "Positive",
                     "boolean_value": True,
+                    "measurement_type_id": serology.id,
+                },
+                # The same word keeps its own meaning for another marker.
+                {
+                    "original_value": "Positive",
+                    "canonical_value": "normal flora present",
+                    "boolean_value": False,
+                    "measurement_type_id": culture.id,
                 },
             ],
         )
         await session.commit()
 
         rules = list((await session.execute(select(QualitativeRule).order_by(QualitativeRule.id.asc()))).scalars())
+        loaded = await qualitative_values.load_qualitative_rules(
+            session, [(serology.id, "POSITIVE"), (culture.id, "positive")]
+        )
 
-    assert len(rules) == 1
-    assert rules[0].normalized_original_value == qualitative_values.normalize_qualitative_key("Positive")
-    assert rules[0].canonical_value == "Positive"
+    key = qualitative_values.normalize_qualitative_key("Positive")
+    assert len(rules) == 2
+    assert loaded[(serology.id, key)].boolean_value is True
+    assert loaded[(culture.id, key)].boolean_value is False
 
 
 @pytest.mark.asyncio
@@ -861,8 +878,10 @@ async def test_qualitative_canonization_reuses_symbolic_rule_keys(session_factor
             filepath="/tmp/qual-loop.png",
             mime_type="image/png",
         )
+        measurement_type = MeasurementType(name="COVID serology", normalized_key="covid-serology")
         measurement = Measurement(
             lab_file=lab_file,
+            measurement_type=measurement_type,
             raw_marker_name="COVID serology",
             normalized_marker_key=normalize_marker_alias_key("COVID serology"),
             original_qualitative_value="-",
@@ -870,32 +889,35 @@ async def test_qualitative_canonization_reuses_symbolic_rule_keys(session_factor
         session.add_all([lab_file, measurement])
         await session.flush()
 
-        job_key = qualitative_values.normalize_qualitative_key(measurement.original_qualitative_value)
-        assert job_key is not None
+        value_key = qualitative_values.normalize_qualitative_key(measurement.original_qualitative_value)
+        assert value_key is not None
+        rule_key = (measurement_type.id, value_key)
         job = Job(
             task_type=pipeline.TASK_CANONIZE_QUALITATIVE,
-            task_key=job_key,
+            task_key=pipeline._qualitative_task_key(measurement_type.normalized_key, value_key),
             status=job_service.JOB_STATUS_LEASED,
             lease_owner="test-runtime",
             lease_until=utc_now(),
-            payload_json=job_service.json_dumps({"original_value": measurement.original_qualitative_value}),
+            payload_json=job_service.json_dumps(
+                {"original_value": measurement.original_qualitative_value, "measurement_type_id": measurement_type.id}
+            ),
         )
         session.add(job)
         await session.commit()
 
         with patch(
             "illdashboard.services.pipeline.copilot_normalization.normalize_qualitative_values",
-            new=AsyncMock(return_value={job_key: ("negative", False)}),
+            new=AsyncMock(return_value={f"{measurement_type.id}|{value_key}": ("negative", False)}),
         ) as normalize_mock:
             await pipeline._canonize_qualitative_jobs(session, [job])
             await session.commit()
 
-        rules = await qualitative_values.load_qualitative_rules(session, [job.task_key])
+        rules = await qualitative_values.load_qualitative_rules(session, [rule_key])
         queued_jobs = list((await session.execute(select(Job).order_by(Job.id.asc()))).scalars())
 
     normalize_mock.assert_awaited_once()
-    assert rules[job_key].canonical_value == "negative"
-    assert rules[job_key].boolean_value is False
+    assert rules[rule_key].canonical_value == "negative"
+    assert rules[rule_key].boolean_value is False
     assert any(
         queued_job.task_type == pipeline.TASK_PROCESS_MEASUREMENTS and queued_job.file_id == lab_file.id
         for queued_job in queued_jobs
@@ -1044,8 +1066,10 @@ async def test_qualitative_canonization_skips_llm_for_threshold_values_with_matc
             filepath="/tmp/qual-threshold-queued.png",
             mime_type="image/png",
         )
+        measurement_type = MeasurementType(name="eGF from creatinine", normalized_key="egf-from-creatinine")
         measurement = Measurement(
             lab_file=lab_file,
+            measurement_type=measurement_type,
             raw_marker_name="eGF from creatinine",
             normalized_marker_key=normalize_marker_alias_key("eGF from creatinine"),
             original_qualitative_value=">1.5",
@@ -1056,11 +1080,13 @@ async def test_qualitative_canonization_skips_llm_for_threshold_values_with_matc
 
         job = Job(
             task_type=pipeline.TASK_CANONIZE_QUALITATIVE,
-            task_key=">1.5",
+            task_key=pipeline._qualitative_task_key(measurement_type.normalized_key, ">1.5"),
             status=job_service.JOB_STATUS_LEASED,
             lease_owner="test-runtime",
             lease_until=utc_now(),
-            payload_json=job_service.json_dumps({"original_value": measurement.original_qualitative_value}),
+            payload_json=job_service.json_dumps(
+                {"original_value": measurement.original_qualitative_value, "measurement_type_id": measurement_type.id}
+            ),
         )
         session.add(job)
         await session.commit()
@@ -1072,7 +1098,7 @@ async def test_qualitative_canonization_skips_llm_for_threshold_values_with_matc
             await pipeline._canonize_qualitative_jobs(session, [job])
             await session.commit()
 
-        rules = await qualitative_values.load_qualitative_rules(session, [job.task_key])
+        rules = await qualitative_values.load_qualitative_rules(session, [(measurement_type.id, ">1.5")])
         queued_jobs = list((await session.execute(select(Job).order_by(Job.id.asc()))).scalars())
 
     normalize_mock.assert_not_awaited()
@@ -1320,12 +1346,14 @@ async def test_queue_file_retries_failed_shared_normalization_jobs_for_that_file
     async with session_factory() as session:
         lab_file = LabFile(filename="retry.png", filepath="/tmp/retry.png", mime_type="image/png", status="error")
         glucose = MeasurementType(name="Glucose", normalized_key="glucose", canonical_unit="mmol/L")
-        session.add_all([lab_file, glucose])
+        crp = MeasurementType(name="CRP", normalized_key="crp")
+        session.add_all([lab_file, glucose, crp])
         await session.flush()
         session.add_all(
             [
                 Measurement(
                     lab_file_id=lab_file.id,
+                    measurement_type_id=crp.id,
                     raw_marker_name="CRP",
                     normalized_marker_key=normalize_marker_alias_key("CRP"),
                     original_qualitative_value="Positive",
@@ -1348,7 +1376,9 @@ async def test_queue_file_retries_failed_shared_normalization_jobs_for_that_file
         )
         failed = [
             (pipeline.TASK_CANONIZE_MARKER, normalize_marker_alias_key("CRP")),
-            (pipeline.TASK_CANONIZE_QUALITATIVE, qualitative_key),
+            (pipeline.TASK_CANONIZE_QUALITATIVE, pipeline._qualitative_task_key("crp", qualitative_key)),
+            (pipeline.TASK_CANONIZE_GROUP, "crp"),
+            (pipeline.TASK_CANONIZE_UNIT, "crp"),
             (pipeline.TASK_CANONIZE_GROUP, "glucose"),
             (pipeline.TASK_CANONIZE_UNIT, "glucose"),
             (pipeline.TASK_CANONIZE_CONVERSION, conversion_key),

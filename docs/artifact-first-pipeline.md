@@ -245,7 +245,7 @@ stateDiagram-v2
 
 ### Extraction retries
 
-- `extract.*` jobs call the page-range extraction functions, which already split oversized/timeout batches and retry single pages at a lower DPI. A failure that survives those retries fails the job; the pipeline does not re-split it again.
+- `extract.*` jobs call the page-range extraction functions, which already split oversized/timeout batches and retry a single page once at the same resolution after a timeout or rate limit. A single page that is still too large fails rather than being re-rendered at lower resolution, which would risk misread digits. A failure that survives those retries fails the job; the pipeline does not re-split it again.
 - PyMuPDF rendering runs on one dedicated thread (PyMuPDF is not thread-safe) so rendering never blocks the event loop.
 
 ## 6) API / UI projections

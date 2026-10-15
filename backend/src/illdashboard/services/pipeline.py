@@ -11,7 +11,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TypeVar
 
@@ -198,12 +198,14 @@ async def preload_uploaded_files(session: AsyncSession) -> int:
             except Exception:
                 logger.warning("Could not read page count for %s, defaulting to 1", file_path.name)
 
+        filename = upload_metadata.read_original_name_sidecar(file_path) or file_path.name
         session.add(
             LabFile(
-                filename=upload_metadata.read_original_name_sidecar(file_path) or file_path.name,
+                filename=filename,
                 filepath=str(file_path.resolve()),
                 mime_type=mime_type,
                 page_count=page_count,
+                lab_date=upload_metadata.filename_date(filename),
             )
         )
         known_paths.add(file_path.resolve())
@@ -687,13 +689,15 @@ async def _delete_failed_shared_normalization_jobs(session: AsyncSession, file_i
     for measurement in result.scalars().all():
         if measurement.normalized_marker_key:
             task_keys[TASK_CANONIZE_MARKER].add(_marker_task_key(measurement.normalized_marker_key))
-        if measurement.original_qualitative_value:
-            qualitative_key = qualitative_values.normalize_qualitative_key(measurement.original_qualitative_value)
-            if qualitative_key:
-                task_keys[TASK_CANONIZE_QUALITATIVE].add(_qualitative_task_key(qualitative_key))
         measurement_type = measurement.measurement_type
         if measurement_type is None:
             continue
+        if measurement.original_qualitative_value:
+            qualitative_key = qualitative_values.normalize_qualitative_key(measurement.original_qualitative_value)
+            if qualitative_key:
+                task_keys[TASK_CANONIZE_QUALITATIVE].add(
+                    _qualitative_task_key(measurement_type.normalized_key, qualitative_key)
+                )
         task_keys[TASK_CANONIZE_GROUP].add(_group_task_key(measurement_type.normalized_key))
         task_keys[TASK_CANONIZE_UNIT].add(_canonical_unit_task_key(measurement_type.normalized_key))
         original_unit_key = rescaling.normalize_unit_key(measurement.original_unit)
@@ -872,7 +876,7 @@ async def _reset_file_processing_state(session: AsyncSession, file: LabFile, *, 
     file.ocr_text_raw = None
     file.ocr_text_english = None
     file.ocr_summary_english = None
-    file.lab_date = None
+    file.lab_date = upload_metadata.filename_date(file.filename)
     file.text_assembled_at = None
     file.summary_generated_at = None
     file.source_resolved_at = None
@@ -1021,7 +1025,7 @@ async def _process_extraction_job(session: AsyncSession, job: Job, *, measuremen
                 filename=file.filename,
             )
     except Exception as exc:
-        # The extraction layer already split the batch and lowered DPI before
+        # The extraction layer already split the batch and retried transient errors before
         # giving up, so a durable re-split here would only repeat paid requests.
         logger.error(
             "Extraction job failed stage=%s job_id=%s file_id=%s filename=%s "
@@ -1074,6 +1078,7 @@ async def _persist_measurement_batch(
         select(MeasurementBatch).where(MeasurementBatch.file_id == file.id, MeasurementBatch.task_key == job.task_key)
     )
     existing_batch = existing_batch_result.scalar_one_or_none()
+    raw_response_json = json.dumps(result, ensure_ascii=False, default=str)
     if existing_batch is None:
         session.add(
             MeasurementBatch(
@@ -1082,8 +1087,11 @@ async def _persist_measurement_batch(
                 start_page=start_page,
                 stop_page=stop_page,
                 dpi=dpi,
+                raw_response_json=raw_response_json,
             )
         )
+    else:
+        existing_batch.raw_response_json = raw_response_json
 
     for raw_measurement in result.get("measurements", []):
         if not isinstance(raw_measurement, dict):
@@ -1093,12 +1101,23 @@ async def _persist_measurement_batch(
         if not raw_name or not normalized_key:
             continue
 
-        numeric_value, qualitative_value = _parse_measurement_value(raw_measurement.get("value"))
+        numeric_value, qualitative_value, value_comparator = _parse_measurement_value(raw_measurement.get("value"))
+        if qualitative_value is not None and _DATE_LIKE_VALUE_PATTERN.fullmatch(qualitative_value):
+            logger.warning(
+                "Skipping extracted measurement whose value is a date file_id=%s marker=%s page=%s",
+                file.id,
+                raw_name,
+                raw_measurement.get("page_number"),
+            )
+            continue
         original_unit = _normalize_optional_text(raw_measurement.get("unit"))
         # Leave undated rows null: reads fall back to the file's effective report
         # date, so later report-date edits and summary dates still apply.
-        measured_at = _parse_datetime(raw_measurement.get("measured_at"))
+        measured_at = _plausible_measurement_date(_parse_datetime(raw_measurement.get("measured_at")))
         page_number = _parse_int(raw_measurement.get("page_number"))
+        # A page outside the batch is unverifiable provenance; keep the row but not the claim.
+        if page_number is not None and not start_page < page_number <= max(stop_page, start_page + 1):
+            page_number = None
 
         session.add(
             Measurement(
@@ -1106,6 +1125,7 @@ async def _persist_measurement_batch(
                 raw_marker_name=raw_name,
                 normalized_marker_key=normalized_key,
                 original_value=numeric_value,
+                original_value_comparator=value_comparator,
                 original_qualitative_value=qualitative_value,
                 original_unit=original_unit,
                 normalized_original_unit=rescaling.normalize_unit_key(original_unit),
@@ -1113,6 +1133,7 @@ async def _persist_measurement_batch(
                 original_reference_high=_parse_numeric_value(raw_measurement.get("reference_high")),
                 measured_at=measured_at,
                 page_number=page_number,
+                source_text=_normalize_optional_text(raw_measurement.get("source_text")),
                 batch_key=job.task_key,
                 normalization_status=MEASUREMENT_STATE_PENDING,
             )
@@ -1336,6 +1357,7 @@ async def _generate_summary(session: AsyncSession, job: Job) -> None:
 
     if not file.ocr_text_raw:
         file.ocr_summary_english = None
+        file.lab_date = upload_metadata.filename_date(file.filename)
         file.source_candidate = None
         file.source_candidate_key = None
         file.summary_generated_at = utc_now()
@@ -1349,8 +1371,10 @@ async def _generate_summary(session: AsyncSession, job: Job) -> None:
         filename=file.filename,
     )
     file.ocr_summary_english = _normalize_document_text(summary_payload.get("summary_english"))
-    summary_date = _parse_datetime(summary_payload.get("lab_date"))
-    file.lab_date = summary_date
+    summary_date = _plausible_measurement_date(_parse_datetime(summary_payload.get("lab_date")))
+    # The summary prompt already weighs the filename; the deterministic parse only
+    # covers a missing or implausible model date so undated files avoid upload time.
+    file.lab_date = summary_date or upload_metadata.filename_date(file.filename)
     source_candidate = _normalize_optional_text(summary_payload.get("source"))
     file.source_candidate = source_candidate
     file.source_candidate_key = normalize_source_tag_value(source_candidate) if source_candidate else None
@@ -1429,7 +1453,14 @@ async def _canonize_marker_jobs(session: AsyncSession, jobs: list[Job]) -> None:
 
     started_at = _log_batch_span_start(TASK_CANONIZE_MARKER, [job for _, job in marker_jobs])
     raw_name_result = await session.execute(
-        select(Measurement.normalized_marker_key, Measurement.raw_marker_name, Measurement.original_unit)
+        select(
+            Measurement.normalized_marker_key,
+            Measurement.raw_marker_name,
+            Measurement.original_unit,
+            Measurement.original_value,
+            Measurement.original_value_comparator,
+            Measurement.original_qualitative_value,
+        )
         .where(Measurement.normalized_marker_key.in_(marker_keys))
         .order_by(
             Measurement.normalized_marker_key.asc(),
@@ -1439,7 +1470,9 @@ async def _canonize_marker_jobs(session: AsyncSession, jobs: list[Job]) -> None:
     )
     raw_names_by_key: dict[str, list[str]] = {}
     observed_units_by_key: dict[str, list[str]] = {}
-    for marker_key, raw_name, original_unit in raw_name_result.all():
+    # The result kind (numeric, bounded, qualitative) decides marker identity better than the label.
+    example_results_by_key: dict[str, list[str]] = {}
+    for marker_key, raw_name, original_unit, value, comparator, qualitative in raw_name_result.all():
         if not raw_name:
             continue
         names = raw_names_by_key.setdefault(marker_key, [])
@@ -1449,6 +1482,16 @@ async def _canonize_marker_jobs(session: AsyncSession, jobs: list[Job]) -> None:
             units = observed_units_by_key.setdefault(marker_key, [])
             if original_unit not in units and len(units) < 8:
                 units.append(original_unit)
+        example = (
+            qualitative
+            if qualitative is not None
+            else f"{comparator or ''}{value:g} {original_unit or ''}".strip()
+            if value is not None
+            else None
+        )
+        examples = example_results_by_key.setdefault(marker_key, [])
+        if example and example not in examples and len(examples) < 6:
+            examples.append(example)
 
     all_raw_names = [name for names in raw_names_by_key.values() for name in names]
     unresolved_names_by_key: dict[str, str] = {}
@@ -1473,12 +1516,17 @@ async def _canonize_marker_jobs(session: AsyncSession, jobs: list[Job]) -> None:
             representative_name: observed_units_by_key.get(marker_key, [])
             for marker_key, representative_name in unresolved_names_by_key.items()
         }
+        example_results_by_name = {
+            representative_name: example_results_by_key.get(marker_key, [])
+            for marker_key, representative_name in unresolved_names_by_key.items()
+        }
         await _commit_before_external_normalization_call(session)
         normalized_map = await copilot_normalization.normalize_marker_names(
             representative_names,
             existing_canonical,
             raw_examples_by_name=raw_examples_by_name,
             observed_units_by_name=observed_units_by_name,
+            example_results_by_name=example_results_by_name,
         )
         canonical_names = [
             normalized_map.get(representative_name, representative_name)
@@ -1767,33 +1815,38 @@ async def _canonize_conversion_jobs(session: AsyncSession, jobs: list[Job]) -> N
 
 
 async def _canonize_qualitative_jobs(session: AsyncSession, jobs: list[Job]) -> None:
-    qualitative_jobs: list[tuple[str, Job]] = []
+    qualitative_jobs: list[tuple[qualitative_values.QualitativeRuleKey, Job]] = []
     for job in jobs:
-        qualitative_key = job.task_key
-        if not qualitative_key:
+        rule_key = _qualitative_rule_key_from_job(job)
+        if rule_key is None:
             await job_service.mark_job_resolved(session, job, {"skipped": True})
             continue
-        qualitative_jobs.append((qualitative_key, job))
+        qualitative_jobs.append((rule_key, job))
 
-    qualitative_keys = list(dict.fromkeys(qualitative_key for qualitative_key, _ in qualitative_jobs))
-    if not qualitative_keys:
+    rule_keys = list(dict.fromkeys(rule_key for rule_key, _ in qualitative_jobs))
+    if not rule_keys:
         return
 
     started_at = _log_batch_span_start(TASK_CANONIZE_QUALITATIVE, [job for _, job in qualitative_jobs])
-    existing_rules = await qualitative_values.load_qualitative_rules(session, qualitative_keys)
-    unresolved_keys = [key for key in qualitative_keys if key not in existing_rules]
+    existing_rules = await qualitative_values.load_qualitative_rules(session, rule_keys)
+    unresolved_keys = [rule_key for rule_key in rule_keys if rule_key not in existing_rules]
     if unresolved_keys:
         # Qualitative keys are normalized in Python, so scan only the raw value
         # column and load full rows for the first match of each key.
-        sample_ids_by_key: dict[str, int] = {}
-        for measurement_id, original_value in await session.execute(
-            select(Measurement.id, Measurement.original_qualitative_value)
-            .where(Measurement.original_qualitative_value.is_not(None))
+        unresolved_set = set(unresolved_keys)
+        unresolved_type_ids = {measurement_type_id for measurement_type_id, _ in unresolved_keys}
+        sample_ids_by_key: dict[qualitative_values.QualitativeRuleKey, int] = {}
+        for measurement_id, measurement_type_id, original_value in await session.execute(
+            select(Measurement.id, Measurement.measurement_type_id, Measurement.original_qualitative_value)
+            .where(
+                Measurement.original_qualitative_value.is_not(None),
+                Measurement.measurement_type_id.in_(unresolved_type_ids),
+            )
             .order_by(Measurement.id.asc())
         ):
-            key = qualitative_values.normalize_qualitative_key(original_value)
-            if key in unresolved_keys and key not in sample_ids_by_key:
-                sample_ids_by_key[key] = measurement_id
+            rule_key = (measurement_type_id, qualitative_values.normalize_qualitative_key(original_value))
+            if rule_key in unresolved_set and rule_key not in sample_ids_by_key:
+                sample_ids_by_key[rule_key] = measurement_id
         sample_result = await session.execute(
             select(Measurement)
             .options(selectinload(Measurement.measurement_type))
@@ -1803,8 +1856,9 @@ async def _canonize_qualitative_jobs(session: AsyncSession, jobs: list[Job]) -> 
         samples_by_key = {key: samples_by_id[measurement_id] for key, measurement_id in sample_ids_by_key.items()}
 
         requests: list[copilot_normalization.QualitativeNormalizationRequest] = []
-        for qualitative_key in unresolved_keys:
-            sample = samples_by_key.get(qualitative_key)
+        request_keys: dict[str, qualitative_values.QualitativeRuleKey] = {}
+        for rule_key in unresolved_keys:
+            sample = samples_by_key.get(rule_key)
             if sample is None or sample.original_qualitative_value is None:
                 continue
             threshold_result = qualitative_values.infer_threshold_qualitative_result(
@@ -1814,9 +1868,11 @@ async def _canonize_qualitative_jobs(session: AsyncSession, jobs: list[Job]) -> 
             )
             if threshold_result is not None:
                 continue
+            request_id = f"{rule_key[0]}|{rule_key[1]}"
+            request_keys[request_id] = rule_key
             requests.append(
                 copilot_normalization.QualitativeNormalizationRequest(
-                    id=qualitative_key,
+                    id=request_id,
                     marker_name=sample.marker_name,
                     original_value=sample.original_qualitative_value,
                     reference_low=sample.original_reference_low,
@@ -1837,6 +1893,7 @@ async def _canonize_qualitative_jobs(session: AsyncSession, jobs: list[Job]) -> 
                         "original_value": request.original_value,
                         "canonical_value": resolved.get(request.id, (None, None))[0],
                         "boolean_value": resolved.get(request.id, (None, None))[1],
+                        "measurement_type_id": request_keys[request.id][0],
                     }
                     for request in requests
                 ],
@@ -1844,7 +1901,7 @@ async def _canonize_qualitative_jobs(session: AsyncSession, jobs: list[Job]) -> 
 
     for _, job in qualitative_jobs:
         await job_service.mark_job_resolved(session, job)
-    await _request_processing_for_qualitative_keys(session, qualitative_keys)
+    await _request_processing_for_qualitative_keys(session, rule_keys)
     _log_batch_span_finish(TASK_CANONIZE_QUALITATIVE, [job for _, job in qualitative_jobs], started_at)
 
 
@@ -2306,6 +2363,8 @@ async def _apply_anomalous_rescaling_if_needed(
     if (
         measurement.id is None
         or measurement.original_value is None
+        # A censored result such as "<0.1" is a detection limit, not a magnitude to rescale.
+        or measurement.original_value_comparator is not None
         or measurement.canonical_value is None
         or measurement.lab_file_id is None
         or not _history_supports_anomalous_rescaling(history_envelope)
@@ -2483,14 +2542,6 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
     alias_map = await load_measurement_type_aliases(
         session, [measurement.raw_marker_name for measurement in measurements]
     )
-    qualitative_rule_map = await qualitative_values.load_qualitative_rules(
-        session,
-        [
-            measurement.original_qualitative_value
-            for measurement in measurements
-            if measurement.original_qualitative_value
-        ],
-    )
     marker_job_statuses = await _load_job_statuses(
         session,
         TASK_CANONIZE_MARKER,
@@ -2538,6 +2589,14 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
         select(MeasurementType).options(selectinload(MeasurementType.group)).where(MeasurementType.id.in_(type_ids))
     )
     measurement_types = {measurement_type.id: measurement_type for measurement_type in type_result.scalars().all()}
+    qualitative_rule_map = await qualitative_values.load_qualitative_rules(
+        session,
+        [
+            (measurement.measurement_type_id, measurement.original_qualitative_value)
+            for measurement in measurements
+            if measurement.original_qualitative_value and measurement.measurement_type_id is not None
+        ],
+    )
     history_envelopes = await rescaling.load_measurement_history_envelopes(
         session,
         list(measurement_types.keys()),
@@ -2585,7 +2644,7 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
             if threshold_result is None:
                 qualitative_key = qualitative_values.normalize_qualitative_key(measurement.original_qualitative_value)
                 if qualitative_key:
-                    qualitative_task_keys.add(_qualitative_task_key(qualitative_key))
+                    qualitative_task_keys.add(_qualitative_task_key(measurement_type.normalized_key, qualitative_key))
 
     conversion_rule_map = await rescaling.load_rescaling_rules(session, conversion_requests)
     conversion_job_statuses = await _load_job_statuses(session, TASK_CANONIZE_CONVERSION, list(conversion_task_keys))
@@ -2724,9 +2783,9 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
                         f"Unsupported qualitative normalization for {measurement.original_qualitative_value}"
                     )
                     continue
-                rule = qualitative_rule_map.get(qualitative_key)
+                rule = qualitative_rule_map.get((measurement_type.id, qualitative_key))
                 if rule is None:
-                    task_key = _qualitative_task_key(qualitative_key)
+                    task_key = _qualitative_task_key(measurement_type.normalized_key, qualitative_key)
                     if qualitative_job_statuses.get(task_key) == job_service.JOB_STATUS_FAILED:
                         measurement.normalization_status = MEASUREMENT_STATE_ERROR
                         measurement.normalization_error = (
@@ -2738,7 +2797,10 @@ async def _apply_known_measurement_rules(session: AsyncSession, measurements: li
                             session,
                             task_type=TASK_CANONIZE_QUALITATIVE,
                             task_key=task_key,
-                            payload={"original_value": measurement.original_qualitative_value},
+                            payload={
+                                "original_value": measurement.original_qualitative_value,
+                                "measurement_type_id": measurement_type.id,
+                            },
                             priority=PRIORITY_CANONIZE,
                         )
                         or requested_new_work
@@ -2797,7 +2859,9 @@ async def _handle_terminal_job_failure(session: AsyncSession, job: Job, error_te
         if isinstance(measurement_type_id, int) and isinstance(original_unit, str):
             await _request_processing_for_conversion(session, measurement_type_id, original_unit)
     elif job.task_type == TASK_CANONIZE_QUALITATIVE:
-        await _request_processing_for_qualitative_keys(session, [job.task_key])
+        rule_key = _qualitative_rule_key_from_job(job)
+        if rule_key is not None:
+            await _request_processing_for_qualitative_keys(session, [rule_key])
     elif job.task_type == TASK_REVIEW_ANOMALOUS_RESCALING:
         measurement_id = payload.get("measurement_id")
         if isinstance(measurement_id, int):
@@ -3039,19 +3103,23 @@ async def _request_processing_for_conversions(
         await _request_processing_for_conversion(session, measurement_type_id, original_unit)
 
 
-async def _request_processing_for_qualitative_keys(session: AsyncSession, keys: list[str]) -> None:
-    normalized_keys = [key for key in keys if key]
-    if not normalized_keys:
+async def _request_processing_for_qualitative_keys(
+    session: AsyncSession, keys: list[qualitative_values.QualitativeRuleKey]
+) -> None:
+    wanted = set(keys)
+    if not wanted:
         return
     result = await session.execute(
-        select(Measurement.lab_file_id, Measurement.original_qualitative_value)
-        .where(Measurement.original_qualitative_value.is_not(None))
+        select(Measurement.lab_file_id, Measurement.measurement_type_id, Measurement.original_qualitative_value)
+        .where(
+            Measurement.original_qualitative_value.is_not(None),
+            Measurement.measurement_type_id.in_({measurement_type_id for measurement_type_id, _ in wanted}),
+        )
         .distinct()
     )
     affected_file_ids: set[int] = set()
-    for file_id, original_value in result.all():
-        normalized_value = qualitative_values.normalize_qualitative_key(original_value)
-        if normalized_value in normalized_keys:
+    for file_id, measurement_type_id, original_value in result.all():
+        if (measurement_type_id, qualitative_values.normalize_qualitative_key(original_value)) in wanted:
             affected_file_ids.add(file_id)
     for file_id in sorted(affected_file_ids):
         await _request_process_measurements(session, file_id)
@@ -3258,8 +3326,16 @@ def _conversion_task_key(measurement_type_key: str, original_unit_key: str, cano
     return f"{measurement_type_key}|{original_unit_key}|{canonical_unit_key}"
 
 
-def _qualitative_task_key(value_key: str) -> str:
-    return value_key
+def _qualitative_task_key(measurement_type_key: str, value_key: str) -> str:
+    return f"{measurement_type_key}|{value_key}"
+
+
+def _qualitative_rule_key_from_job(job: Job) -> qualitative_values.QualitativeRuleKey | None:
+    measurement_type_id = job_service.json_loads(job.payload_json).get("measurement_type_id")
+    _, separator, value_key = (job.task_key or "").partition("|")
+    if not separator or not value_key or not isinstance(measurement_type_id, int):
+        return None
+    return measurement_type_id, value_key
 
 
 async def _load_job_statuses(session: AsyncSession, task_type: str, task_keys: list[str]) -> dict[str, str]:
@@ -3331,6 +3407,15 @@ def _normalize_document_text(raw: object) -> str | None:
     return normalized.strip()
 
 
+_DATE_LIKE_VALUE_PATTERN = re.compile(r"\d{1,4}[./-]\d{1,2}[./-]\d{1,4}")
+_COMPARATOR_VALUE_PATTERN = re.compile(r"\s*(<=|>=|=<|=>|≤|≥|<|>)\s*(.+)")
+_COMPARATOR_ALIASES = {"≤": "<=", "=<": "<=", "≥": ">=", "=>": ">="}
+_PLAIN_NUMBER_PATTERN = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
+_COMMA_DECIMAL_PATTERN = re.compile(r"[+-]?\d+,\d+")
+_GROUPED_NUMBER_PATTERN = re.compile(r"[+-]?\d{1,3}(?: \d{3})+(?:[.,]\d+)?")
+_MIN_MEASUREMENT_YEAR = 1900
+
+
 def _parse_numeric_value(raw: object) -> float | None:
     if raw is None or isinstance(raw, bool):
         return None
@@ -3342,14 +3427,15 @@ def _parse_numeric_value(raw: object) -> float | None:
         return value if math.isfinite(value) else None
     if not isinstance(raw, str):
         return None
-    value = raw.strip()
-    if not value:
+    value = raw.strip().replace("\u00a0", " ").replace("\u202f", " ")
+    # Only unambiguous formats become numbers. Guessing "1 75" as 1.75 would
+    # manufacture precision; such literals stay strings so they remain visible.
+    if _GROUPED_NUMBER_PATTERN.fullmatch(value):
+        value = value.replace(" ", "").replace(",", ".")
+    elif _COMMA_DECIMAL_PATTERN.fullmatch(value):
+        value = value.replace(",", ".")
+    if not _PLAIN_NUMBER_PATTERN.fullmatch(value):
         return None
-    value = re.sub(r"(\d)\s+(\d{3})(?!\d)", r"\1\2", value)
-    value = re.sub(r"(\d)\s+(\d)", r"\1.\2", value)
-    if value.count(",") == 1:
-        value = re.sub(r"(\d),(\d)", r"\1.\2", value)
-    value = value.replace(" ", "")
     try:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -3373,11 +3459,29 @@ def _clean_qualitative_value(raw: object) -> str | None:
     return normalized or None
 
 
-def _parse_measurement_value(raw: object) -> tuple[float | None, str | None]:
+def _parse_measurement_value(raw: object) -> tuple[float | None, str | None, str | None]:
+    """Return (numeric value, qualitative literal, comparator) for one extracted result."""
     numeric_value = _parse_numeric_value(raw)
     if numeric_value is not None:
-        return numeric_value, None
-    return None, _clean_qualitative_value(raw)
+        return numeric_value, None, None
+    if isinstance(raw, str):
+        # Censored results keep their bound as a number plus comparator so they can be
+        # converted like other values without ever being shown as an exact point.
+        match = _COMPARATOR_VALUE_PATTERN.fullmatch(raw)
+        if match is not None:
+            bound = _parse_numeric_value(match.group(2))
+            if bound is not None:
+                comparator = _COMPARATOR_ALIASES.get(match.group(1), match.group(1))
+                return bound, None, comparator
+    return None, _clean_qualitative_value(raw), None
+
+
+def _plausible_measurement_date(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.year < _MIN_MEASUREMENT_YEAR or value > datetime.now(UTC) + timedelta(days=1):
+        return None
+    return value
 
 
 def _parse_datetime(raw: object) -> datetime | None:

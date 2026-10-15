@@ -219,6 +219,7 @@ def _build_marker_name_normalization_user_text(
     *,
     raw_examples_by_name: dict[str, list[str]] | None = None,
     observed_units_by_name: dict[str, list[str]] | None = None,
+    example_results_by_name: dict[str, list[str]] | None = None,
 ) -> str:
     user_text = "EXISTING canonical marker names:\n"
     if existing_canonical:
@@ -244,6 +245,11 @@ def _build_marker_name_normalization_user_text(
                 user_text += f"  - {observed_unit}\n"
         else:
             user_text += "  - (none)\n"
+        example_results = example_results_by_name.get(name) if example_results_by_name else None
+        if example_results:
+            user_text += "  Example results:\n"
+            for example_result in example_results:
+                user_text += f"  - {example_result}\n"
     return user_text
 
 
@@ -460,7 +466,8 @@ NORMALIZE_SYSTEM_PROMPT = """\
 You are a medical lab data normalization assistant. The user will give you:
 1. A list of EXISTING canonical marker names already in the database.
 2. A list of NEW marker entries extracted from OCR. Each entry includes a
-   representative name, optional raw example labels, and optional observed units.
+   representative name, optional raw example labels, optional observed units, and
+   optional example results.
 
 For each new marker entry, decide:
 - If it matches an existing canonical name (same test, just different formatting, \
@@ -471,32 +478,39 @@ same single canonical name.
 standard English canonical lab marker name when you can translate it confidently.
 - If the source label is in another language, including Czech, prefer the English \
 canonical medical name instead of preserving the source-language wording.
-- Ignore specimen prefixes, analyzer noise, sample annotations, and bracketed \
-context when they do not change the underlying biomarker.
+- Ignore analyzer noise, sample annotations, and bracketed context when they do not \
+change the underlying biomarker. A short specimen prefix such as \"S-\", \"B -\", \"U_\", \
+or \"P-\" names the specimen (serum, blood, urine, plasma), not the analyte: \
+\"B - Lymphocytes\" is total lymphocytes, not B lymphocytes.
+- Keep the specimen in the canonical name when the same analyte is measured in different \
+specimens (for example urine vs blood glucose), and keep urine dipstick scores separate \
+from urine sediment counts.
+- Keep antibody class (IgG/IgM/IgA/IgE), allergen component numbers, and assay method \
+when they are shown. Never add an antibody class or component that the raw labels do not show.
 - When a label includes a standard lab abbreviation such as MCHC, MCV, ALT, AST, \
 CRP, TSH, HDL, LDL, or HbA1c, prefer that standard abbreviation as the canonical \
 name unless there is a clearly more established English database label already present.
 - Prefer concise English medical names such as \"White Blood Cell (WBC) Count\" \
 or \"Platelet Count\" over local-language labels.
-- When two labels exist for the same analyte and one has a trailing \"Abs\" (or \
-similar suffix indicating an absolute/quantitative value) while the other does not, \
-keep them as two separate canonical types. The short form without \"Abs\" is the \
-positivity/qualitative test and the form with \"Abs\" is the absolute numeric count. \
-For example, \"Cytomegalovirus (CMV) IgG Antibodies\" is the qualitative positivity \
-result and \"Cytomegalovirus (CMV) IgG Antibodies Abs\" is the quantitative titer. \
-Do NOT merge them into one canonical name.
-- More generally, when the same analyte appears with both a qualitative variant \
-(positive/negative, reactive/non-reactive) and a quantitative variant (numeric \
-value with units), preserve them as distinct canonical names so they track \
-different measurement kinds.
-- For blood-cell subset markers, keep relative/percentage measurements separate from \
-absolute count measurements. Labels such as \"absolute\", \"absolut\", \"abs.\", \
+- Decide the result kind from the example results, not from the label alone. When the \
+same analyte appears with both a qualitative variant (positive/negative, reactive/non-reactive) \
+and a quantitative variant (numeric value with units), keep them as distinct canonical names. \
+Existing quantitative antibody names use a trailing \"Abs\", for example \
+\"Cytomegalovirus (CMV) IgG Antibodies\" (positivity) vs \
+\"Cytomegalovirus (CMV) IgG Antibodies Abs\" (numeric titer). A raw label without \"Abs\" \
+whose example results are numeric belongs to the quantitative variant.
+- Keep different quantities of one analyte separate: relative (%) vs absolute counts, \
+electrophoresis fractions (%) vs concentrations (g/L), enzyme activity (%) vs concentration \
+(U/mL), and assay index/ratio units vs concentration units.
+- For blood-cell subset markers, labels such as \"absolute\", \"absolut\", \"abs.\", \
 \"count\", \"počet\", or German \"gesamt\" often indicate the absolute-count variant \
 and should map to names such as \"Absolute Lymphocyte Count\" rather than the \
 percentage/fraction marker.
 - Use observed units as strong context when they are provided. Count units such as \
 \"cells/µL\", \"Zellen/µl\", \"/µL\", \"G/L\", or \"10^9/L\" indicate an absolute-count \
 marker family, while \"%\" or \"1\" indicate a relative or fraction-style marker family.
+- If the raw examples of one entry mix incompatible quantities, map the entry to the \
+quantity shown by most example results.
 
 Return ONLY valid JSON: a mapping object where keys are the original new names \
 and values are the canonical names.
@@ -647,6 +661,12 @@ For each request:
     Use true for outcomes like positive, reactive, or detected.
     Use false for outcomes like negative, non-reactive, or not detected.
     Use null when the result is indeterminate or cannot be safely reduced to true/false.
+- Rules are stored per marker, so interpret the value for that marker only.
+- Keep grade and abundance words in the canonical value ("rare", "occasional", "trace", "1+", "2+");
+    do not collapse them into "detected" or "positive".
+- Detection is not automatically abnormal: findings that are expected for the marker, such as
+    "normal flora" in a culture, map to boolean false.
+- Dilution titers such as "1:160" or "<1:80" keep the titer in the canonical value.
 - If the meaning is unclear, return a cleaned-up lower-case version of the original value rather than null.
 
 Return ONLY valid JSON as an object keyed by request id. Each value must be an object with:
@@ -793,6 +813,7 @@ async def normalize_marker_names(
     *,
     raw_examples_by_name: dict[str, list[str]] | None = None,
     observed_units_by_name: dict[str, list[str]] | None = None,
+    example_results_by_name: dict[str, list[str]] | None = None,
 ) -> dict[str, str]:
     """Map raw marker names to canonical forms."""
     if not new_names:
@@ -858,6 +879,7 @@ async def normalize_marker_names(
                 evolving_canonical,
                 raw_examples_by_name=raw_examples_by_name,
                 observed_units_by_name=observed_units_by_name,
+                example_results_by_name=example_results_by_name,
             ),
             default={},
             request_name="normalize_marker_names",

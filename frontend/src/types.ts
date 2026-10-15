@@ -49,6 +49,7 @@ export interface Measurement {
   canonical_unit?: string | null;
   canonical_value: number | null;
   original_value?: number | null;
+  original_value_comparator?: "<" | "<=" | ">" | ">=" | null;
   original_qualitative_value?: string | null;
   qualitative_bool?: boolean | null;
   qualitative_value: string | null;
@@ -60,6 +61,7 @@ export interface Measurement {
   original_reference_high?: number | null;
   measured_at: string | null;
   page_number: number | null;
+  source_text?: string | null;
   has_user_edits?: boolean;
   user_edited_fields?: string[];
 }

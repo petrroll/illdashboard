@@ -27,6 +27,8 @@ import {
   formatDate,
   formatDateTime,
   formatMeasurementScalarValue,
+  getSourceValueComparator,
+  withValueComparator,
   formatPreferredMeasurementScalarValue,
   formatPreferredMeasurementUnit,
   formatPreferredReferenceRange,
@@ -788,7 +790,10 @@ function FileDetailContent({ fileId }: { fileId: string | null }) {
 
                     return (
                       <tr key={measurement.id}>
-                        <td style={{ fontWeight: 500 }}>
+                        <td
+                          style={{ fontWeight: 500 }}
+                          title={measurement.source_text ? `Source: ${measurement.source_text}` : undefined}
+                        >
                           <Link
                             to={`/charts?marker=${encodeURIComponent(measurement.marker_name)}`}
                             className="marker-name-link"
@@ -806,7 +811,10 @@ function FileDetailContent({ fileId }: { fileId: string | null }) {
                                 secondary={conversionMissing
                                   ? conversionWarning ?? undefined
                                   : showOriginalValue
-                                  ? formatMeasurementScalarValue(originalValue, measurement.qualitative_value)
+                                  ? withValueComparator(
+                                      formatMeasurementScalarValue(originalValue, measurement.qualitative_value),
+                                      getSourceValueComparator(measurement),
+                                    )
                                   : undefined}
                               />
                             )}

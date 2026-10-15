@@ -43,6 +43,9 @@ import {
   formatDate,
   formatDateFromTimestamp,
   formatMeasurementScalarValue,
+  getDisplayedValueComparator,
+  getSourceValueComparator,
+  withValueComparator,
   formatMeasurementValue,
   formatPreferredMeasurementScalarValue,
   formatPreferredMeasurementUnit,
@@ -93,6 +96,8 @@ type MarkerChartPoint = {
   timestamp: number;
   /** Numeric trend value; null for qualitative-only points. */
   value: number | null;
+  /** Display comparator when the value is a censored bound such as "<0.1". */
+  valueComparator: string | null;
   /** Y coordinate for qualitative event diamonds (bottom of chart); null for numeric points. */
   eventY: number | null;
   reference_low: number | null;
@@ -196,7 +201,9 @@ function renderPreferredMeasurementValue(
     | "canonical_unit"
     | "qualitative_value"
     | "original_value"
+    | "original_value_comparator"
     | "original_unit"
+    | "user_edited_fields"
   >,
 ) {
   const renderedValue = formatPreferredMeasurementScalarValue(measurement);
@@ -468,6 +475,7 @@ export default function MarkerChart() {
         axisDateLabel: formatTimestampLabel(measuredTimestamp ?? fallbackTimestamp),
         timestamp: axisTimestamp,
         value: trendValue,
+        valueComparator: isQualitative ? null : getDisplayedValueComparator(measurement),
         eventY: null, // Filled after Y-axis scale is computed.
         reference_low: pointRefLow,
         reference_high: pointRefHigh,
@@ -1169,7 +1177,7 @@ export default function MarkerChart() {
                               const displayValue = isQualitative
                                 ? point.qualitativeLabel
                                 : point.value != null
-                                  ? formatMeasurementValue(point.value, unit)
+                                  ? withValueComparator(formatMeasurementValue(point.value, unit), point.valueComparator)
                                   : null;
 
                               return (
@@ -1213,13 +1221,14 @@ export default function MarkerChart() {
                               const { cx, cy, payload, index: dotIndex } = props as {
                                 cx: number; cy: number; payload: MarkerChartPoint; index: number;
                               };
+                              // Hollow dots mark censored bounds, which are not exact results.
                               return (
                                 <circle
                                   key={`nd-${dotIndex}`}
                                   cx={cx}
                                   cy={cy}
                                   r={5}
-                                  fill={payload.statusColor}
+                                  fill={payload.valueComparator ? "none" : payload.statusColor}
                                   stroke={payload.statusColor}
                                   strokeWidth={2}
                                 />
@@ -1321,7 +1330,10 @@ export default function MarkerChart() {
                             && hasRescaledMeasurementValue(measurement);
 
                           return (
-                            <tr key={measurement.id}>
+                            <tr
+                              key={measurement.id}
+                              title={measurement.source_text ? `Source: ${measurement.source_text}` : undefined}
+                            >
                               <td>
                                 <InlineEditableValue
                                   display={<span>{formatDate(getEffectiveMeasuredAt(measurement))}</span>}
@@ -1345,7 +1357,10 @@ export default function MarkerChart() {
                                       secondary={conversionMissing
                                         ? conversionWarning ?? undefined
                                         : showOriginalValue
-                                        ? formatMeasurementScalarValue(originalValue, measurement.qualitative_value)
+                                        ? withValueComparator(
+                                            formatMeasurementScalarValue(originalValue, measurement.qualitative_value),
+                                            getSourceValueComparator(measurement),
+                                          )
                                         : undefined}
                                     />
                                   )}

@@ -25,9 +25,10 @@ from illdashboard.services.documents import run_pymupdf
 logger = logging.getLogger(__name__)
 
 OCR_PDF_RENDER_DPI = 144
-OCR_PDF_MIN_RENDER_DPI = 72
 OCR_ASK_TIMEOUT = COPILOT_REQUEST_TIMEOUT
 OCR_RETRY_DELAY = 3
+# Larger text layers are usually not lab tables; cap them so one page cannot blow the request size.
+PDF_TEXT_LAYER_MAX_CHARS_PER_PAGE = 20_000
 A4_WIDTH_INCHES = 210 / 25.4
 A4_HEIGHT_INCHES = 297 / 25.4
 
@@ -111,12 +112,58 @@ def _retryable_pdf_error_reason(exc: Exception) -> str:
     return exc.__class__.__name__
 
 
-# Keep the schema-critical extraction guidance in one place so both structured
-# extraction backends apply the same value and bound semantics.
+# Keep the schema-critical extraction guidance in one place so the image/PDF,
+# Mistral, and text-document extractors apply the same value, binding, and date
+# semantics. Once a value is stored, later stages cannot recover what was printed.
 MEASUREMENT_VALUE_RULES = """\
-- Numeric results -> JSON number.
-- Qualitative results -> short string such as "positive", "negative", "reactive", "detected", or "not detected".
+- Exact numeric result -> JSON number. Use "." as decimal separator, no thousands separators or spaces,
+  and keep the leading zero (0.1, not .1). Read decimal points carefully: 0.1 and 1 are different results.
+- Result printed with a comparator (<, >, <=, >=, ≤, ≥) -> JSON string keeping the comparator and the number,
+  e.g. "<0.1", "< 5", ">=150". Never drop the comparator and never return only the bare number.
+- Dilution titer -> JSON string as printed, e.g. "1:160" or "<1:80". Never replace a titer with only an
+  interpretation such as "negative".
+- Qualitative or semiquantitative result -> short English string that keeps the printed grade or abundance,
+  e.g. "positive", "not detected", "rare", "trace", "occasional", "2+".
+- When both a number and an interpretation are printed for the same result, return the number.
+- If a result is illegible or you cannot tell which label it belongs to, omit that measurement instead of guessing.
 - "reference_low" and "reference_high" -> JSON number or null.\
+"""
+
+
+MEASUREMENT_BINDING_RULES = """\
+Row binding:
+- Take the label, result, unit, and reference interval of one measurement from the same row or line.
+- Never use as a result: dates, times, sample/order numbers, local test codes, page numbers, reference limits,
+  or a value printed for a neighboring label.
+- When one row prints several dated results, return one measurement per result, each with its own measured_at.
+- Rows with the same printed label but different results are separate measurements; keep each of them.
+- Keep the printed marker name, including specimen, organism, antibody class, component number, and method
+  when printed. Do not add an antibody class, component, unit, or reference interval that is not printed.
+- A short specimen prefix such as "S-", "B -", "U_", or "P-" names the specimen (serum, blood, urine, plasma);
+  it is not part of the analyte. "B - Lymphocytes" is total lymphocytes, not B lymphocytes.
+- "source_text": copy the printed row or fragment the result was read from, verbatim in the original language
+  (at most about 200 characters), so the extraction can be checked against the source.\
+"""
+
+
+MEASUREMENT_DATE_RULES = """\
+measured_at:
+- The specimen collection date of that result as YYYY-MM-DD: a date printed on the result's row or column,
+  otherwise the collection/sampling date of the report block the result belongs to.
+- Prefer collection/sampling dates over receipt, processing, validation, or print dates; use those only when the
+  block prints no collection date.
+- Do not carry a date over from an unrelated report block, and do not use the filename.
+- When only month and year apply (for example results quoted in history sections as "11/2022"), estimate
+  the most likely day from the surrounding text, otherwise use the 15th of that month.
+- Return null when no date applies to the result; the document-level date is used instead.\
+"""
+
+
+MEASUREMENT_SCOPE_RULES = """\
+- Extract every explicitly reported result, including results inside clinical notes, letters, or discharge
+  summaries. Do not extract ordered tests without results, reference tables, or general assessments such as
+  "results normal".
+- Return an empty "measurements" array only when the document reports no results.\
 """
 
 
@@ -134,7 +181,10 @@ MEASUREMENT_EXTRACTION_RULES = f"""\
 - Include every measured marker, including qualitative serology and immunology results.
 - Keep marker names specific, including organism and antibody class when shown.
 - Do not skip dense semicolon-separated or comma-separated sections; split each
-    assay/result into its own measurement object.
+    assay/result into its own measurement object. Check the first and last item of every list.
+{MEASUREMENT_SCOPE_RULES}
+{MEASUREMENT_BINDING_RULES}
+{MEASUREMENT_DATE_RULES}
 {MEASUREMENT_REFERENCE_BOUND_RULES}\
 """
 
@@ -147,22 +197,15 @@ PDF of a document. Your job is to:
     This includes qualitative serology and immunology markers reported as positive/negative/reactive/not detected.
 2. Identify the lab/report source when possible (for example Synlab, Jaeger, Unilabs).
 3. For each marker return a JSON array of objects with keys:
-    "marker_name", "value" (number for numeric results, string for qualitative
-    results), "unit", "reference_low" (numeric or null), "reference_high"
-    (numeric or null), "measured_at" (ISO date string or null), "page_number"
-    (integer, 1-indexed – which page/image the value appears on).
-4. Also return "lab_date" (ISO date string or null) for the report date.
+    "marker_name", "value" (number, or string as described below), "unit", "reference_low" (numeric or null),
+    "reference_high" (numeric or null), "measured_at" (YYYY-MM-DD or null), "page_number"
+    (integer, 1-indexed – which page/image the value appears on), "source_text" (string).
+4. Also return "lab_date" (YYYY-MM-DD or null) for the specimen collection date of the document as a whole.
 5. Also return "source" as a short raw source/provider name string, or null if unclear.
-
-If the document is not a lab report, return an empty "measurements" array instead of inventing measurements.
 
 CRITICAL rules for values:
 {MEASUREMENT_VALUE_RULES}
 - Do NOT omit a marker just because its value is qualitative.
-- Use a dot (.) as the decimal separator, never a comma or space. E.g. 0.1, not "0,1" or "0 1".
-- Do NOT insert spaces into numbers. E.g. 1500, not "1 500".
-- If a value is less than 1, include the leading zero: 0.1, not .1.
-- Read decimal points carefully – "0.1" (zero point one) is very different from "1".
 
 CRITICAL extraction rules:
 {MEASUREMENT_EXTRACTION_RULES}
@@ -170,6 +213,10 @@ CRITICAL extraction rules:
 When multiple pages/images are attached, number them starting from 1 in the \
 order they are provided and set "page_number" accordingly for every measurement.
 If there is only one page/image, set "page_number" to 1 for all measurements.
+
+The user message may include the embedded text layer of each PDF page. Use it to read exact characters \
+(digits, decimal separators, comparators), but bind values to labels using the page image layout. Where the text \
+layer and the image disagree, follow what is visibly printed.
 
 Use the provided original filename as an additional hint for the source only when it helps.
 
@@ -214,7 +261,7 @@ MISTRAL_MEDICAL_ANNOTATION_FORMAT = {
         "properties": {
             "lab_date": {
                 "type": ["string", "null"],
-                "description": "Report date as an ISO date string when visible, otherwise null.",
+                "description": "Specimen collection date of the document as YYYY-MM-DD when visible, otherwise null.",
             },
             "source": {
                 "type": ["string", "null"],
@@ -234,7 +281,10 @@ MISTRAL_MEDICAL_ANNOTATION_FORMAT = {
                             ),
                         },
                         "value": {
-                            "description": "Numeric results as numbers and qualitative results as short strings.",
+                            "description": (
+                                "Exact numeric results as numbers. Results with a comparator (e.g. '<0.1'), "
+                                "titers (e.g. '1:160'), and qualitative results as strings exactly as printed."
+                            ),
                             "anyOf": [{"type": "number"}, {"type": "string"}],
                         },
                         "unit": {
@@ -251,12 +301,19 @@ MISTRAL_MEDICAL_ANNOTATION_FORMAT = {
                         },
                         "measured_at": {
                             "type": ["string", "null"],
-                            "description": "ISO date string for the measurement when explicitly shown, otherwise null.",
+                            "description": (
+                                "Specimen collection date (YYYY-MM-DD) of this result or its report block, "
+                                "otherwise null."
+                            ),
                         },
                         "page_number": {
                             "type": "integer",
                             "minimum": 1,
                             "description": "1-indexed page number within the attached batch.",
+                        },
+                        "source_text": {
+                            "type": ["string", "null"],
+                            "description": "Verbatim printed row or fragment the result was read from.",
                         },
                     },
                     "required": [
@@ -267,6 +324,7 @@ MISTRAL_MEDICAL_ANNOTATION_FORMAT = {
                         "reference_high",
                         "measured_at",
                         "page_number",
+                        "source_text",
                     ],
                 },
             },
@@ -282,8 +340,7 @@ Extract all lab values from this lab report.
 Rules:
 {MEASUREMENT_EXTRACTION_RULES}
 {MEASUREMENT_VALUE_RULES}
-- Set page_number relative to the attached batch, starting from 1.
-- Return an empty measurements array when the document is not a lab report.\
+- Set page_number relative to the attached batch, starting from 1.\
 """
 
 
@@ -303,13 +360,15 @@ Rules:
 - Use only the provided raw text and filename.
 - Do not rely on any structured measurements or translated text.
 - Keep the summary factual and concise.
-- For "lab_date", prefer the main document/report-level date rather than dates attached only to
-  individual measurements or comparison rows.
-- When several dates are plausible, prefer dates labeled like validation/validated, result/report,
-  specimen collection, or issue dates when they apply to the whole report.
+- "lab_date" is the fallback date for results without their own date, so prefer the specimen
+  collection/sampling date of the whole document; otherwise use its result, validation, report, or issue date.
+  Do not use dates attached only to individual measurements, comparison rows, or history sections.
 - If more than one document-level date is plausible, choose the most likely one for this specific
   document instead of returning null too early.
-- Return null only when no plausible document-level date is visible.
+- The user names the files, so a full date in the filename (for example 2025-03-14, 20250314, or
+  14.03.2025) is trustworthy. Use it when the text shows no document-level date, and prefer it when
+  choosing between several plausible document dates.
+- Return null only when neither the text nor the filename gives a plausible full document-level date.
 - If the document is not clearly a lab report, briefly describe what kind of document it seems to be.
 - Do not add generic cautions or boilerplate.
 
@@ -318,7 +377,7 @@ Do not include any commentary outside the JSON.\
 """
 
 
-MEDICAL_TEXT_SYSTEM_PROMPT = """\
+MEDICAL_TEXT_SYSTEM_PROMPT = f"""\
 You are a medical lab report extraction assistant.
 
 The user will provide:
@@ -327,25 +386,27 @@ The user will provide:
 
 Your job is to:
 1. Identify every measured lab marker.
-2. Extract "lab_date" as an ISO date string or null when the report date is not clear.
+2. Extract "lab_date" as YYYY-MM-DD or null when the document date is not clear.
 3. Extract "source" as a short raw lab/provider name string or null when unclear.
 4. Return each measurement with keys:
    "marker_name", "value", "unit", "reference_low", "reference_high",
-   "measured_at", and "page_number".
+   "measured_at", "page_number", and "source_text".
 
-Rules:
-- Use a JSON number in "value" for numeric results and a short JSON string for qualitative results.
-- "reference_low" and "reference_high" must be JSON numbers or null.
-- If the document is not a lab report, return an empty "measurements" array.
+Rules for values:
+{MEASUREMENT_VALUE_RULES}
+
+Extraction rules:
+{MEASUREMENT_EXTRACTION_RULES}
+
+Document rules:
 - Because the source is a text document, always set "page_number" to 1.
 - Use only the provided raw text and filename.
-- For "lab_date", choose the single best date for the document as a whole, not a date attached only
-  to one measurement row.
-- When several dates are plausible, prefer document-level validation/result/report/specimen dates
-  over dates that belong only to individual analytes, history rows, or unrelated admin details.
-- Return null only when no plausible document-level date is visible.
+- For "lab_date", prefer the specimen collection date of the document as a whole, not a date attached only
+  to one measurement row, history row, or unrelated admin detail.
+- A full date in the user-chosen filename is trustworthy; use it when the text shows no document-level date.
+- Return null only when no plausible document-level date is available.
 
-Return ONLY valid JSON: {"lab_date": "...", "source": "...", "measurements": [...]}.
+Return ONLY valid JSON: {{"lab_date": "...", "source": "...", "measurements": [...]}}.
 Do not include any commentary outside the JSON.\
 """
 
@@ -540,17 +601,39 @@ def _pdf_to_images(
     return paths
 
 
+def _pdf_page_text_layers(pdf_path: str, *, start_page: int, stop_page: int) -> list[str]:
+    with fitz.open(pdf_path) as document:
+        return [
+            document.load_page(page_index).get_text("text").strip()[:PDF_TEXT_LAYER_MAX_CHARS_PER_PAGE]
+            for page_index in range(start_page, stop_page)
+        ]
+
+
+def _text_layer_prompt_section(page_texts: list[str] | None) -> str:
+    if not page_texts or not any(page_texts):
+        return ""
+    sections = [f"--- Page {index} ---\n{text}" for index, text in enumerate(page_texts, start=1) if text]
+    return (
+        "Embedded PDF text layer (exact characters, but possibly incomplete or out of reading order):\n"
+        + "\n\n".join(sections)
+    )
+
+
 async def _extract_structured_medical_data_from_attachments(
     attachments: list[dict],
     *,
     filename: str | None = None,
     request_context: str = "",
+    page_texts: list[str] | None = None,
 ) -> dict:
     prompt = "Extract all lab values from the attached file, including qualitative serology and immunology results."
     if filename:
         prompt = f"Original filename: {filename}\n\n{prompt}"
+    text_layer = _text_layer_prompt_section(page_texts)
+    if text_layer:
+        prompt = f"{prompt}\n\n{text_layer}"
 
-    return await copilot_ask_json(
+    parsed = await copilot_ask_json(
         MEDICAL_OCR_SYSTEM_PROMPT,
         prompt,
         attachments=attachments,
@@ -558,6 +641,7 @@ async def _extract_structured_medical_data_from_attachments(
         request_name="structured_medical_extraction",
         request_context=request_context,
     )
+    return _normalized_medical_annotation(parsed)
 
 
 async def _extract_document_text_from_attachments(
@@ -582,8 +666,10 @@ async def _extract_document_text_from_attachments(
 
 def _normalized_medical_annotation(annotation: dict) -> dict:
     measurements = annotation.get("measurements")
+    # A reply without a measurements list is malformed, not an empty page; storing it
+    # would mark the pages as extracted and silently lose their results.
     if not isinstance(measurements, list):
-        measurements = []
+        raise ValueError("Structured extraction reply has no 'measurements' list")
     return {
         "lab_date": annotation.get("lab_date"),
         "source": annotation.get("source"),
@@ -772,6 +858,8 @@ class _ExtractionKind:
     extract_fn: Callable[..., Awaitable[dict]]
     merge_fn: Callable[[list[dict]], dict]
     post_process_fn: Callable[[dict, int], dict] | None = None
+    # Native PDF text gives exact digits for dense small print that the downscaled page image blurs.
+    uses_pdf_text_layer: bool = False
 
 
 async def _pdf_batch_extract(
@@ -798,9 +886,14 @@ async def _pdf_batch_extract(
     try:
         temp_images = await run_pymupdf(_pdf_to_images, pdf_path, start_page=start_page, stop_page=stop_page, dpi=dpi)
         attachments = [_file_attachment(path) for path in temp_images]
+        extra_arguments: dict = {}
+        if kind.uses_pdf_text_layer:
+            extra_arguments["page_texts"] = await run_pymupdf(
+                _pdf_page_text_layers, pdf_path, start_page=start_page, stop_page=stop_page
+            )
 
         batch_context = f"{filename}:p{start_page + 1}-{stop_page}:{dpi}dpi"
-        result = await kind.extract_fn(attachments, filename=filename, request_context=batch_context)
+        result = await kind.extract_fn(attachments, filename=filename, request_context=batch_context, **extra_arguments)
         logger.info(
             "PDF batch extract done kind=%s path=%s filename=%s pages=%s-%s dpi=%s duration=%.2fs",
             kind.label,
@@ -875,6 +968,7 @@ async def _pdf_range_with_retries(
     stop_page: int,
     dpi: int = OCR_PDF_RENDER_DPI,
     filename: str | None = None,
+    transient_retry_used: bool = False,
 ) -> dict:
     page_count = stop_page - start_page
     started_at = time.perf_counter()
@@ -976,28 +1070,30 @@ async def _pdf_range_with_retries(
             right = await _retry(start_page=midpoint, stop_page=stop_page)
             return kind.merge_fn([left, right])
 
-        if dpi != OCR_PDF_MIN_RENDER_DPI:
-            logger.warning(
-                "%s page request failed for %s (filename=%s, page=%s, dpi=%s, reason=%s); retrying at dpi=%s",
+        # Lowering resolution would trade a transport error for misread digits, so a
+        # single page only gets one same-resolution retry for transient failures.
+        if _is_request_too_large_error(exc) or transient_retry_used:
+            logger.exception(
+                "%s extraction failed for %s (filename=%s, page=%s, dpi=%s, reason=%s)",
                 kind.label,
                 pdf_path,
                 filename,
                 start_page + 1,
                 dpi,
                 retry_reason,
-                OCR_PDF_MIN_RENDER_DPI,
             )
-            return await _retry(dpi=OCR_PDF_MIN_RENDER_DPI)
+            raise
 
-        logger.exception(
-            "%s extraction failed at minimum DPI for %s (filename=%s, page=%s, dpi=%s)",
+        logger.warning(
+            "%s page request failed for %s (filename=%s, page=%s, dpi=%s, reason=%s); retrying once",
             kind.label,
             pdf_path,
             filename,
             start_page + 1,
             dpi,
+            retry_reason,
         )
-        raise
+        return await _retry(transient_retry_used=True)
 
 
 async def _image_with_retries(
@@ -1006,6 +1102,7 @@ async def _image_with_retries(
     *,
     dpi: int = OCR_PDF_RENDER_DPI,
     filename: str | None = None,
+    transient_retry_used: bool = False,
 ) -> dict:
     started_at = time.perf_counter()
     logger.info("%s image start path=%s filename=%s dpi=%s", kind.label, image_path, filename, dpi)
@@ -1032,32 +1129,33 @@ async def _image_with_retries(
             logger.exception("%s extraction failed for %s (filename=%s, dpi=%s)", kind.label, image_path, filename, dpi)
             raise
 
-        if dpi != OCR_PDF_MIN_RENDER_DPI:
-            logger.warning(
-                "%s image request failed for %s (filename=%s, dpi=%s, reason=%s); retrying at dpi=%s",
+        if _is_request_too_large_error(exc) or transient_retry_used:
+            logger.exception(
+                "%s extraction failed for %s (filename=%s, dpi=%s, reason=%s)",
                 kind.label,
                 image_path,
                 filename,
                 dpi,
                 retry_reason,
-                OCR_PDF_MIN_RENDER_DPI,
             )
-            await asyncio.sleep(OCR_RETRY_DELAY)
-            return await _image_with_retries(
-                image_path,
-                kind,
-                dpi=OCR_PDF_MIN_RENDER_DPI,
-                filename=filename,
-            )
+            raise
 
-        logger.exception(
-            "%s extraction failed at minimum DPI for %s (filename=%s, dpi=%s)",
+        logger.warning(
+            "%s image request failed for %s (filename=%s, dpi=%s, reason=%s); retrying once",
             kind.label,
             image_path,
             filename,
             dpi,
+            retry_reason,
         )
-        raise
+        await asyncio.sleep(OCR_RETRY_DELAY)
+        return await _image_with_retries(
+            image_path,
+            kind,
+            dpi=dpi,
+            filename=filename,
+            transient_retry_used=True,
+        )
 
 
 _MEDICAL_EXTRACTION = _ExtractionKind(
@@ -1065,6 +1163,7 @@ _MEDICAL_EXTRACTION = _ExtractionKind(
     extract_fn=_extract_structured_medical_data_from_attachments,
     merge_fn=_merge_structured_medical_results,
     post_process_fn=_offset_result_page_numbers,
+    uses_pdf_text_layer=True,
 )
 
 _TEXT_EXTRACTION = _ExtractionKind(
@@ -1110,7 +1209,7 @@ async def extract_measurement_batch(
         )
 
     # The DB-backed pipeline calls this wrapper directly for each durable OCR
-    # job, so it must go through the retry/split/lower-DPI path instead of the
+    # job, so it must go through the retry/split path instead of the
     # raw single-attempt batch call.
     return await _pdf_range_with_retries(
         file_path,

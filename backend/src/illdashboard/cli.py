@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -15,9 +16,10 @@ import uvicorn
 from sqlalchemy.engine import make_url
 
 from illdashboard.config import settings
+from illdashboard.copilot.client import shutdown_client
 from illdashboard.database import dispose_database_engine, get_async_session_factory, get_database_engine
 from illdashboard.database_migrations import prepare_main_database
-from illdashboard.services import pipeline
+from illdashboard.services import extraction_eval, pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Reset failed pipeline jobs to pending; a running server picks them up (may make paid AI requests)",
     )
     retry_parser.set_defaults(command="retry-failed-jobs")
+
+    evaluate_parser = subparsers.add_parser(
+        "evaluate-extraction",
+        help=(
+            "Extract pages listed in a private MANIFEST and score them without touching the database "
+            "(makes paid AI requests for pages not already cached in OUT)"
+        ),
+    )
+    evaluate_parser.add_argument("manifest", type=Path)
+    evaluate_parser.add_argument("--files-dir", type=Path, help="Directory with source documents or uploads")
+    evaluate_parser.add_argument("--out", type=Path, required=True, help="Report and reply cache directory")
+    evaluate_parser.add_argument("--refresh", action="store_true", help="Ignore cached replies")
+    evaluate_parser.set_defaults(command="evaluate-extraction")
 
     return parser
 
@@ -137,6 +152,13 @@ async def _retry_failed_jobs() -> int:
         await dispose_database_engine()
 
 
+async def _evaluate_extraction(manifest: Path, files_dir: Path | None, out_dir: Path, refresh: bool) -> dict:
+    try:
+        return await extraction_eval.evaluate(manifest, files_dir=files_dir, out_dir=out_dir, refresh=refresh)
+    finally:
+        await shutdown_client()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -163,6 +185,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "retry-failed-jobs":
         print(f"Reset {asyncio.run(_retry_failed_jobs())} failed jobs to pending")
+        return 0
+
+    if args.command == "evaluate-extraction":
+        report = asyncio.run(_evaluate_extraction(args.manifest, args.files_dir, args.out, args.refresh))
+        print(json.dumps(report["summary"], indent=2))
+        print(f"Full report: {args.out / 'report.json'}")
         return 0
 
     parser.error(f"Unsupported command: {args.command}")

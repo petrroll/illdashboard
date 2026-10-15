@@ -9,8 +9,9 @@ from dataclasses import dataclass
 from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from illdashboard.models import Base, SchemaMigration
+from illdashboard.models import Base, QualitativeRule, SchemaMigration
 from illdashboard.services.markers import ensure_marker_groups
+from illdashboard.services.qualitative_values import normalize_qualitative_key
 from illdashboard.services.search import ensure_search_schema
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,63 @@ async def _migration_0003_drop_lab_file_ocr_raw(session: AsyncSession) -> None:
         await session.execute(text('ALTER TABLE "lab_files" DROP COLUMN "ocr_raw"'))
 
 
+async def _migration_0004_measurement_value_comparator(session: AsyncSession) -> None:
+    await _add_column_if_missing(
+        session,
+        "measurements",
+        "original_value_comparator",
+        '"original_value_comparator" VARCHAR',
+    )
+
+
+async def _migration_0005_per_marker_qualitative_rules(session: AsyncSession) -> None:
+    # Rules were unique per raw word across all markers. Copy each learned rule to
+    # every marker that already uses the word, so no paid re-normalization is
+    # needed; new markers then get their own context-aware rule.
+    legacy_rules = (
+        await session.execute(
+            text(
+                "SELECT normalized_original_value, original_value, canonical_value, boolean_value "
+                "FROM qualitative_rules"
+            )
+        )
+    ).all()
+    usages = (
+        await session.execute(
+            text(
+                "SELECT DISTINCT measurement_type_id, original_qualitative_value FROM measurements "
+                "WHERE measurement_type_id IS NOT NULL AND original_qualitative_value IS NOT NULL"
+            )
+        )
+    ).all()
+    type_ids_by_key: dict[str, set[int]] = {}
+    for measurement_type_id, original_value in usages:
+        key = normalize_qualitative_key(original_value)
+        if key is not None:
+            type_ids_by_key.setdefault(key, set()).add(measurement_type_id)
+
+    await session.execute(text('DROP TABLE "qualitative_rules"'))
+    connection = await session.connection()
+    await connection.run_sync(lambda sync_connection: QualitativeRule.__table__.create(sync_connection))
+    for normalized_value, original_value, canonical_value, boolean_value in legacy_rules:
+        for measurement_type_id in sorted(type_ids_by_key.get(normalized_value, ())):
+            session.add(
+                QualitativeRule(
+                    original_value=original_value,
+                    canonical_value=canonical_value,
+                    boolean_value=boolean_value,
+                    normalized_original_value=normalized_value,
+                    measurement_type_id=measurement_type_id,
+                )
+            )
+    await session.flush()
+
+
+async def _migration_0006_extraction_trace(session: AsyncSession) -> None:
+    await _add_column_if_missing(session, "measurements", "source_text", '"source_text" TEXT')
+    await _add_column_if_missing(session, "measurement_batches", "raw_response_json", '"raw_response_json" TEXT')
+
+
 MIGRATIONS: tuple[DatabaseMigration, ...] = (
     DatabaseMigration(
         version=1,
@@ -129,6 +187,21 @@ MIGRATIONS: tuple[DatabaseMigration, ...] = (
         version=3,
         name="drop-lab-file-ocr-raw",
         apply=_migration_0003_drop_lab_file_ocr_raw,
+    ),
+    DatabaseMigration(
+        version=4,
+        name="measurement-value-comparator",
+        apply=_migration_0004_measurement_value_comparator,
+    ),
+    DatabaseMigration(
+        version=5,
+        name="per-marker-qualitative-rules",
+        apply=_migration_0005_per_marker_qualitative_rules,
+    ),
+    DatabaseMigration(
+        version=6,
+        name="extraction-trace",
+        apply=_migration_0006_extraction_trace,
     ),
 )
 

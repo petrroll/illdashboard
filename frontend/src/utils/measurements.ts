@@ -475,6 +475,28 @@ export function hasEditedMeasurementField(
   return fieldNames.some((fieldName) => editedFields.has(fieldName));
 }
 
+const VALUE_COMPARATOR_SYMBOLS = { "<": "<", "<=": "≤", ">": ">", ">=": "≥" } as const;
+
+// Censored results such as "<0.1" store the bound as the value; the comparator
+// must stay visible so a detection limit never reads as an exact result.
+export function getSourceValueComparator(
+  measurement: Pick<Measurement, "original_value_comparator" | "qualitative_value">,
+) {
+  const comparator = measurement.original_value_comparator;
+  return comparator && measurement.qualitative_value == null ? VALUE_COMPARATOR_SYMBOLS[comparator] : null;
+}
+
+export function getDisplayedValueComparator(
+  measurement: Pick<Measurement, "original_value_comparator" | "qualitative_value" | "user_edited_fields">,
+) {
+  // A user-edited value replaces the source bound, so its comparator no longer applies.
+  return hasEditedMeasurementField(measurement, "canonical_value") ? null : getSourceValueComparator(measurement);
+}
+
+export function withValueComparator(renderedValue: string, comparator: string | null) {
+  return comparator && renderedValue !== "—" ? `${comparator}${renderedValue}` : renderedValue;
+}
+
 export function formatPreferredMeasurementValue(
   measurement: Pick<
     Measurement,
@@ -483,11 +505,12 @@ export function formatPreferredMeasurementValue(
     | "canonical_unit"
     | "qualitative_value"
     | "original_value"
+    | "original_value_comparator"
     | "original_unit"
     | "user_edited_fields"
   >,
 ) {
-  return isUnitConversionMissing(measurement)
+  const renderedValue = isUnitConversionMissing(measurement)
     ? formatMeasurementValue(
         getDisplayedMeasurementValue(measurement),
         getOriginalMeasurementUnit(measurement),
@@ -498,6 +521,7 @@ export function formatPreferredMeasurementValue(
         measurement.canonical_unit,
         measurement.qualitative_value,
       );
+  return withValueComparator(renderedValue, getDisplayedValueComparator(measurement));
 }
 
 export function formatPreferredMeasurementScalarValue(
@@ -507,10 +531,11 @@ export function formatPreferredMeasurementScalarValue(
     | "canonical_value"
     | "qualitative_value"
     | "original_value"
+    | "original_value_comparator"
     | "user_edited_fields"
   >,
 ) {
-  return isUnitConversionMissing(measurement)
+  const renderedValue = isUnitConversionMissing(measurement)
     ? formatMeasurementScalarValue(
         getDisplayedMeasurementValue(measurement),
         measurement.qualitative_value,
@@ -519,6 +544,7 @@ export function formatPreferredMeasurementScalarValue(
         measurement.canonical_value,
         measurement.qualitative_value,
       );
+  return withValueComparator(renderedValue, getDisplayedValueComparator(measurement));
 }
 
 export function formatPreferredMeasurementUnit(

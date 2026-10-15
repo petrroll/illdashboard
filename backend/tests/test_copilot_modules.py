@@ -132,104 +132,66 @@ async def _wait_for(condition, *, timeout: float = 1.0):
         await asyncio.sleep(0.01)
 
 
-@pytest.mark.asyncio
-async def test_measurement_batch_retries_single_page_at_lower_dpi_after_413():
-    async def fake_batch(
-        pdf_path: str,
-        kind: copilot_ocr._ExtractionKind,
-        *,
-        start_page: int,
-        stop_page: int,
-        dpi: int,
-        filename: str | None = None,
-    ):
-        if dpi == copilot_ocr.OCR_PDF_RENDER_DPI:
-            raise Exception("CAPIError: 413 failed to parse request")
-        return {
-            "lab_date": None,
-            "source": None,
-            "measurements": [
-                {
-                    "marker_name": "Sodium",
-                    "value": 141,
-                    "unit": "mmol/l",
-                    "reference_low": 136,
-                    "reference_high": 145,
-                    "measured_at": None,
-                    "page_number": 1,
-                }
-            ],
+_SODIUM_RESULT = {
+    "lab_date": None,
+    "source": None,
+    "measurements": [
+        {
+            "marker_name": "Sodium",
+            "value": 141,
+            "unit": "mmol/l",
+            "reference_low": 136,
+            "reference_high": 145,
+            "measured_at": None,
+            "page_number": 1,
         }
+    ],
+}
 
-    with patch(
-        "illdashboard.copilot.extraction._pdf_batch_extract",
-        new=AsyncMock(side_effect=fake_batch),
-    ) as batch_mock:
-        result = await copilot_ocr.extract_measurement_batch(
-            "/tmp/report.pdf", start_page=0, stop_page=1, dpi=copilot_ocr.OCR_PDF_RENDER_DPI
-        )
+
+@pytest.mark.asyncio
+async def test_single_page_413_fails_instead_of_lowering_resolution():
+    batch_mock = AsyncMock(side_effect=Exception("CAPIError: 413 failed to parse request"))
+    with patch("illdashboard.copilot.extraction._pdf_batch_extract", new=batch_mock):
+        with pytest.raises(Exception, match="413"):
+            await copilot_ocr.extract_measurement_batch(
+                "/tmp/report.pdf", start_page=0, stop_page=1, dpi=copilot_ocr.OCR_PDF_RENDER_DPI
+            )
+
+    assert [call.kwargs["dpi"] for call in batch_mock.await_args_list] == [copilot_ocr.OCR_PDF_RENDER_DPI]
+
+
+@pytest.mark.asyncio
+async def test_single_page_timeout_retries_once_at_same_resolution():
+    batch_mock = AsyncMock(side_effect=[TimeoutError(), _SODIUM_RESULT])
+    with patch("illdashboard.copilot.extraction._pdf_batch_extract", new=batch_mock):
+        result = await copilot_ocr.extract_measurement_batch("/tmp/report.pdf", start_page=0, stop_page=1, dpi=144)
 
     assert [measurement["marker_name"] for measurement in result["measurements"]] == ["Sodium"]
-    assert [measurement["page_number"] for measurement in result["measurements"]] == [1]
-    assert [
-        (call.kwargs["start_page"], call.kwargs["stop_page"], call.kwargs["dpi"])
-        for call in batch_mock.await_args_list
-    ] == [(0, 1, 144), (0, 1, 72)]
+    assert [(call.kwargs["start_page"], call.kwargs["dpi"]) for call in batch_mock.await_args_list] == [
+        (0, 144),
+        (0, 144),
+    ]
 
 
 @pytest.mark.asyncio
-async def test_extract_measurement_batch_retries_image_at_lower_dpi_after_413():
-    async def fake_image_extract(
-        image_path: str,
-        kind: copilot_ocr._ExtractionKind,
-        *,
-        dpi: int,
-        filename: str | None = None,
-        render_cache=None,
-    ):
-        assert image_path == "/tmp/report.png"
-        assert kind is copilot_ocr._MEDICAL_EXTRACTION
-        if dpi == copilot_ocr.OCR_PDF_RENDER_DPI:
-            raise Exception("CAPIError: 413 failed to parse request")
-        return {
-            "lab_date": None,
-            "source": None,
-            "measurements": [
-                {
-                    "marker_name": "Sodium",
-                    "value": 141,
-                    "unit": "mmol/l",
-                    "reference_low": 136,
-                    "reference_high": 145,
-                    "measured_at": None,
-                    "page_number": 1,
-                }
-            ],
-        }
+async def test_single_page_timeout_gives_up_after_one_retry():
+    batch_mock = AsyncMock(side_effect=TimeoutError())
+    with patch("illdashboard.copilot.extraction._pdf_batch_extract", new=batch_mock):
+        with pytest.raises(TimeoutError):
+            await copilot_ocr.extract_measurement_batch("/tmp/report.pdf", start_page=0, stop_page=1, dpi=144)
 
-    with patch(
-        "illdashboard.copilot.extraction._image_extract",
-        new=AsyncMock(side_effect=fake_image_extract),
-    ) as image_mock:
-        result = await copilot_ocr.extract_measurement_batch(
-            "/tmp/report.png",
-            start_page=0,
-            stop_page=1,
-            dpi=144,
-        )
+    assert batch_mock.await_count == 2
 
-    assert result["measurements"][0]["page_number"] == 1
-    assert [
-        (
-            call.args[0],
-            call.kwargs["dpi"],
-            call.kwargs["filename"],
-        )
-        for call in image_mock.await_args_list
-    ] == [
-        ("/tmp/report.png", 144, None),
-        ("/tmp/report.png", 72, None),
-    ]
+
+@pytest.mark.asyncio
+async def test_image_413_fails_instead_of_lowering_resolution():
+    image_mock = AsyncMock(side_effect=Exception("CAPIError: 413 failed to parse request"))
+    with patch("illdashboard.copilot.extraction._image_extract", new=image_mock):
+        with pytest.raises(Exception, match="413"):
+            await copilot_ocr.extract_measurement_batch("/tmp/report.png", start_page=0, stop_page=1, dpi=144)
+
+    assert [call.kwargs["dpi"] for call in image_mock.await_args_list] == [144]
 
 
 def test_pdf_to_images_caps_render_to_a4_pixels(tmp_path):
@@ -588,11 +550,55 @@ def test_medical_summary_prompts_prefer_document_level_dates():
     summary_prompt = copilot_ocr.MEDICAL_SUMMARY_SYSTEM_PROMPT
     text_prompt = copilot_ocr.MEDICAL_TEXT_SYSTEM_PROMPT
 
-    assert "document as a whole" in summary_prompt
+    assert "whole document" in summary_prompt
     assert "individual measurements" in summary_prompt
-    assert "validation/validated" in summary_prompt
-    assert "Return null only when no plausible document-level date is visible." in summary_prompt
+    assert "collection/sampling date" in summary_prompt
+    assert "date in the filename" in summary_prompt
     assert "document as a whole" in text_prompt
+    assert "filename is trustworthy" in text_prompt
+
+
+def test_all_measurement_extractors_share_value_binding_and_date_rules():
+    prompts = (
+        copilot_ocr.MEDICAL_OCR_SYSTEM_PROMPT,
+        copilot_ocr.MISTRAL_MEDICAL_ANNOTATION_PROMPT,
+        copilot_ocr.MEDICAL_TEXT_SYSTEM_PROMPT,
+    )
+    for shared_rules in (
+        copilot_ocr.MEASUREMENT_VALUE_RULES,
+        copilot_ocr.MEASUREMENT_BINDING_RULES,
+        copilot_ocr.MEASUREMENT_DATE_RULES,
+        copilot_ocr.MEASUREMENT_SCOPE_RULES,
+    ):
+        for prompt in prompts:
+            assert shared_rules.strip() in prompt
+    assert '"<0.1"' in copilot_ocr.MEASUREMENT_VALUE_RULES
+    assert "not a lab report" not in copilot_ocr.MEDICAL_OCR_SYSTEM_PROMPT
+
+
+@pytest.mark.asyncio
+async def test_structured_extraction_rejects_reply_without_measurements_list():
+    with patch("illdashboard.copilot.extraction.copilot_ask_json", new=AsyncMock(return_value={"lab_date": None})):
+        with pytest.raises(ValueError, match="measurements"):
+            await copilot_ocr._extract_structured_medical_data_from_attachments([], filename="report.pdf")
+
+
+@pytest.mark.asyncio
+async def test_pdf_measurement_extraction_includes_embedded_text_layer(tmp_path):
+    pdf_path = tmp_path / "report.pdf"
+    document = fitz.open()
+    document.new_page().insert_text((72, 72), "CRP 0,8 mg/l")
+    document.new_page()
+    document.save(pdf_path)
+    document.close()
+
+    ask_mock = AsyncMock(return_value={"lab_date": None, "source": None, "measurements": []})
+    with patch("illdashboard.copilot.extraction.copilot_ask_json", new=ask_mock):
+        await copilot_ocr.extract_measurement_batch(str(pdf_path), start_page=0, stop_page=2, dpi=144)
+
+    user_prompt = ask_mock.await_args.args[1]
+    assert "--- Page 1 ---\nCRP 0,8 mg/l" in user_prompt
+    assert "--- Page 2 ---" not in user_prompt
 
 
 def test_medical_extraction_prompts_share_reference_bound_guidance():

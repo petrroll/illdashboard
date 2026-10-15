@@ -33,14 +33,14 @@ def test_copilot_model_defaults(default_settings):
     assert default_settings.EXTRACTION_PROVIDER == "copilot"
     assert default_settings.NORMALIZATION_PROVIDER == "copilot"
     assert default_settings.COPILOT_DEFAULT_MODEL == "gpt-5.6-terra"
-    assert default_settings.COPILOT_MEASUREMENT_EXTRACTION_MODEL == "gpt-6-luna"
+    assert default_settings.COPILOT_MEASUREMENT_EXTRACTION_MODEL == "gpt-6.1-sol"
     assert default_settings.COPILOT_TEXT_EXTRACTION_MODEL == "gpt-6-luna"
     assert default_settings.COPILOT_NORMALIZATION_MODEL == "gpt-6-luna"
 
 
-def test_copilot_settings_preserve_model_default_reasoning(default_settings):
+def test_copilot_settings_reasoning_defaults(default_settings):
+    assert default_settings.COPILOT_MEASUREMENT_EXTRACTION_REASONING_EFFORT == "medium"
     reasoning_settings = (
-        "COPILOT_MEASUREMENT_EXTRACTION_REASONING_EFFORT",
         "COPILOT_TEXT_EXTRACTION_REASONING_EFFORT",
         "COPILOT_NORMALIZATION_REASONING_EFFORT",
     )
@@ -70,7 +70,12 @@ def test_copilot_model_routing_and_environment_override(default_settings, monkey
     routed = copilot_client._request_session_settings(request_name)
 
     assert routed.model == getattr(default_settings, model_setting)
-    assert routed.reasoning_effort is None
+    expected_effort = (
+        default_settings.COPILOT_MEASUREMENT_EXTRACTION_REASONING_EFFORT
+        if model_setting == "COPILOT_MEASUREMENT_EXTRACTION_MODEL"
+        else None
+    )
+    assert routed.reasoning_effort == expected_effort
 
     monkeypatch.setenv(model_setting, "test-model-override")
     monkeypatch.setattr(copilot_client, "settings", Settings(_env_file=None))

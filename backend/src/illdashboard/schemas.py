@@ -75,6 +75,7 @@ class MeasurementOut(BaseModel):
     canonical_unit: str | None = None
     canonical_value: float | None = None
     original_value: float | None = None
+    original_value_comparator: Literal["<", "<=", ">", ">="] | None = None
     original_qualitative_value: str | None = None
     qualitative_bool: bool | None = None
     qualitative_value: str | None = None
@@ -86,6 +87,7 @@ class MeasurementOut(BaseModel):
     original_reference_high: float | None = None
     measured_at: datetime | None = None
     page_number: int | None = None
+    source_text: str | None = None
     has_user_edits: bool = False
     user_edited_fields: list[str] = Field(default_factory=list)
 
@@ -134,6 +136,7 @@ class MeasurementOut(BaseModel):
                 "canonical_unit": getattr(data, "effective_canonical_unit", None),
                 "canonical_value": getattr(data, "effective_canonical_value", None),
                 "original_value": data.original_value,
+                "original_value_comparator": data.original_value_comparator,
                 "original_qualitative_value": data.original_qualitative_value,
                 "qualitative_bool": getattr(data, "effective_qualitative_bool", None),
                 "qualitative_value": getattr(data, "effective_qualitative_value", None),
@@ -145,6 +148,7 @@ class MeasurementOut(BaseModel):
                 "original_reference_high": data.original_reference_high,
                 "measured_at": data.measured_at,
                 "page_number": data.page_number,
+                "source_text": data.source_text,
                 "has_user_edits": bool(getattr(data, "has_user_edits", False)),
                 "user_edited_fields": list(getattr(data, "user_edited_fields", [])),
             }

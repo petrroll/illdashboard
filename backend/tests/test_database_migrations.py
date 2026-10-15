@@ -203,13 +203,9 @@ async def test_prepare_main_database_migrates_pre_edit_schema(tmp_path: Path):
         assert await list_applied_migration_versions(engine) == [migration.version for migration in MIGRATIONS]
 
         async with engine.connect() as connection:
-            lab_columns = {
-                row[1]
-                for row in (await connection.execute(text("PRAGMA table_info('lab_files')"))).all()
-            }
+            lab_columns = {row[1] for row in (await connection.execute(text("PRAGMA table_info('lab_files')"))).all()}
             measurement_columns = {
-                row[1]
-                for row in (await connection.execute(text("PRAGMA table_info('measurements')"))).all()
+                row[1] for row in (await connection.execute(text("PRAGMA table_info('measurements')"))).all()
             }
             file_row = (
                 await connection.execute(
@@ -269,3 +265,54 @@ async def test_prepare_main_database_migrates_pre_edit_schema(tmp_path: Path):
         assert tuple(measurement_row) == (42.0, None, 0, None, 0, None, 0, 0, 0)
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_global_qualitative_rules_are_copied_to_each_marker_that_uses_them(tmp_path: Path):
+    db_path = tmp_path / "legacy-rules.db"
+    _create_pre_edit_schema(db_path)
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE qualitative_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                original_value VARCHAR NOT NULL,
+                canonical_value VARCHAR NOT NULL,
+                boolean_value BOOLEAN,
+                normalized_original_value VARCHAR NOT NULL UNIQUE,
+                measurement_type_id INTEGER,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            );
+            CREATE INDEX ix_qualitative_rules_normalized_original_value
+                ON qualitative_rules(normalized_original_value);
+            INSERT INTO qualitative_rules (original_value, canonical_value, boolean_value, normalized_original_value)
+                VALUES ('Positive', 'positive', 1, 'positive'), ('unused', 'unused', NULL, 'unused');
+            INSERT INTO measurement_types (name, normalized_key, group_name) VALUES ('Culture', 'culture', 'Other');
+            INSERT INTO measurements (lab_file_id, measurement_type_id, raw_marker_name, normalized_marker_key,
+                original_qualitative_value, normalization_status)
+            VALUES (1, 1, 'Ferritin', 'ferritin', 'positive', 'resolved'),
+                   (1, 2, 'Culture', 'culture', ' POSITIVE ', 'resolved');
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    engine = create_database_engine(f"sqlite+aiosqlite:///{db_path}")
+    try:
+        await prepare_main_database(engine)
+        async with engine.connect() as connection:
+            rows = (
+                await connection.execute(
+                    text(
+                        "SELECT measurement_type_id, normalized_original_value, canonical_value "
+                        "FROM qualitative_rules ORDER BY measurement_type_id"
+                    )
+                )
+            ).all()
+    finally:
+        await engine.dispose()
+
+    assert [tuple(row) for row in rows] == [(1, "positive", "positive"), (2, "positive", "positive")]

@@ -291,8 +291,8 @@ Environment variables can come from the shell or from `backend/.env`.
 | `EXTRACTION_PROVIDER` | `copilot` | Measurement/text extraction provider: `copilot` or `mistral` |
 | `NORMALIZATION_PROVIDER` | `copilot` | Normalization provider: `copilot` or `mistral` |
 | `COPILOT_DEFAULT_MODEL` | `gpt-5.6-terra` | Default Copilot model for summary/general requests |
-| `COPILOT_MEASUREMENT_EXTRACTION_MODEL` | `gpt-6-luna` | Copilot model for measurement extraction |
-| `COPILOT_MEASUREMENT_EXTRACTION_REASONING_EFFORT` | unset | Optional `low` / `medium` / `high` / `xhigh` reasoning effort when the chosen model supports it |
+| `COPILOT_MEASUREMENT_EXTRACTION_MODEL` | `gpt-6.1-sol` | Copilot model for measurement extraction |
+| `COPILOT_MEASUREMENT_EXTRACTION_REASONING_EFFORT` | `medium` | Optional `low` / `medium` / `high` / `xhigh` reasoning effort when the chosen model supports it |
 | `COPILOT_TEXT_EXTRACTION_MODEL` | `gpt-6-luna` | Copilot model for OCR text extraction and translation |
 | `COPILOT_TEXT_EXTRACTION_REASONING_EFFORT` | unset | Optional reasoning effort for text extraction when supported |
 | `COPILOT_NORMALIZATION_MODEL` | `gpt-6-luna` | Copilot model for normalization jobs |
@@ -308,7 +308,7 @@ Copilot SDK 1.0.21 requests use `empty` client mode with a private temporary sto
 
 ### Copilot model policy
 
-Bulk measurement OCR, text extraction/translation, and normalization default to GPT-6 Luna (`gpt-6-luna`). Summary/general requests use GPT-5.6 Terra (`gpt-5.6-terra`). GitHub's [model comparison](https://docs.github.com/en/copilot/reference/ai-models/model-comparison) describes both GPT-5.6 Luna and GPT-6 Luna as fast, cost-efficient options for small or repetitive tasks, and Terra as a balanced general-purpose choice. This keeps repeated batches on Luna while reserving Terra's general-purpose profile for summaries. It is a pragmatic quality/cost starting point, not evidence that a higher version is more accurate, nor a live healthcare/OCR benchmark.
+Text extraction/translation and normalization default to GPT-6 Luna (`gpt-6-luna`). Summary/general requests use GPT-5.6 Terra (`gpt-5.6-terra`). GitHub's [model comparison](https://docs.github.com/en/copilot/reference/ai-models/model-comparison) describes both GPT-5.6 Luna and GPT-6 Luna as fast, cost-efficient options for small or repetitive tasks, and Terra as a balanced general-purpose choice. Measurement extraction uses GPT-6.1 Sol (`gpt-6.1-sol`) with `medium` reasoning: a source review found swapped row values and dropped `<` comparators, and a wrong extracted value cannot be repaired by later normalization. Sol costs more per token than Luna (about 10× by the catalog cache price on 2026-10-15) but runs once per page. These are pragmatic quality/cost choices, not a live healthcare/OCR benchmark.
 
 Canonical literals were verified on 2026-10-13 in the official SDK CLI 1.0.97 software cache, `~/.cache/github-copilot-sdk/cli/1.0.97/prebuilds/linux-x64/runtime.node`: `gpt-6-luna`, `gpt-5.6-luna`, and `gpt-5.6-terra`. GitHub's [supported models reference](https://docs.github.com/en/copilot/reference/ai-models/supported-models) lists these models as GA with Copilot CLI support. GPT-5.6 Luna (`gpt-5.6-luna`) is an explicit alternative for the bulk settings; GitHub calls it the lowest-cost model in the GPT-5.6 family, not necessarily cheaper than GPT-6 Luna.
 

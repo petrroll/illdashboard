@@ -110,6 +110,8 @@ class MeasurementBatch(Base):
     start_page: Mapped[int] = mapped_column(Integer, nullable=False)
     stop_page: Mapped[int] = mapped_column(Integer, nullable=False)
     dpi: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The full provider reply, so a wrong value can be traced to extraction vs later normalization.
+    raw_response_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -210,6 +212,8 @@ class Measurement(Base):
     raw_marker_name: Mapped[str] = mapped_column(String, nullable=False)
     normalized_marker_key: Mapped[str] = mapped_column(String, nullable=False, index=True)
     original_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # "<", "<=", ">", or ">=" when the source printed a censored result such as "<0.1".
+    original_value_comparator: Mapped[str | None] = mapped_column(String, nullable=True)
     original_qualitative_value: Mapped[str | None] = mapped_column(String, nullable=True)
     qualitative_bool: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     qualitative_value: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -240,6 +244,7 @@ class Measurement(Base):
     user_edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     measured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     batch_key: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     normalization_status: Mapped[str] = mapped_column(String, nullable=False, default="pending", index=True)
     normalization_error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -469,16 +474,18 @@ class RescalingRule(Base):
 
 class QualitativeRule(Base):
     __tablename__ = "qualitative_rules"
-    __table_args__ = (UniqueConstraint("normalized_original_value"),)
+    # Scoped per marker: the same word ("present", "normal", "trace") can mean
+    # different things for different assays, so one global rule contaminated others.
+    __table_args__ = (UniqueConstraint("measurement_type_id", "normalized_original_value"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     original_value: Mapped[str] = mapped_column(String, nullable=False)
     canonical_value: Mapped[str] = mapped_column(String, nullable=False)
     boolean_value: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    normalized_original_value: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
-    measurement_type_id: Mapped[int | None] = mapped_column(
-        ForeignKey("measurement_types.id", ondelete="SET NULL"),
-        nullable=True,
+    normalized_original_value: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    measurement_type_id: Mapped[int] = mapped_column(
+        ForeignKey("measurement_types.id", ondelete="CASCADE"),
+        nullable=False,
         index=True,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -488,7 +495,7 @@ class QualitativeRule(Base):
         onupdate=utc_now,
     )
 
-    measurement_type: Mapped[MeasurementType | None] = relationship(back_populates="qualitative_rules")
+    measurement_type: Mapped[MeasurementType] = relationship(back_populates="qualitative_rules")
 
 
 class BiomarkerInsight(Base):

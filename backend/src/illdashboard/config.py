@@ -43,13 +43,15 @@ class Settings(BaseSettings):
 
     # GitHub Copilot SDK settings
     # Terra balances general-purpose quality and cost for summaries; Luna keeps
-    # repeated OCR, translation, and normalization batches lightweight. This is
-    # a workload/cost policy, not a healthcare accuracy benchmark.
+    # repeated OCR text, translation, and normalization batches lightweight.
+    # Measurement extraction runs once per page and stored values cannot be
+    # recovered downstream, so it uses the stronger Sol tier with medium
+    # reasoning for row binding. This is a workload/cost policy, not a
+    # healthcare accuracy benchmark.
     COPILOT_DEFAULT_MODEL: str = "gpt-5.6-terra"
-    COPILOT_MEASUREMENT_EXTRACTION_MODEL: str = "gpt-6-luna"
+    COPILOT_MEASUREMENT_EXTRACTION_MODEL: str = "gpt-6.1-sol"
     # None preserves each model's default reasoning, rather than disabling it.
-    # Avoid forcing extra effort on every batch without measured quality gains.
-    COPILOT_MEASUREMENT_EXTRACTION_REASONING_EFFORT: Literal["low", "medium", "high", "xhigh"] | None = None
+    COPILOT_MEASUREMENT_EXTRACTION_REASONING_EFFORT: Literal["low", "medium", "high", "xhigh"] | None = "medium"
     COPILOT_TEXT_EXTRACTION_MODEL: str = "gpt-6-luna"
     COPILOT_TEXT_EXTRACTION_REASONING_EFFORT: Literal["low", "medium", "high", "xhigh"] | None = None
     COPILOT_NORMALIZATION_MODEL: str = "gpt-6-luna"
