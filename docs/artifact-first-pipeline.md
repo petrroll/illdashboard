@@ -239,6 +239,8 @@ stateDiagram-v2
 
 ### Worker wakeups and SQLite
 
+- Measurement extraction has four workers; text extraction has six, so text can use the full shared extraction pool when measurement work drains. Copilot still permits at most six extraction requests combined and ten requests globally; normalization and summary limits are unchanged.
+- Text assembly is scheduled only after persisted text batches cover every page, not merely after every page has an extraction job scheduled. Premature assembly jobs finish with a waiting outcome without requeuing the controller; extraction completion wakes `ensure.text` when new artifacts arrive.
 - `enqueue_job` records the task type on the session; after that transaction commits, idle workers for that lane are woken immediately. Idle workers otherwise re-check only once per second, which covers delayed retries.
 - Idle claims probe with a plain `SELECT` and only issue the leasing `UPDATE` when work exists, so idle workers do not take the SQLite write lock.
 - Both databases run in WAL mode so API reads are not blocked by pipeline writes.

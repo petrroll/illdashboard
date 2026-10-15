@@ -24,6 +24,7 @@ from illdashboard.config import settings
 from illdashboard.copilot import extraction as copilot_extraction
 from illdashboard.copilot import normalization as copilot_normalization
 from illdashboard.copilot.client import (
+    COPILOT_EXTRACTION_CONCURRENCY,
     COPILOT_REQUEST_TIMEOUT,
     get_copilot_request_load,
     keep_responses_for_retry,
@@ -108,7 +109,8 @@ JOB_LEASE_HEARTBEAT_SECONDS = 60.0
 WORKER_IDLE_SECONDS = 1.0
 WORKER_STOP_GRACE_SECONDS = 1.0
 MEASUREMENT_EXTRACT_WORKER_CONCURRENCY = 4
-TEXT_EXTRACT_WORKER_CONCURRENCY = 2
+# Text can fill the shared extraction pool after measurement work drains.
+TEXT_EXTRACT_WORKER_CONCURRENCY = COPILOT_EXTRACTION_CONCURRENCY
 PROCESS_MEASUREMENTS_WORKER_CONCURRENCY = 2
 SUMMARY_WORKER_CONCURRENCY = 1
 ENSURE_WORKER_CONCURRENCY = 2
@@ -954,7 +956,7 @@ async def _ensure_text(session: AsyncSession, job: Job) -> None:
     for start_page, stop_page in missing_ranges:
         await _request_text_extraction_batch(session, file.id, start_page, stop_page, DEFAULT_OCR_DPI)
 
-    if not missing_ranges and file.text_assembled_at is None:
+    if _coverage_complete(file.page_count, existing_ranges) and file.text_assembled_at is None:
         await _request_assemble_text(session, file.id)
 
     await _refresh_file_status_projection(session, file)
@@ -1252,7 +1254,6 @@ async def _assemble_text(session: AsyncSession, job: Job) -> None:
     text_ranges = await _load_text_batch_ranges(session, file.id)
     if not _coverage_complete(file.page_count, text_ranges):
         await job_service.mark_job_resolved(session, job, {"waiting": True})
-        await _request_text_ensure(session, file.id)
         return
 
     started_at = _log_task_span_start(job, [file])

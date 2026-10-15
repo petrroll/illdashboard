@@ -1523,7 +1523,15 @@ async def test_ask_json_repairs_malformed_json_responses():
 
 
 @pytest.mark.asyncio
-async def test_ask_allows_distinct_normalization_lanes_while_extraction_is_busy():
+@pytest.mark.parametrize(
+    "extraction_request_names",
+    [
+        ["structured_medical_extraction"],
+        ["document_text_extraction"],
+        ["structured_medical_extraction", "document_text_extraction"],
+    ],
+)
+async def test_ask_allows_distinct_normalization_lanes_while_extraction_is_busy(extraction_request_names):
     release_event = asyncio.Event()
     client = SimpleNamespace(
         create_session=AsyncMock(side_effect=lambda *_args, **_kwargs: BlockingSession(release_event))
@@ -1545,9 +1553,13 @@ async def test_ask_allows_distinct_normalization_lanes_while_extraction_is_busy(
         try:
             extraction_tasks = [
                 asyncio.create_task(
-                    copilot_client._ask("system", "user", request_name="structured_medical_extraction")
+                    copilot_client._ask(
+                        "system",
+                        "user",
+                        request_name=extraction_request_names[index % len(extraction_request_names)],
+                    )
                 )
-                for _ in range(copilot_client.COPILOT_EXTRACTION_CONCURRENCY + 1)
+                for index in range(copilot_client.COPILOT_EXTRACTION_CONCURRENCY + 1)
             ]
             await _wait_for(lambda: client.create_session.await_count == copilot_client.COPILOT_EXTRACTION_CONCURRENCY)
 

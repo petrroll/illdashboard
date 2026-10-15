@@ -1,17 +1,132 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import OperationalError
 
-from illdashboard.models import Job, LabFile, Measurement, utc_now
+from illdashboard.models import Job, LabFile, Measurement, TextBatch, utc_now
 from illdashboard.services import jobs as job_service
 from illdashboard.services import pipeline
 
 TASK_TYPE = "test.task"
 TASK_KEY = "key-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completed_pages", [0, 1, 2])
+async def test_ensure_text_waits_for_persisted_coverage(session_factory, completed_pages):
+    async with session_factory() as session:
+        lab_file = LabFile(
+            filename="coverage.pdf", filepath="/tmp/coverage.pdf", mime_type="application/pdf", page_count=2
+        )
+        session.add(lab_file)
+        await session.flush()
+        if completed_pages:
+            session.add(
+                TextBatch(
+                    file_id=lab_file.id,
+                    task_key="completed-text",
+                    start_page=0,
+                    stop_page=completed_pages,
+                    dpi=144,
+                    raw_text="Synthetic report",
+                )
+            )
+        if completed_pages < 2:
+            await pipeline._request_text_extraction_batch(session, lab_file.id, completed_pages, 2, 144)
+        await pipeline._request_text_ensure(session, lab_file.id)
+        await session.commit()
+        jobs = await job_service.claim_jobs(
+            session,
+            task_types=[pipeline.TASK_ENSURE_TEXT],
+            lease_owner="test",
+            limit=1,
+            lease_seconds=60,
+        )
+        await pipeline._ensure_text(session, jobs[0])
+        await session.commit()
+
+        assembly = await session.scalar(select(Job).where(Job.task_type == pipeline.TASK_ASSEMBLE_TEXT))
+        assert (assembly is not None) == (completed_pages == 2)
+
+
+@pytest.mark.asyncio
+async def test_premature_text_assembly_does_not_requeue_controller(session_factory):
+    async with session_factory() as session:
+        lab_file = LabFile(filename="waiting.png", filepath="/tmp/waiting.png", mime_type="image/png")
+        session.add(lab_file)
+        await session.flush()
+        await pipeline._request_assemble_text(session, lab_file.id)
+        await session.commit()
+        jobs = await job_service.claim_jobs(
+            session,
+            task_types=[pipeline.TASK_ASSEMBLE_TEXT],
+            lease_owner="test",
+            limit=1,
+            lease_seconds=60,
+        )
+        await pipeline._assemble_text(session, jobs[0])
+        await session.commit()
+
+        assert jobs[0].status == job_service.JOB_STATUS_RESOLVED
+        assert job_service.json_loads(jobs[0].resolved_json) == {"waiting": True}
+        assert await session.scalar(select(Job).where(Job.task_type == pipeline.TASK_ENSURE_TEXT)) is None
+
+
+@pytest.mark.asyncio
+async def test_text_workers_fill_shared_extraction_capacity(session_factory, monkeypatch):
+    started = 0
+    capacity_filled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def extract_text(*args, **kwargs):
+        nonlocal started
+        started += 1
+        if started == pipeline.COPILOT_EXTRACTION_CONCURRENCY:
+            capacity_filled.set()
+        await release.wait()
+        return {"raw_text": "Synthetic report"}
+
+    monkeypatch.setattr(pipeline.copilot_extraction, "extract_text_batch", extract_text)
+    monkeypatch.setattr(pipeline.copilot_extraction, "extract_measurement_batch", AsyncMock(return_value={}))
+    monkeypatch.setattr(pipeline.copilot_extraction, "generate_summary", AsyncMock(return_value={}))
+    runtime = pipeline.PipelineRuntime(session_factory)
+    await runtime.start()
+    try:
+        async with session_factory() as session:
+            for index in range(pipeline.COPILOT_EXTRACTION_CONCURRENCY + 1):
+                lab_file = LabFile(
+                    filename=f"capacity-{index}.png",
+                    filepath=f"/tmp/capacity-{index}.png",
+                    mime_type="image/png",
+                )
+                session.add(lab_file)
+                await session.flush()
+                await pipeline._request_text_extraction_batch(session, lab_file.id, 0, 1, 144)
+            await session.commit()
+
+        await asyncio.wait_for(capacity_filled.wait(), timeout=5)
+        async with session_factory() as session:
+            counts = dict(
+                (
+                    await session.execute(
+                        select(Job.status, func.count())
+                        .where(Job.task_type == pipeline.TASK_EXTRACT_TEXT)
+                        .group_by(Job.status)
+                    )
+                ).all()
+            )
+        assert started == pipeline.COPILOT_EXTRACTION_CONCURRENCY
+        assert counts == {
+            job_service.JOB_STATUS_LEASED: pipeline.COPILOT_EXTRACTION_CONCURRENCY,
+            job_service.JOB_STATUS_PENDING: 1,
+        }
+    finally:
+        await runtime.stop()
 
 
 async def _enqueue(session_factory) -> None:
