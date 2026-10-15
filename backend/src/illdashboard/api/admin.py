@@ -55,11 +55,14 @@ async def purge_all_caches(db: AsyncSession = Depends(get_db)):
 
 
 @router.delete("/admin/database", tags=["admin"])
-async def drop_database(db: AsyncSession = Depends(get_db)):
+async def drop_database(delete_files: bool = False, db: AsyncSession = Depends(get_db)):
     """Destructively reset both lab and medication/event databases and stop/restart workers.
 
-    Original uploaded files remain and are re-registered, but extracted results,
+    By default original uploaded files remain and are re-registered; with
+    `delete_files=true` they are permanently deleted too. Extracted results,
     manual edits, tags, medications, and events are lost. Export a full backup first.
     """
-    sparkline_count = await admin_service.reset_database(_session_engine(db))
-    return {"status": "database_reset", "deleted_sparklines": sparkline_count}
+    sparkline_count, deleted_files = await admin_service.reset_database(
+        _session_engine(db), delete_files=delete_files
+    )
+    return {"status": "database_reset", "deleted_sparklines": sparkline_count, "deleted_files": deleted_files}

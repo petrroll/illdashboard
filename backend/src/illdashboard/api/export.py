@@ -9,6 +9,8 @@ import json
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.parse import quote
@@ -48,6 +50,15 @@ EXPORT_SHELL_FILENAME = "share-export-shell.html"
 EXPORT_PREVIEW_DPI = 96
 EXPORT_PREVIEW_MAX_EDGE_PX = 1400
 EXPORT_PREVIEW_JPEG_QUALITY = 70
+# Bump when the archive layout or manifest meaning changes so restore tooling can reject unknown formats.
+FULL_EXPORT_FORMAT_VERSION = 1
+
+
+def _app_version() -> str | None:
+    try:
+        return package_version("illdashboard")
+    except PackageNotFoundError:
+        return None
 
 
 class FullExportResponse(FileResponse):
@@ -141,7 +152,10 @@ def _write_full_archive(directory: Path, exported_at: str) -> Path:
             })
         archive.writestr("manifest.json", json.dumps({
             "format": "illdashboard-full-export",
-            "version": 1,
+            "version": FULL_EXPORT_FORMAT_VERSION,
+            "app_version": _app_version(),
+            # The database schema is versioned separately from the archive layout.
+            "schema_migrations": sorted(row["version"] for row in records["main"]["schema_migrations"]),
             "exported_at": exported_at,
             "databases": {name: f"databases/{name}.sqlite" for name in records},
             "records": "data.json",
@@ -187,7 +201,7 @@ async def export_full(
         return FullExportResponse(
             archive,
             directory,
-            filename=f"illdashboard-full-{exported_at.strftime('%Y-%m-%d')}.zip",
+            filename=f"illdashboard-full-v{FULL_EXPORT_FORMAT_VERSION}-{exported_at.strftime('%Y%m%d-%H%M%SZ')}.zip",
         )
     except BaseException:
         # A cancelled request must not remove files while the archive thread still writes them.

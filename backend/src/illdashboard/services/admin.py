@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.orm import selectinload
 
+from illdashboard.config import settings
 from illdashboard.database_migrations import prepare_main_database
 from illdashboard.medications_database import reset_medications_database
 from illdashboard.models import Base, BiomarkerInsight, RescalingRule
 from illdashboard.services import pipeline as pipeline_service
+from illdashboard.services import upload_metadata
 from illdashboard.sparkline import SPARKLINE_CACHE_DIR
 
 
@@ -32,15 +37,30 @@ def purge_sparkline_cache() -> int:
     return deleted
 
 
-async def reset_database(database_engine: AsyncEngine) -> int:
-    async def perform_reset() -> int:
+def purge_upload_dir() -> int:
+    upload_dir = Path(settings.UPLOAD_DIR)
+    if not upload_dir.is_dir():
+        return 0
+    deleted = 0
+    for path in upload_dir.iterdir():
+        if path.is_file():
+            if not upload_metadata.is_original_name_sidecar(path):
+                deleted += 1
+            path.unlink()
+    return deleted
+
+
+async def reset_database(database_engine: AsyncEngine, *, delete_files: bool = False) -> tuple[int, int]:
+    async def perform_reset() -> tuple[int, int]:
         async with database_engine.begin() as conn:
             await conn.run_sync(Base.metadata.drop_all)
         await reset_medications_database()
         await prepare_main_database(database_engine)
+        # Without deleting originals, the preload below re-registers every upload as a fresh file.
+        deleted_files = await asyncio.to_thread(purge_upload_dir) if delete_files else 0
         async with AsyncSession(database_engine, expire_on_commit=False) as session:
             await pipeline_service.preload_uploaded_files(session)
-        return purge_sparkline_cache()
+        return purge_sparkline_cache(), deleted_files
 
     # Dropping the whole schema invalidates worker sessions, so the reset shares
     # the same stop/restart boundary as the explicit clean-runtime flows.

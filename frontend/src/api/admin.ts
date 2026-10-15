@@ -17,6 +17,7 @@ export interface PurgeAllCachesResult {
 export interface ResetDatabaseResult {
   status: string;
   deleted_sparklines: number;
+  deleted_files: number;
 }
 
 export interface RescalingRule {
@@ -59,10 +60,12 @@ export async function purgeAllCaches() {
   return response.data;
 }
 
-export async function resetDatabase() {
+export async function resetDatabase(deleteFiles = false) {
   if (isShareExportMode()) {
     throwUnavailableInShareExport("Resetting the database");
   }
-  const response = await apiClient.delete<ResetDatabaseResult>("/admin/database");
+  const response = await apiClient.delete<ResetDatabaseResult>("/admin/database", {
+    params: { delete_files: deleteFiles },
+  });
   return response.data;
 }

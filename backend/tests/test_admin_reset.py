@@ -35,7 +35,7 @@ async def test_admin_database_reset_uses_request_database(client, session_factor
         response = await client.delete("/api/admin/database")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "database_reset", "deleted_sparklines": 0}
+    assert response.json() == {"status": "database_reset", "deleted_sparklines": 0, "deleted_files": 0}
 
     files_response = await client.get("/api/files")
     assert files_response.status_code == 200
@@ -47,3 +47,20 @@ async def test_admin_database_reset_uses_request_database(client, session_factor
         jobs = jobs_result.scalars().all()
 
     assert jobs == []
+
+
+@pytest.mark.asyncio
+async def test_admin_database_reset_can_delete_uploaded_files(client):
+    upload = await client.post("/api/files/upload", files={"file": ("report.md", b"original", "text/markdown")})
+    assert upload.status_code == 200
+    upload_dir = Path(settings.UPLOAD_DIR)
+    assert any(upload_dir.iterdir())
+
+    with patch.object(admin_service, "purge_sparkline_cache", return_value=0):
+        response = await client.delete("/api/admin/database", params={"delete_files": "true"})
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "database_reset", "deleted_sparklines": 0, "deleted_files": 1}
+    assert [path for path in upload_dir.iterdir() if path.is_file()] == []
+    files_response = await client.get("/api/files")
+    assert files_response.json() == []

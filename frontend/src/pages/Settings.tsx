@@ -33,7 +33,8 @@ import {
 type SettingsAction =
   | "purge-explanations"
   | "purge-all"
-  | "drop-db";
+  | "drop-db"
+  | "drop-db-and-files";
 
 interface SettingsActionDefinition {
   id: SettingsAction;
@@ -60,7 +61,14 @@ const settingsActions: SettingsActionDefinition[] = [
     id: "drop-db",
     label: "Drop Database",
     loadingLabel: "Dropping…",
-    description: "Delete all data and start fresh. This cannot be undone.",
+    description: "Delete all data and start fresh. Uploaded files are kept and re-imported. This cannot be undone.",
+    destructive: true,
+  },
+  {
+    id: "drop-db-and-files",
+    label: "Drop Database and Files",
+    loadingLabel: "Deleting…",
+    description: "Delete all data and all uploaded original documents. This cannot be undone.",
     destructive: true,
   },
 ];
@@ -85,6 +93,13 @@ async function performSettingsAction(action: SettingsAction) {
       await resetDatabase();
       return {
         message: "Database has been reset. Files still in the upload folder were reloaded as uploaded items.",
+        shouldReload: true,
+      };
+    }
+    case "drop-db-and-files": {
+      const response = await resetDatabase(true);
+      return {
+        message: `Database has been reset and ${response.deleted_files} uploaded files were deleted.`,
         shouldReload: true,
       };
     }
@@ -247,6 +262,23 @@ function OnlineSettings() {
           href="/api/export/share-html"
         >
           Download shareable HTML
+        </a>
+      </div>
+
+      <div className="card" style={{ marginBottom: "1.5rem" }}>
+        <h3 style={{ marginBottom: "0.75rem" }}>Full backup</h3>
+        <p style={{ color: "var(--text-muted)", marginBottom: "0.75rem", lineHeight: 1.5 }}>
+          Download a single versioned ZIP with both databases, all records as JSON, and every original
+          document, including edits, tags, medications, events, and generated summaries. It contains sensitive
+          health data; credentials and regenerable caches are not included.
+        </p>
+        <a
+          className="btn btn-primary"
+          style={{ textDecoration: "none" }}
+          href="/api/export/full"
+          download
+        >
+          Download full backup (ZIP)
         </a>
       </div>
 

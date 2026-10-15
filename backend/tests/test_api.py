@@ -239,12 +239,15 @@ async def test_full_export_preserves_databases_originals_and_all_records(client,
     assert response.headers["content-type"] == "application/zip"
     assert response.headers["cache-control"] == "no-store"
     assert "attachment" in response.headers["content-disposition"]
+    assert "illdashboard-full-v1-" in response.headers["content-disposition"]
     assert all(not path.exists() for path in temporary_paths)
     with ZipFile(io.BytesIO(response.content)) as archive:
         manifest = json.loads(archive.read("manifest.json"))
         records = json.loads(archive.read("data.json"))
         assert manifest["format"] == "illdashboard-full-export"
         assert manifest["version"] == 1
+        assert manifest["app_version"] == "0.1.0"
+        assert manifest["schema_migrations"] == sorted(m["version"] for m in records["main"]["schema_migrations"])
         assert set(records["main"]) == set(Base.metadata.tables)
         assert set(records["medications"]) == set(MedicationsBase.metadata.tables)
         assert records["main"]["lab_files"][0]["ocr_summary_english"] == "Stored summary"
@@ -2320,7 +2323,7 @@ async def test_reset_database_reloads_upload_dir_as_uploaded_files(client, sessi
         response = await client.delete("/api/admin/database")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "database_reset", "deleted_sparklines": 0}
+    assert response.json() == {"status": "database_reset", "deleted_sparklines": 0, "deleted_files": 0}
 
     files_response = await client.get("/api/files")
     assert files_response.status_code == 200
