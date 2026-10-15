@@ -1,5 +1,5 @@
 import { memo, startTransition, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { MouseEvent as ReactMouseEvent } from "react";
+import type { MouseEvent as ReactMouseEvent, RefObject } from "react";
 import {
   LineChart,
   Line,
@@ -222,13 +222,19 @@ function renderPreferredMeasurementValue(
       );
 }
 
-// Selection and detail/insight loads must not reformat every row in the overview.
-const MarkerRowContent = memo(function MarkerRowContent({
+// Only the old and new selected rows need to render when selection changes.
+const MarkerOverviewRow = memo(function MarkerOverviewRow({
   item,
   shareExportMode,
+  active,
+  onSelect,
+  rowRefs,
 }: {
   item: MarkerOverviewItem;
   shareExportMode: boolean;
+  active: boolean;
+  onSelect: (markerName: string) => void;
+  rowRefs: RefObject<Map<string, HTMLButtonElement>>;
 }) {
   const latest = item.latest_measurement;
   const previous = item.previous_measurement;
@@ -254,7 +260,18 @@ const MarkerRowContent = memo(function MarkerRowContent({
   const hasTrend = item.has_numeric_history || item.has_qualitative_trend;
 
   return (
-    <>
+    <button
+      ref={(node) => {
+        if (node) {
+          rowRefs.current.set(item.marker_name, node);
+        } else {
+          rowRefs.current.delete(item.marker_name);
+        }
+      }}
+      type="button"
+      className={`marker-row ${active ? "active" : ""}`}
+      onClick={() => onSelect(item.marker_name)}
+    >
       <div className="marker-row-name">
         <strong>{item.marker_name}</strong>
         <span className="marker-row-date">{formatDate(effectiveMeasuredAt(latest))}</span>
@@ -287,7 +304,69 @@ const MarkerRowContent = memo(function MarkerRowContent({
           </span>
         )}
       </div>
-    </>
+    </button>
+  );
+});
+
+const MarkerGroupSection = memo(function MarkerGroupSection({
+  group,
+  activeMarker,
+  collapsed,
+  shareExportMode,
+  onSelect,
+  onToggle,
+  rowRefs,
+}: {
+  group: MarkerOverviewGroup;
+  activeMarker: string;
+  collapsed: boolean;
+  shareExportMode: boolean;
+  onSelect: (markerName: string) => void;
+  onToggle: (groupName: string) => void;
+  rowRefs: RefObject<Map<string, HTMLButtonElement>>;
+}) {
+  return (
+    <section className={`marker-group ${collapsed ? "marker-group-collapsed" : ""}`}>
+      <header
+        className="marker-group-header"
+        onClick={() => onToggle(group.group_name)}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            onToggle(group.group_name);
+          }
+        }}
+      >
+        <h3>
+          <span className="marker-group-toggle">{collapsed ? "▶" : "▼"}</span>
+          {group.group_name}
+        </h3>
+        <span>{group.markers.length}</span>
+      </header>
+
+      {!collapsed && (
+        <div className="marker-group-table" role="list">
+          <div className="marker-row marker-row-legend" aria-hidden="true">
+            <div className="marker-row-name"><strong>Marker</strong></div>
+            <div className="marker-row-value"><strong>Last result</strong></div>
+            <div className="marker-row-range"><strong>Trend</strong></div>
+            <div className="marker-row-previous"><strong>Previous &amp; diff</strong></div>
+          </div>
+          {group.markers.map((item) => (
+            <MarkerOverviewRow
+              key={item.marker_name}
+              item={item}
+              shareExportMode={shareExportMode}
+              active={activeMarker === item.marker_name}
+              onSelect={onSelect}
+              rowRefs={rowRefs}
+            />
+          ))}
+        </div>
+      )}
+    </section>
   );
 });
 
@@ -335,6 +414,10 @@ export default function MarkerChart() {
     nextParams.set("marker", markerName);
     setSearchParams(nextParams, { replace: true, preventScrollReset: true });
   }, [searchParams, setSearchParams]);
+  const markerNavigationRef = useRef(syncMarkerQuery);
+  useLayoutEffect(() => {
+    markerNavigationRef.current = syncMarkerQuery;
+  }, [syncMarkerQuery]);
 
   const clampListPaneWidth = (nextWidth: number) => {
     const browserWidth = markerBrowserRef.current?.clientWidth ?? window.innerWidth;
@@ -665,7 +748,7 @@ export default function MarkerChart() {
     );
   }, [chartData, yAxisScale, chartSeries.qualitativeEventCount]);
 
-  const toggleGroupCollapsed = (groupName: string) => {
+  const toggleGroupCollapsed = useCallback((groupName: string) => {
     setCollapsedGroups((previous) => {
       const next = new Set(previous);
       if (next.has(groupName)) {
@@ -675,13 +758,13 @@ export default function MarkerChart() {
       }
       return next;
     });
-  };
+  }, []);
 
-  const selectMarker = (markerName: string) => {
+  const selectMarker = useCallback((markerName: string) => {
     startTransition(() => {
-      syncMarkerQuery(markerName);
+      markerNavigationRef.current(markerName);
     });
-  };
+  }, []);
 
   const applyUpdatedMarkerDetail = async (updatedDetail: MarkerDetailResponse) => {
     cancelPendingInsightRefresh();
@@ -958,48 +1041,16 @@ export default function MarkerChart() {
         ) : (
           <div className="marker-groups">
             {filteredOverview.map((group) => (
-              <section key={group.group_name} className={`marker-group ${collapsedGroups.has(group.group_name) ? "marker-group-collapsed" : ""}`}>
-                <header
-                  className="marker-group-header"
-                  onClick={() => toggleGroupCollapsed(group.group_name)}
-                  role="button"
-                  tabIndex={0}
-                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleGroupCollapsed(group.group_name); } }}
-                >
-                  <h3>
-                    <span className="marker-group-toggle">{collapsedGroups.has(group.group_name) ? "▶" : "▼"}</span>
-                    {group.group_name}
-                  </h3>
-                  <span>{group.markers.length}</span>
-                </header>
-
-                {!collapsedGroups.has(group.group_name) && <div className="marker-group-table" role="list">
-                  <div className="marker-row marker-row-legend" aria-hidden="true">
-                    <div className="marker-row-name"><strong>Marker</strong></div>
-                    <div className="marker-row-value"><strong>Last result</strong></div>
-                    <div className="marker-row-range"><strong>Trend</strong></div>
-                    <div className="marker-row-previous"><strong>Previous &amp; diff</strong></div>
-                  </div>
-                  {group.markers.map((item) => (
-                      <button
-                        key={item.marker_name}
-                        ref={(node) => {
-                          if (node) {
-                            markerRowRefs.current.set(item.marker_name, node);
-                            return;
-                          }
-
-                          markerRowRefs.current.delete(item.marker_name);
-                        }}
-                        type="button"
-                        className={`marker-row ${selectedMarker === item.marker_name ? "active" : ""}`}
-                        onClick={() => selectMarker(item.marker_name)}
-                      >
-                        <MarkerRowContent item={item} shareExportMode={shareExportMode} />
-                      </button>
-                  ))}
-                </div>}
-              </section>
+              <MarkerGroupSection
+                key={group.group_name}
+                group={group}
+                activeMarker={group.markers.some((item) => item.marker_name === selectedMarker) ? selectedMarker : ""}
+                collapsed={collapsedGroups.has(group.group_name)}
+                shareExportMode={shareExportMode}
+                onSelect={selectMarker}
+                onToggle={toggleGroupCollapsed}
+                rowRefs={markerRowRefs}
+              />
             ))}
           </div>
         )}

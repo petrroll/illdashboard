@@ -397,9 +397,9 @@ function measurement(value, index = 0) {
   };
 }
 
-test("memoized biomarker row content preserves values, updates and offline sparklines", () => {
-  const { MarkerRowContent } = loadSource("pages/MarkerChart.tsx", {
-    expose: ["MarkerRowContent"],
+test("memoized biomarker rows preserve values, selection, scrolling and offline sparklines", () => {
+  const { MarkerOverviewRow, MarkerGroupSection } = loadSource("pages/MarkerChart.tsx", {
+    expose: ["MarkerOverviewRow", "MarkerGroupSection"],
     imports: {
       recharts: {}, "react-markdown": {}, "react-router-dom": {}, "../api": {},
       "../components/InlineEditableValue": {}, "../components/StackedMeasurementValue": {},
@@ -408,15 +408,30 @@ test("memoized biomarker row content preserves values, updates and offline spark
       "../export/runtime": { getShareExportMarkerSparklineUrl: () => "data:image/png;base64,offline" },
     },
   });
-  assert.equal(MarkerRowContent.$$typeof, Symbol.for("react.memo"));
+  assert.equal(MarkerOverviewRow.$$typeof, Symbol.for("react.memo"));
   const item = {
     marker_name: "Synthetic marker", canonical_unit: "1",
     latest_measurement: measurement(12, 1), previous_measurement: measurement(10),
     reference_low: 0, reference_high: 11, total_count: 4,
     value_min: 8, value_max: 12, has_numeric_history: true, has_qualitative_trend: false,
   };
+  const selected = [];
+  const props = {
+    item, shareExportMode: false, active: false,
+    onSelect: (name) => selected.push(name), rowRefs: { current: new Map() },
+  };
+  const row = MarkerOverviewRow.type(props);
+  row.props.onClick();
+  assert.deepEqual(selected, [item.marker_name]);
+  const node = {};
+  row.props.ref(node);
+  assert.equal(props.rowRefs.current.get(item.marker_name), node);
+  row.props.ref(null);
+  assert.equal(props.rowRefs.current.size, 0);
+  assert.equal(MarkerOverviewRow.type({ ...props, active: true }).props.className, "marker-row active");
+  assert.equal(row.props.className, "marker-row ");
   const render = (entry = item, shareExportMode = false) =>
-    renderToStaticMarkup(React.createElement(MarkerRowContent, { item: entry, shareExportMode }));
+    renderToStaticMarkup(React.createElement(MarkerOverviewRow, { ...props, item: entry, shareExportMode }));
   const html = render();
   assert.match(html, /Synthetic marker/);
   assert.match(html, /2026-01-02/);
@@ -439,8 +454,41 @@ test("memoized biomarker row content preserves values, updates and offline spark
   const offline = render(item, true);
   assert.match(offline, /data:image\/png;base64,offline/);
   assert.doesNotMatch(offline, /\/api\//);
+
+  assert.equal(MarkerGroupSection.$$typeof, Symbol.for("react.memo"));
+  const toggles = [];
+  const groupProps = {
+    group: { group_name: "Synthetic group", markers: [item] },
+    activeMarker: item.marker_name, collapsed: false, shareExportMode: true,
+    onSelect: props.onSelect, rowRefs: props.rowRefs, onToggle: (name) => toggles.push(name),
+  };
+  const section = MarkerGroupSection.type(groupProps);
+  const header = section.props.children[0];
+  header.props.onClick();
+  let prevented = false;
+  header.props.onKeyDown({ key: " ", preventDefault: () => { prevented = true; } });
+  header.props.onKeyDown({ key: "Tab" });
+  assert.equal(prevented, true);
+  assert.deepEqual(toggles, ["Synthetic group", "Synthetic group"]);
+  const expanded = renderToStaticMarkup(React.createElement(MarkerGroupSection, groupProps));
+  assert.match(expanded, /marker-row active/);
+  assert.match(expanded, /data:image\/png;base64,offline/);
+  const collapsed = renderToStaticMarkup(React.createElement(MarkerGroupSection, { ...groupProps, collapsed: true }));
+  assert.match(collapsed, /marker-group-collapsed/);
+  assert.doesNotMatch(collapsed, /<button/);
 });
 
+test("stable biomarker selection uses the latest URL synchronization callback", () => {
+  const navigations = [];
+  const markerNavigationRef = { current: (name) => navigations.push(`old:${name}`) };
+  const selectMarker = loadHandler("pages/MarkerChart.tsx", "selectMarker", {
+    useCallback: (callback) => callback, startTransition: (callback) => callback(), markerNavigationRef,
+  });
+  selectMarker("first");
+  markerNavigationRef.current = (name) => navigations.push(`new:${name}`);
+  selectMarker("second");
+  assert.deepEqual(navigations, ["old:first", "new:second"]);
+});
 test("measurement and reference exports preserve small nonzero values", () => {
   for (const value of [0.004, -0.004, 0.0000004, 0.098, 39.9999999997, 0, -0]) {
     assert.equal(measurements.formatMeasurementScalarValue(value), measurements.formatSignificantValue(value));
