@@ -6,6 +6,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from illdashboard.config import settings
+from illdashboard.request_timing import instrument_database_engine
 
 _engine: AsyncEngine | None = None
 _async_session_factory: async_sessionmaker[AsyncSession] | None = None
@@ -14,6 +15,7 @@ _database_url: str | None = None
 
 def create_database_engine(database_url: str) -> AsyncEngine:
     engine = create_async_engine(database_url, echo=False)
+    instrument_database_engine(engine.sync_engine)
 
     if engine.url.get_backend_name() == "sqlite":
         @event.listens_for(engine.sync_engine, "connect")

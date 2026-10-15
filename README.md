@@ -271,6 +271,42 @@ without a generation request. Changing markers aborts superseded history and int
 requests so they do not occupy browser connections needed by the new selection; an AI job already
 started on the server may still finish.
 
+## Performance diagnostics
+
+HTTP responses include standard `Server-Timing` metrics, visible in browser DevTools under
+**Network → select a request → Timing → Server Timing**:
+
+- **`app`**: backend wall time from entering the request middleware until response headers are ready.
+  Includes dependencies, SQL waits, ORM work, and response serialization before headers.
+- **`db`**: sum of SQL cursor-execution elapsed times, with the statement count in the description.
+  Covers both databases and failed statements. Does not include connection-pool checkout, ORM object
+  construction, transaction commit/rollback, or later application work. Concurrent statements can
+  overlap, so this is not an exclusive wall-time breakdown.
+- **`vite`**: development/preview proxy time from starting the upstream request until receiving backend
+  response headers. Preserves the backend metrics. This includes `app`; it is not an extra duration
+  to add to it.
+
+The Vite API proxy uses a keep-alive HTTP agent. Without one, the proxy explicitly closes every
+connection, forcing repeated browser/forwarding connection setup. The first request after a cold
+start or an idle connection timeout can still pay that setup cost.
+
+For example, if Chrome reports 315 ms waiting for a response but `app` is 25 ms and `vite` is 28 ms,
+most of the wait is outside backend processing and the measured upstream proxy interval. That narrows
+the investigation to browser scheduling, forwarding/transport, and work before the proxy starts its
+upstream request; it does not by itself identify which one caused the delay. A large `app` with a
+small `db` points toward non-SQL backend work or waits.
+
+These metrics stop at response headers: streaming/export body generation, downloading, and React
+rendering are not included. Use the browser **Performance** panel to correlate clicks, request start,
+response arrival, and the next paint. Server timings are also available through
+`PerformanceResourceTiming.serverTiming` for same-origin requests.
+
+Instrumentation is request-local, uses monotonic clocks, and sends only durations and SQL statement
+counts. It does not store or transmit SQL text, parameters, query strings, or medical values, and adds
+no telemetry service or dependency. Existing timing metrics are preserved. Handled HTTP errors,
+validation errors, and CORS preflights are timed; unhandled exceptions that escape the middleware
+retain normal error logging and may produce an outer framework-generated response without timings.
+
 ## Pipeline at a glance
 
 The current runtime is an artifact-first controller, not the old reconcile/publish pipeline.

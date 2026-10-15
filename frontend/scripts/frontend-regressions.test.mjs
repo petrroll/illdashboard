@@ -57,6 +57,42 @@ function loadHandler(relativePath, name, globals, effectDependency = null) {
 
 const measurements = loadSource("utils/measurements.ts");
 
+test("Vite proxy reuses connections, preserves timings and isolates concurrent requests", (t) => {
+  let clock = 0;
+  const { default: config } = loadSource("../vite.config.ts", {
+    imports: {
+      vite: { defineConfig: (config) => config },
+      "@vitejs/plugin-react": () => null,
+      "node:perf_hooks": { performance: { now: () => clock } },
+    },
+    globals: { process: { env: { BACKEND_PORT: "8001" } } },
+  });
+  const { EventEmitter } = require("node:events");
+  const proxy = new EventEmitter();
+  const options = config.server.proxy["/api"];
+  assert.equal(options.target, "http://localhost:8001");
+  assert.equal(options.agent.keepAlive, true);
+  t.after(() => options.agent.destroy());
+  options.configure(proxy);
+  for (const existing of ["app;dur=12.00", ["app;dur=12.00", "db;dur=3.00"]]) {
+    const first = {};
+    const second = {};
+    clock = 50;
+    proxy.emit("proxyReq", {}, first);
+    clock = 70;
+    proxy.emit("proxyReq", {}, second);
+    clock = 95;
+    const response = { headers: { "server-timing": existing } };
+    proxy.emit("proxyRes", response, first);
+    const upstream = Array.isArray(existing) ? existing.join(", ") : existing;
+    assert.equal(response.headers["server-timing"], `${upstream}, vite;dur=45.00;desc="Vite upstream to response headers"`);
+    clock = 100;
+    const otherResponse = { headers: {} };
+    proxy.emit("proxyRes", otherResponse, second);
+    assert.equal(otherResponse.headers["server-timing"], 'vite;dur=30.00;desc="Vite upstream to response headers"');
+  }
+});
+
 test("inline editing starts with the latest value and cancellation restores it", () => {
   for (const name of ["beginEditing", "cancelEditing"]) {
     let draft;

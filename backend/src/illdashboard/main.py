@@ -18,6 +18,7 @@ from illdashboard.config import settings
 from illdashboard.copilot.client import prewarm_client, shutdown_client
 from illdashboard.database import dispose_database_engine, get_async_session_factory
 from illdashboard.medications_database import dispose_medications_engine, init_medications_database
+from illdashboard.request_timing import ServerTimingMiddleware
 from illdashboard.services.pipeline import start_pipeline_runtime, stop_pipeline_runtime
 from illdashboard.sparkline import shutdown_sparkline_worker
 
@@ -154,13 +155,15 @@ async def reject_cross_site_unsafe_requests(request: Request, call_next):
     return await call_next(request)
 
 
-# Added after the cross-site middleware so CORS stays outermost and still answers preflights itself.
+# CORS wraps the cross-site guard so it still answers preflights itself.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(TRUSTED_BROWSER_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Server-Timing"],
 )
+app.add_middleware(ServerTimingMiddleware)
 
 app.include_router(router, prefix="/api")
