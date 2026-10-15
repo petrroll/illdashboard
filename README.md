@@ -261,6 +261,10 @@ Then open:
 
 Files stay on disk under the configured `UPLOAD_DIR`, and derived artifacts, jobs, rules, and search documents live in SQLite.
 
+Biomarker selection reuses unchanged overview row content rather than reformatting the entire list
+when history or insights finish loading. Initial loading still fetches the overview and lazy-loaded
+sparklines; uncached AI interpretations load separately from the chart and history.
+
 ## Pipeline at a glance
 
 The current runtime is an artifact-first controller, not the old reconcile/publish pipeline.

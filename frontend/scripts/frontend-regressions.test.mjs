@@ -293,6 +293,50 @@ function measurement(value, index = 0) {
   };
 }
 
+test("memoized biomarker row content preserves values, updates and offline sparklines", () => {
+  const { MarkerRowContent } = loadSource("pages/MarkerChart.tsx", {
+    expose: ["MarkerRowContent"],
+    imports: {
+      recharts: {}, "react-markdown": {}, "react-router-dom": {}, "../api": {},
+      "../components/InlineEditableValue": {}, "../components/StackedMeasurementValue": {},
+      "../components/TagInput": {}, "../components/TagFilter": {},
+      "../utils/measurements": measurements,
+      "../export/runtime": { getShareExportMarkerSparklineUrl: () => "data:image/png;base64,offline" },
+    },
+  });
+  assert.equal(MarkerRowContent.$$typeof, Symbol.for("react.memo"));
+  const item = {
+    marker_name: "Synthetic marker", canonical_unit: "1",
+    latest_measurement: measurement(12, 1), previous_measurement: measurement(10),
+    reference_low: 0, reference_high: 11, total_count: 4,
+    value_min: 8, value_max: 12, has_numeric_history: true, has_qualitative_trend: false,
+  };
+  const render = (entry = item, shareExportMode = false) =>
+    renderToStaticMarkup(React.createElement(MarkerRowContent, { item: entry, shareExportMode }));
+  const html = render();
+  assert.match(html, /Synthetic marker/);
+  assert.match(html, /2026-01-02/);
+  assert.match(html, /<strong>12<\/strong>/);
+  assert.match(html, /<strong>10<\/strong>/);
+  assert.match(html, /\+2/);
+  assert.match(html, /2 more \(8–12\)/);
+  assert.match(html, /class="marker-row-value value-high"/);
+  assert.match(html, /\/api\/measurements\/sparkline\?marker_name=Synthetic%20marker&amp;v=6/);
+  assert.match(html, /loading="lazy"/);
+  assert.match(html, /decoding="async"/);
+
+  const updated = { ...item, latest_measurement: measurement(9, 1) };
+  assert.match(render(updated), /<strong>9<\/strong>/);
+  assert.match(render(updated), /-1/);
+  assert.match(render(updated), /class="marker-row-value value-normal"/);
+  assert.match(render({ ...item, previous_measurement: null }), /First result/);
+  assert.doesNotMatch(render({ ...item, has_numeric_history: false }), /<img/);
+  assert.match(render({ ...item, has_numeric_history: false, has_qualitative_trend: true }), /<img/);
+  const offline = render(item, true);
+  assert.match(offline, /data:image\/png;base64,offline/);
+  assert.doesNotMatch(offline, /\/api\//);
+});
+
 test("measurement and reference exports preserve small nonzero values", () => {
   for (const value of [0.004, -0.004, 0.0000004, 0.098, 39.9999999997, 0, -0]) {
     assert.equal(measurements.formatMeasurementScalarValue(value), measurements.formatSignificantValue(value));

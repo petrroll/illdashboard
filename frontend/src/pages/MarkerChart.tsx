@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, startTransition, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import {
   LineChart,
@@ -221,6 +221,75 @@ function renderPreferredMeasurementValue(
         </>
       );
 }
+
+// Selection and detail/insight loads must not reformat every row in the overview.
+const MarkerRowContent = memo(function MarkerRowContent({
+  item,
+  shareExportMode,
+}: {
+  item: MarkerOverviewItem;
+  shareExportMode: boolean;
+}) {
+  const latest = item.latest_measurement;
+  const previous = item.previous_measurement;
+  const latestWarning = getUnitConversionWarning(latest);
+  const latestValueClassName = getMeasurementStatusClassName(latest, item.reference_low, item.reference_high);
+  const previousValueClassName = getMeasurementStatusClassName(previous, item.reference_low, item.reference_high);
+  const latestTrendValue = getCanonicalTrendValue(latest);
+  const previousTrendValue = previous ? getCanonicalTrendValue(previous) : null;
+  const delta = previous && latestTrendValue != null && previousTrendValue != null
+    ? latestTrendValue - previousTrendValue
+    : null;
+  const latestValueNote = latestWarning
+    ? latestWarning
+    : previous == null
+    ? "First result"
+    : delta != null
+    ? `${delta > 0 ? "+" : ""}${formatMeasurementValue(delta, item.canonical_unit ?? latest.canonical_unit)}`
+    : "";
+  const otherCount = item.total_count - 1 - (previous ? 1 : 0);
+  const sparklineSrc = shareExportMode
+    ? getShareExportMarkerSparklineUrl(item.marker_name)
+    : `/api/measurements/sparkline?marker_name=${encodeURIComponent(item.marker_name)}&v=6`;
+  const hasTrend = item.has_numeric_history || item.has_qualitative_trend;
+
+  return (
+    <>
+      <div className="marker-row-name">
+        <strong>{item.marker_name}</strong>
+        <span className="marker-row-date">{formatDate(effectiveMeasuredAt(latest))}</span>
+      </div>
+
+      <div className={`marker-row-value ${latestValueClassName}`}>
+        <strong>{renderPreferredMeasurementValue(latest)}</strong>
+        <span>{latestValueNote}</span>
+      </div>
+
+      <div className="marker-row-range">
+        {sparklineSrc && hasTrend && (
+          <div className="range-meter">
+            <img
+              className="sparkline-img"
+              src={sparklineSrc}
+              alt={`Sparkline for ${item.marker_name}`}
+              loading="lazy"
+              decoding="async"
+            />
+          </div>
+        )}
+      </div>
+
+      <div className={`marker-row-previous ${previousValueClassName}`}>
+        <strong>{previous ? renderPreferredMeasurementValue(previous) : "—"}</strong>
+        {otherCount > 0 && item.value_min != null && item.value_max != null && (
+          <span className="marker-row-history-note">
+            {otherCount} more ({formatMeasurementValue(item.value_min)}–{formatMeasurementValue(item.value_max)})
+          </span>
+        )}
+      </div>
+    </>
+  );
+});
 
 export default function MarkerChart() {
   const shareExportMode = isShareExportMode();
@@ -741,29 +810,6 @@ export default function MarkerChart() {
     await refreshMarkerDetail(detail.marker_name);
   };
 
-  const trendMeter = (item: MarkerOverviewItem) => {
-    const sparklineSrc = shareExportMode
-      ? getShareExportMarkerSparklineUrl(item.marker_name)
-      : `/api/measurements/sparkline?marker_name=${encodeURIComponent(item.marker_name)}&v=6`;
-    const hasTrend = item.has_numeric_history || item.has_qualitative_trend;
-
-    if (!sparklineSrc || !hasTrend) {
-      return null;
-    }
-
-    return (
-      <div className="range-meter">
-        <img
-          className="sparkline-img"
-          src={sparklineSrc}
-          alt={`Sparkline for ${item.marker_name}`}
-          loading="lazy"
-          decoding="async"
-        />
-      </div>
-    );
-  };
-
   const startResize = (event: ReactMouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
     const startX = event.clientX;
@@ -907,36 +953,7 @@ export default function MarkerChart() {
                     <div className="marker-row-range"><strong>Trend</strong></div>
                     <div className="marker-row-previous"><strong>Previous &amp; diff</strong></div>
                   </div>
-                  {group.markers.map((item) => {
-                    const latest = item.latest_measurement;
-                    const previous = item.previous_measurement;
-                    const latestWarning = getUnitConversionWarning(latest);
-                    const latestValueClassName = getMeasurementStatusClassName(
-                      latest,
-                      item.reference_low,
-                      item.reference_high,
-                    );
-                    const previousValueClassName = getMeasurementStatusClassName(
-                      previous,
-                      item.reference_low,
-                      item.reference_high,
-                    );
-                    const latestTrendValue = getCanonicalTrendValue(latest);
-                    const previousTrendValue = previous ? getCanonicalTrendValue(previous) : null;
-                    const delta =
-                      previous && latestTrendValue != null && previousTrendValue != null
-                        ? latestTrendValue - previousTrendValue
-                        : null;
-                    const latestValueNote = latestWarning
-                      ? latestWarning
-                      : previous == null
-                      ? "First result"
-                      : delta != null
-                      ? `${delta > 0 ? "+" : ""}${formatMeasurementValue(delta, item.canonical_unit ?? latest.canonical_unit)}`
-                      : "";
-                    const otherCount = item.total_count - 1 - (previous ? 1 : 0);
-
-                    return (
+                  {group.markers.map((item) => (
                       <button
                         key={item.marker_name}
                         ref={(node) => {
@@ -951,31 +968,9 @@ export default function MarkerChart() {
                         className={`marker-row ${selectedMarker === item.marker_name ? "active" : ""}`}
                         onClick={() => selectMarker(item.marker_name)}
                       >
-                        <div className="marker-row-name">
-                          <strong>{item.marker_name}</strong>
-                          <span className="marker-row-date">{formatDate(effectiveMeasuredAt(latest))}</span>
-                        </div>
-
-                        <div className={`marker-row-value ${latestValueClassName}`}>
-                          <strong>{renderPreferredMeasurementValue(latest)}</strong>
-                          <span>{latestValueNote}</span>
-                        </div>
-
-                        <div className="marker-row-range">{trendMeter(item)}</div>
-
-                        <div className={`marker-row-previous ${previousValueClassName}`}>
-                          <strong>
-                            {previous ? renderPreferredMeasurementValue(previous) : "—"}
-                          </strong>
-                          {otherCount > 0 && item.value_min != null && item.value_max != null && (
-                            <span className="marker-row-history-note">
-                              {otherCount} more ({formatMeasurementValue(item.value_min)}–{formatMeasurementValue(item.value_max)})
-                            </span>
-                          )}
-                        </div>
+                        <MarkerRowContent item={item} shareExportMode={shareExportMode} />
                       </button>
-                    );
-                  })}
+                  ))}
                 </div>}
               </section>
             ))}
